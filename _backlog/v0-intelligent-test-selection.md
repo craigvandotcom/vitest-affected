@@ -91,36 +91,73 @@ vitest-smart/
 
 | Package | Purpose | Why this one |
 |---|---|---|
-| `oxc-parser` | Parse imports from TS/JS/TSX/JSX files | Handles TypeScript natively, same API shape as es-module-lexer but with full AST. `result.module.staticImports` gives pre-extracted imports with zero AST walking. Used by Rolldown/Vite 8. |
+| `oxc-parser` | Parse imports from TS/JS/TSX/JSX files | Handles TypeScript natively, 8x faster than esbuild.transformSync. `result.module` gives pre-extracted imports with zero AST walking. Full AST ready for Phase 3. Used by Rolldown/Vite 8. |
 | `oxc-resolver` | Resolve specifiers to file paths | 28x faster than enhanced-resolve, handles TS aliases, tsconfig paths, project references. Same OXC ecosystem as parser. |
 
-**Why not es-module-lexer?** It cannot parse TypeScript files — requires pre-transform with esbuild. oxc-parser handles `.ts`/`.tsx` natively in a single step and provides the full AST we'll need for Phase 3 (symbol-level tracking).
+**Why not esbuild + es-module-lexer?** esbuild is already in every Vitest project's tree (free), but the two-step pipeline (transform → lex) is 8x slower (813ms vs 100ms for 433 files). Both stacks are fast enough for real use, but oxc-parser also provides the full AST needed for Phase 3 — esbuild doesn't expose AST.
 
-### Verified API Patterns
+**Benchmarked on body-compass-app (433 TS/TSX files):**
+
+```
+Phase      | Total    | Per file  | % of total
+-----------|----------|-----------|----------
+Read       |   14.9ms |   0.034ms | 9%
+Hash       |    9.9ms |   0.023ms | 6%
+Parse      |   99.7ms |   0.230ms | 60%
+Resolve    |   41.2ms |   0.095ms | 25%
+-----------|----------|-----------|----------
+TOTAL      |  165.8ms |   0.383ms | 100%
+
+Import stats: 1499 total, 106 type-only, 879 local, 488 external, 2 errors
+Resolution: 99.9% success with tsconfig configured
+```
+
+### Verified API Patterns (Tested Against Real Code)
 
 #### oxc-parser — Import Extraction
 
 ```typescript
 import { parseSync } from 'oxc-parser';
 
-const { module, errors } = parseSync('file.ts', sourceCode);
+const { module: mod, errors } = parseSync(filePath, sourceCode);
+// filePath extension drives language detection (.ts, .tsx, .jsx, .js)
 
-// Static imports — imp.n = specifier, imp.t = type-only boolean
-for (const imp of module.staticImports) {
-  if (imp.t) continue;  // Skip type-only imports (no runtime dependency)
-  specifiers.push(imp.n);
+const specifiers: string[] = [];
+
+// Static imports — imp.moduleRequest.value = specifier string
+for (const imp of mod.staticImports) {
+  // Check if ALL entries are type-only (no runtime dependency)
+  if (imp.entries.every(e => e.isType)) continue;
+  specifiers.push(imp.moduleRequest.value);
 }
 
-// Dynamic imports — imp.n is null for computed expressions like import(someVar)
-for (const imp of module.dynamicImports) {
-  if (imp.n) specifiers.push(imp.n);
+// Dynamic imports — no .value field, must slice source code
+// Only string literals are useful (computed expressions can't be resolved statically)
+for (const imp of mod.dynamicImports) {
+  const raw = sourceCode.slice(imp.moduleRequest.start, imp.moduleRequest.end);
+  // Check if it's a string literal (starts with ' or ")
+  if (raw.startsWith("'") || raw.startsWith('"')) {
+    specifiers.push(raw.slice(1, -1));  // Strip quotes
+  }
 }
 
-// Re-exports — export { foo } from './bar', export * from './baz'
-for (const exp of module.staticExports) {
-  if (exp.n) specifiers.push(exp.n);
+// Re-exports — these are in staticExports, NOT staticImports
+// export { foo } from './bar'  →  entries[].moduleRequest.value
+// export * from './baz'        →  entries[].moduleRequest.value
+for (const exp of mod.staticExports) {
+  for (const entry of exp.entries) {
+    if (entry.moduleRequest) {
+      specifiers.push(entry.moduleRequest.value);
+    }
+  }
 }
 ```
+
+**Key API differences from es-module-lexer (research was wrong about field names):**
+- Specifier: `imp.moduleRequest.value` (NOT `imp.n`)
+- Type-only: `imp.entries[].isType` (NOT `imp.t`)
+- Re-exports: in `staticExports`, NOT `staticImports`
+- Dynamic imports: no `.value` — slice source code with `.start`/`.end`
 
 #### oxc-resolver — Path Resolution
 
@@ -132,21 +169,27 @@ const resolver = new ResolverFactory({
   extensions: ['.ts', '.tsx', '.js', '.jsx', '.json'],
   conditionNames: ['node', 'import'],
   tsconfig: {
-    configFile: '/project/tsconfig.json',
+    configFile: path.join(projectRoot, 'tsconfig.json'),
     references: 'auto',  // follow project references
   },
-  builtinModules: true,  // returns result.builtin for node:fs etc.
+  builtinModules: true,
 });
 
 // CRITICAL: context is DIRECTORY, not file path
 const result = resolver.sync(path.dirname(importingFile), specifier);
 
-if (result.builtin) return null;    // Skip Node.js builtins
-if (result.error) return null;      // Resolution failed (external package)
-return result.path;                 // Absolute resolved path
+// Builtins return { error: "Builtin module node:path" } — NOT a .builtin field
+if (result.error) return null;   // Builtin, external package, or unresolvable
+return result.path;              // Absolute resolved path
 ```
 
-**Gotcha:** `resolver.sync()` takes the *directory* of the importing file as the first arg, NOT the file itself. Use `path.dirname(importingFile)`.
+**Gotchas (verified):**
+- `resolver.sync()` takes the *directory* of the importing file, NOT the file itself
+- Builtins return `{ error: "Builtin module ..." }` regardless of `builtinModules` flag
+- npm packages resolve to absolute paths into `node_modules/` — filter these for the graph
+- `result.path` is always absolute
+- `result.moduleType` and `result.packageJsonPath` also available on success
+- **tsconfig MUST be configured** — without it, `@/` path aliases fail (739/741 errors in testing)
 
 ### Vitest Plugin Architecture
 
