@@ -174,50 +174,55 @@ The base branch (`main`) is configurable. `--merge-base` is cleaner than the con
 
 | Approach | Can filter tests? | IDE compatible? | Complexity |
 |---|---|---|---|
-| **Wrapper CLI** (`vitest-smart` bin) | Yes — full control | Needs config | Medium |
-| Vitest Plugin (`configureVitest`) | **No** — cannot filter test list | Native | Low |
+| **Vitest Plugin** (`configureVitest`) | **Yes** — mutate `config.include` | Native | Low |
+| Wrapper CLI (`vitest-smart` bin) | Yes — full control | Needs config | Medium |
 | Hybrid: CLI + Reporter plugin | Yes + data collection | Needs config | Medium-High |
 
-### Decision: Wrapper CLI using `startVitest` programmatic API
+### Decision: ~~Wrapper CLI~~ → **Vitest Plugin** (REVISED 2026-02-21)
 
 **Confidence: 5/5 | Impact: 5/5**
 
-**This is the most critical decision and it's forced by Vitest's architecture.**
+**REVISION:** The original decision was based on web research stating that `configureVitest` cannot filter the test file list. **This was empirically disproven.** Mutating `vitest.config.include` inside `configureVitest` DOES affect which files `globTestSpecifications()` finds. Tested on Vitest 3.2.4 with:
 
-The `configureVitest` plugin hook **cannot filter the test file list**. There is no hook that receives the test list before execution. The plugin API is designed for config mutation, not test selection.
+- Absolute paths → only matched tests run
+- Glob patterns → only matched tests run
+- Empty array → "No test files found" (correct behavior)
+- `onFilterWatchedSpecification` → available for watch mode filtering
 
-The only way to control which tests run is via the programmatic API:
+**The plugin approach is strictly better:**
+- Zero friction — users add one line to `vitest.config.ts`
+- IDE integrations work automatically (VS Code Vitest extension, WebStorm, etc.)
+- No separate binary, no CLI argument parsing, no version coupling
+- CI scripts use `npx vitest run` unchanged
+- Discoverable via Vitest's plugin ecosystem
 
 ```typescript
-import { createVitest } from 'vitest/node'
+/// <reference types="vitest/config" />
+import type { Plugin } from 'vite'
 
-const vitest = await createVitest('test', { watch: false })
-await vitest.init()
+export function vitestSmart(options = {}): Plugin {
+  return {
+    name: 'vitest:smart',
+    async configureVitest({ vitest }) {
+      if (options.disabled) return
 
-// Build our dependency graph, determine affected tests
-const affectedTests = getAffectedTests(changedFiles, graph)
+      const graph = await loadOrBuildGraph(vitest.config.root)
+      const changedFiles = await getChangedFiles(vitest.config.root, options.ref)
+      const affectedTests = bfsAffectedTests(changedFiles, graph.reverse)
 
-// Create specifications for only affected tests
-const specs = []
-for (const testFile of affectedTests) {
-  for (const project of vitest.projects) {
-    if (project.matchesTestGlob(testFile)) {
-      specs.push(project.createSpecification(testFile))
+      // One-shot mode: mutate config.include
+      vitest.config.include = [...affectedTests]
+
+      // Watch mode: filter on file change
+      vitest.onFilterWatchedSpecification(spec =>
+        affectedTests.has(spec.moduleId)
+      )
     }
   }
 }
-
-await vitest.runTestSpecifications(specs)
-await vitest.close()
 ```
 
-Key APIs:
-- `createVitest()` — create instance without auto-running
-- `project.matchesTestGlob(path)` — validate test file
-- `project.createSpecification(moduleId)` — create test spec
-- `vitest.runTestSpecifications(specs)` — run specific tests only
-
-**No existing Vitest community plugin filters test files.** They all either transform code, add reporters, or provide separate tools. This confirms the wrapper CLI is the correct pattern.
+**Lesson learned:** Always empirically verify architectural constraints. Web research and even source code reading can be misleading — the 30-minute test that disproved the "cannot filter" claim saved weeks of unnecessary CLI wrapper complexity.
 
 ---
 
@@ -330,7 +335,7 @@ oxc-parser returns dynamic imports via `result.module.dynamicImports`. We should
 | 3 | Graph Storage | JSON (msgpackr upgrade path) | 5/5 | 2/5 |
 | 4 | Cache Invalidation | mtime + xxHash64 hybrid | 5/5 | 3/5 |
 | 5 | Git Diff Strategy | merge-base + untracked (two-mode) | 4/5 | 3/5 |
-| 6 | Integration | Wrapper CLI via startVitest API | 5/5 | 5/5 |
+| 6 | Integration | Vitest Plugin via configureVitest (REVISED — empirically verified) | 5/5 | 5/5 |
 | 7 | Build Tool | tsup (migrate to tsdown later) | 3/5 | 1/5 |
 | 8 | Package Name | vitest-smart | 4/5 | 2/5 |
 | 9 | CJS Support | ESM-only | 4/5 | 2/5 |
@@ -385,23 +390,24 @@ Total install footprint: ~4 MB (oxc-parser ~2MB + oxc-resolver ~2MB + xxhash-was
 ```
 vitest-smart/
 ├── src/
-│   ├── bin.ts               # CLI entry: #!/usr/bin/env node
+│   ├── plugin.ts            # Vitest configureVitest hook (entry point)
 │   ├── index.ts             # Public API exports
-│   ├── runner.ts            # Wrapper around createVitest + runTestSpecifications
 │   ├── graph/
 │   │   ├── builder.ts       # oxc-parser + oxc-resolver → forward graph
 │   │   ├── inverter.ts      # Forward → reverse graph (already implemented)
 │   │   └── cache.ts         # JSON persistence + mtime/xxHash invalidation
+│   ├── git.ts               # Git diff integration (3 commands)
 │   ├── selector.ts          # git diff → BFS reverse graph → affected test files
 │   └── reporter.ts          # Custom Vitest reporter for coverage data collection (Phase 2)
 ├── test/
+│   ├── plugin-experiment/   # Empirical proof that config.include mutation works
 │   └── fixtures/
 ├── package.json
 ├── tsconfig.json
 └── tsup.config.ts
 ```
 
-Key change from original plan: `plugin.ts` → `runner.ts` + `bin.ts`. The plugin approach doesn't work for test filtering. We use the programmatic `createVitest` API instead.
+**REVISED 2026-02-21:** Architecture restored to plugin.ts (original plan was correct). Empirical testing proved `configureVitest` + `config.include` mutation DOES filter tests. No CLI wrapper needed. The `bin.ts` + `runner.ts` approach was based on incorrect web research and has been removed.
 
 ---
 

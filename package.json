@@ -38,7 +38,8 @@
   },
   "dependencies": {
     "oxc-parser": "^0.114.0",
-    "oxc-resolver": "^6.0.0"
+    "oxc-resolver": "^6.0.0",
+    "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

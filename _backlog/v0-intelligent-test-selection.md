@@ -69,13 +69,13 @@ Jest's `resolveInverseModuleMap` scans the *entire* haste-map filesystem at ever
 vitest-smart/
 ├── src/
 │   ├── plugin.ts            # Vitest configureVitest hook (entry point)
+│   ├── index.ts             # Public API exports
 │   ├── graph/
 │   │   ├── builder.ts       # oxc-parser + oxc-resolver → forward graph
 │   │   ├── inverter.ts      # Forward graph → reverse graph (DONE)
 │   │   └── cache.ts         # Persist to .vitest-smart/, hash-based invalidation
 │   ├── git.ts               # Git diff integration (3 commands)
-│   ├── selector.ts          # BFS reverse graph → affected test file list
-│   └── index.ts             # Public API
+│   └── selector.ts          # BFS reverse graph → affected test file list
 ├── test/
 │   ├── fixtures/            # Sample projects with known dependency structures
 │   │   ├── simple/          # Linear A→B→C chain
@@ -86,6 +86,8 @@ vitest-smart/
 ├── tsconfig.json
 └── vitest.config.ts
 ```
+
+> **EMPIRICALLY VERIFIED (2026-02-21):** Mutating `vitest.config.include` inside the `configureVitest` hook DOES filter which test files run. Tested with absolute paths, glob patterns, and empty arrays on Vitest 3.2.4. This means vitest-smart is a **standard Vitest plugin** — no CLI wrapper needed. Users just add it to `vitest.config.ts` and run `npx vitest` as normal. IDE integrations, CI scripts, and the entire Vitest ecosystem work unchanged.
 
 ### Core Dependencies
 
@@ -191,9 +193,9 @@ return result.path;              // Absolute resolved path
 - `result.moduleType` and `result.packageJsonPath` also available on success
 - **tsconfig MUST be configured** — without it, `@/` path aliases fail (739/741 errors in testing)
 
-### Vitest Plugin Architecture
+### Integration Architecture: Vitest Plugin via `configureVitest`
 
-Two separate mechanisms needed for filtering tests:
+> **VERIFIED EMPIRICALLY (2026-02-21):** The `configureVitest` hook CAN filter the test file list by mutating `vitest.config.include`. Earlier web research incorrectly stated this was impossible. Tested on Vitest 3.2.4 with absolute paths, globs, and empty arrays — all work as expected. This overrides Decision 6 in `v0-decisions.md`.
 
 ```typescript
 /// <reference types="vitest/config" />
@@ -208,30 +210,54 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
   return {
     name: 'vitest:smart',
 
-    async configureVitest({ vitest, project }) {
+    async configureVitest({ vitest }) {
       if (options.disabled) return;
 
-      const graph = await loadOrBuildGraph(vitest.config.root);
-      const changedFiles = await getChangedFiles(vitest.config.root, options.ref);
-      const affectedTests = bfsAffectedTests(changedFiles, graph.reverse);
+      try {
+        const graph = await loadOrBuildGraph(vitest.config.root);
+        const changedFiles = await getChangedFiles(vitest.config.root, options.ref);
+        const affectedTests = bfsAffectedTests(changedFiles, graph.reverse);
 
-      // ONE-SHOT MODE (vitest run): mutate config.include before start() globs
-      // configureVitest runs during _setServer(), before start() — mutations here
-      // affect which files globTestSpecifications() finds
-      if (affectedTests.size > 0) {
-        vitest.config.include = [...affectedTests];
+        if (affectedTests.size > 0) {
+          // ONE-SHOT MODE: set include to only affected test file paths
+          // Verified: this mutation IS respected by globTestSpecifications()
+          vitest.config.include = [...affectedTests];
+          console.log(`[vitest-smart] ${affectedTests.size} affected tests (of ${graph.totalTests} total)`);
+        } else {
+          console.log('[vitest-smart] No affected tests — skipping all tests');
+          vitest.config.include = [];
+        }
+
+        // WATCH MODE: filter which specs rerun on file change
+        vitest.onFilterWatchedSpecification((spec) => {
+          return affectedTests.has(spec.moduleId);
+        });
+      } catch (err) {
+        // GRACEFUL FALLBACK: if anything fails, run all tests
+        console.warn('[vitest-smart] Error building graph — running full suite:', err);
+        // Don't modify config.include — let Vitest run everything
       }
-
-      // WATCH MODE: filter which specs to rerun on file change
-      vitest.onFilterWatchedSpecification((spec) => {
-        return affectedTests.has(spec.moduleId);
-      });
     }
   };
 }
 ```
 
-**Key timing:** `configureVitest` runs during `_setServer()`, called before `start()`. Mutating `vitest.config.include` here affects the initial `globTestSpecifications()` call. `onFilterWatchedSpecification` is watch-mode only.
+**Two filtering mechanisms, one plugin:**
+1. **One-shot mode (`vitest run`):** Mutate `vitest.config.include` to absolute paths of affected tests
+2. **Watch mode:** `onFilterWatchedSpecification` filters which specs rerun on file change
+
+**User experience — zero friction:**
+```typescript
+// vitest.config.ts — this is ALL the user needs to add
+import { defineConfig } from 'vitest/config'
+import { vitestSmart } from 'vitest-smart'
+
+export default defineConfig({
+  plugins: [vitestSmart()],
+})
+```
+
+Then just run `npx vitest` as normal. IDE integrations, CI scripts, reporters — everything works unchanged.
 
 ### Git Diff Integration
 
@@ -268,6 +294,16 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<string[]>
 - `ref...HEAD` (three dots) = merge-base comparison (what diverged since branching) — correct for CI
 - Newly created files only appear in `git ls-files --others` — need all three commands
 - No external dependencies needed — `child_process.execFile` is sufficient (avoids `execa` dep)
+- **CI shallow clones:** `git diff --merge-base` requires commit history. GitHub Actions defaults to `fetch-depth: 1` which will fail. Document this requirement:
+
+```yaml
+# GitHub Actions — required for vitest-smart in CI
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0  # Full history needed for merge-base diff
+```
+
+If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually sufficient. vitest-smart should detect shallow clones and warn with a helpful message.
 
 ---
 
@@ -278,18 +314,33 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<string[]>
 **Effort:** ~500-1000 lines
 **Accuracy:** ~80% (catches all static import-chain dependencies)
 
-**Implementation Steps:**
+**Implementation Steps (test-first order):**
 
-1. **`graph/builder.ts`** — Glob all source files, parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`
-2. **`graph/inverter.ts`** — Invert forward graph to reverse graph (DONE — already implemented)
-3. **`graph/cache.ts`** — Persist graph + file hashes to `.vitest-smart/graph.json`. On rebuild, only re-parse files whose content hash changed.
-4. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged)
-5. **`selector.ts`** — BFS the reverse graph from changed files, collect affected test files (match `*.test.*` / `*.spec.*`)
-6. **`plugin.ts`** — Wire everything together in `configureVitest` hook
-7. **`index.ts`** — Export plugin function + standalone API
-8. **Fixture tests** — Small projects with known dependency structures to verify graph correctness
+1. **Fixture tests** — Create small projects with known dependency structures FIRST. These define the contract. Include: `simple/` (linear A→B→C), `diamond/` (A→B→C, A→D→C), `circular/` (A→B→A). Write failing tests that assert expected graph shapes and affected test sets.
+2. **`graph/builder.ts`** — Glob all source files, parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`
+3. **`graph/inverter.ts`** — Invert forward graph to reverse graph (DONE — already implemented)
+4. **`graph/cache.ts`** — Persist graph + file hashes to `.vitest-smart/graph.json`. On rebuild, only re-parse files whose content hash changed.
+5. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged)
+6. **`selector.ts`** — BFS the reverse graph from changed files, collect affected test files. **Must include graceful fallback:** if graph build or git commands fail, return `null` to signal "run all tests".
+7. **`plugin.ts`** — Wire everything together in `configureVitest` hook. Mutate `config.include` for one-shot mode, register `onFilterWatchedSpecification` for watch mode. Graceful fallback: on error, don't modify config (runs full suite).
+8. **`index.ts`** — Export plugin function + standalone API for programmatic use
 
-**Type-only imports:** oxc-parser provides `imp.t` boolean — we skip these since they create no runtime dependency. This improves accuracy over naive parsing.
+**Safety invariant:** vitest-smart must NEVER silently skip tests. If any component fails (graph build, git diff, BFS), the fallback is to run the full test suite and log a warning. False positives (running too many tests) are acceptable; false negatives (missing failures) are not.
+
+**Graceful fallback:** If graph build, cache load, or git diff fails for any reason, vitest-smart runs the full test suite and logs a warning. Never silently skip tests.
+
+**`verify` mode:** Validates accuracy by running affected tests first, then running ALL tests, and comparing results. Reports any failures that smart selection would have missed. Use this to prove the accuracy claim on your codebase before trusting it in CI.
+
+```typescript
+// vitest.config.ts
+vitestSmart({ verify: true })  // Run affected, then full, compare results
+```
+
+Or via environment variable: `VITEST_SMART_VERIFY=1 npx vitest run`
+
+**`forceRerunTriggers`:** Changes to `vitest.config.*`, `tsconfig.json`, `package.json`, or `.env*` trigger a full test run regardless of graph analysis. These files affect all tests but are invisible to static import analysis. Configurable via options.
+
+**Type-only imports:** oxc-parser provides `imp.entries[].isType` — if ALL entries are type-only, we skip the import since it creates no runtime dependency. This improves accuracy over naive parsing.
 
 **Dynamic imports:** Captured by `module.dynamicImports` — included in graph when specifier is a string literal. Computed specifiers (`import(variable)`) are ignored (Phase 2 handles via coverage).
 
