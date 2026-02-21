@@ -1,0 +1,47 @@
+{
+  "name": "vitest-smart",
+  "version": "0.1.0",
+  "description": "Intelligent test selection for Vitest — run only the tests affected by your changes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "vitest",
+    "test-selection",
+    "test-impact-analysis",
+    "dependency-graph",
+    "affected-tests",
+    "vitest-plugin"
+  ],
+  "author": "CraigVan",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "vitest": ">=3.0.0"
+  },
+  "dependencies": {
+    "es-module-lexer": "^1.6.0",
+    "oxc-resolver": "^6.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
