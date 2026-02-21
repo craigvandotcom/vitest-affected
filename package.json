@@ -37,7 +37,7 @@
     "vitest": ">=3.0.0"
   },
   "dependencies": {
-    "es-module-lexer": "^1.6.0",
+    "oxc-parser": "^0.114.0",
     "oxc-resolver": "^6.0.0"
   },
   "devDependencies": {

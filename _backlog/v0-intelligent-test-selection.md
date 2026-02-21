@@ -14,13 +14,22 @@ When you change `src/utils/food.ts`, you want to know which test files to run. T
 
 | Tool | Limitation |
 |---|---|
-| `vitest --changed` | Only catches directly changed files, misses transitive deps |
+| `vitest --changed` | Uses runtime Vite module graph — forward-only traversal, no persistence, misses transitive deps |
 | `vitest related <files>` | Manual — you have to tell it which files changed |
 | Nx/Turborepo `affected` | Package-level, not file-level |
 | Wallaby.js | Commercial, closed-source, IDE-coupled |
 | Datadog TIA | SaaS, commercial, requires dd-trace |
 
-**No open-source Vitest plugin for file-level intelligent test selection exists.**
+**No open-source Vitest plugin for file-level intelligent test selection exists.** (Confirmed: npm search returns zero results for vitest-affected, vitest-related, vitest-tia, vitest-impact.)
+
+### Why `vitest --changed` Falls Short (Verified)
+
+Vitest's `--changed` implementation (`packages/vitest/src/node/git.ts`) has three fundamental problems:
+
+1. **Runtime graph only** — The Vite module graph doesn't exist before tests start. It's populated as Vite transforms modules during the run. So `--changed` cannot pre-filter — it still starts all test workers, then checks.
+2. **No persistence** — The graph is in-memory per process. Every run starts from scratch.
+3. **Forward-only traversal** — `getTestDependencies()` walks forward (test → imports → their imports) and checks if any changed file appears. This is O(test_count × graph_depth). A pre-built reverse graph inverts this to O(changed_files × graph_depth).
+4. **Bug: misses changed test files** — If a test file itself is modified (not a source file it imports), `--changed` does NOT run it (vitest issue #1113).
 
 ---
 
@@ -28,12 +37,12 @@ When you change `src/utils/food.ts`, you want to know which test files to run. T
 
 ### Core Algorithm
 
-1. **Parse** — Extract all `import`/`require` statements from every source file
-2. **Resolve** — Turn import specifiers into absolute file paths
+1. **Parse** — Extract all import/export specifiers from every source file using `oxc-parser`
+2. **Resolve** — Turn specifiers into absolute file paths using `oxc-resolver`
 3. **Build forward graph** — `file → [files it imports]`
-4. **Invert** — `file → [files that import it]` (reverse graph)
+4. **Invert** — `file → [files that import it]` (reverse adjacency list)
 5. **Query** — Given `git diff` changed files, BFS the reverse graph to find all affected test files
-6. **Cache** — Persist graph to disk, use file hashes for incremental updates
+6. **Cache** — Persist graph to disk, use file content hashes for incremental updates
 
 ### Example
 
@@ -48,6 +57,10 @@ src/utils/food.ts          (CHANGED)
 
 Change 1 file → run 3 tests instead of 50.
 
+### BFS vs Jest's Approach
+
+Jest's `resolveInverseModuleMap` scans the *entire* haste-map filesystem at every BFS level — O(V × depth). Our pre-built reverse adjacency list makes BFS O(V + E), strictly better for large codebases. Circular dependencies handled by a `visited` set (same as Jest's `visitedModules`).
+
 ---
 
 ## Technical Architecture
@@ -57,13 +70,18 @@ vitest-smart/
 ├── src/
 │   ├── plugin.ts            # Vitest configureVitest hook (entry point)
 │   ├── graph/
-│   │   ├── builder.ts       # es-module-lexer + oxc-resolver → forward graph
-│   │   ├── inverter.ts      # Forward graph → reverse graph
+│   │   ├── builder.ts       # oxc-parser + oxc-resolver → forward graph
+│   │   ├── inverter.ts      # Forward graph → reverse graph (DONE)
 │   │   └── cache.ts         # Persist to .vitest-smart/, hash-based invalidation
-│   ├── selector.ts          # git diff → BFS reverse graph → test file list
+│   ├── git.ts               # Git diff integration (3 commands)
+│   ├── selector.ts          # BFS reverse graph → affected test file list
 │   └── index.ts             # Public API
 ├── test/
-│   └── fixtures/            # Sample projects for testing the plugin itself
+│   ├── fixtures/            # Sample projects with known dependency structures
+│   │   ├── simple/          # Linear A→B→C chain
+│   │   ├── diamond/         # Diamond dependency pattern
+│   │   └── circular/        # Circular import handling
+│   └── *.test.ts
 ├── package.json
 ├── tsconfig.json
 └── vitest.config.ts
@@ -73,17 +91,140 @@ vitest-smart/
 
 | Package | Purpose | Why this one |
 |---|---|---|
-| `es-module-lexer` | Extract import specifiers | 4KiB, zero deps, Vite uses it internally, ~5ms/MB |
-| `oxc-resolver` | Resolve specifiers to file paths | 28x faster than enhanced-resolve, handles TS aliases |
+| `oxc-parser` | Parse imports from TS/JS/TSX/JSX files | Handles TypeScript natively, same API shape as es-module-lexer but with full AST. `result.module.staticImports` gives pre-extracted imports with zero AST walking. Used by Rolldown/Vite 8. |
+| `oxc-resolver` | Resolve specifiers to file paths | 28x faster than enhanced-resolve, handles TS aliases, tsconfig paths, project references. Same OXC ecosystem as parser. |
 
-### Plugin Entry Point
+**Why not es-module-lexer?** It cannot parse TypeScript files — requires pre-transform with esbuild. oxc-parser handles `.ts`/`.tsx` natively in a single step and provides the full AST we'll need for Phase 3 (symbol-level tracking).
 
-Hook into Vitest via `configureVitest` (v3.1+ plugin API):
-- On test run, check for cached dependency graph
-- If stale or missing, rebuild (incremental — only re-parse changed files)
-- Run `git diff` to get changed files
-- BFS reverse graph to find affected test files
-- Filter Vitest's test list to only affected tests
+### Verified API Patterns
+
+#### oxc-parser — Import Extraction
+
+```typescript
+import { parseSync } from 'oxc-parser';
+
+const { module, errors } = parseSync('file.ts', sourceCode);
+
+// Static imports — imp.n = specifier, imp.t = type-only boolean
+for (const imp of module.staticImports) {
+  if (imp.t) continue;  // Skip type-only imports (no runtime dependency)
+  specifiers.push(imp.n);
+}
+
+// Dynamic imports — imp.n is null for computed expressions like import(someVar)
+for (const imp of module.dynamicImports) {
+  if (imp.n) specifiers.push(imp.n);
+}
+
+// Re-exports — export { foo } from './bar', export * from './baz'
+for (const exp of module.staticExports) {
+  if (exp.n) specifiers.push(exp.n);
+}
+```
+
+#### oxc-resolver — Path Resolution
+
+```typescript
+import { ResolverFactory } from 'oxc-resolver';
+import path from 'node:path';
+
+const resolver = new ResolverFactory({
+  extensions: ['.ts', '.tsx', '.js', '.jsx', '.json'],
+  conditionNames: ['node', 'import'],
+  tsconfig: {
+    configFile: '/project/tsconfig.json',
+    references: 'auto',  // follow project references
+  },
+  builtinModules: true,  // returns result.builtin for node:fs etc.
+});
+
+// CRITICAL: context is DIRECTORY, not file path
+const result = resolver.sync(path.dirname(importingFile), specifier);
+
+if (result.builtin) return null;    // Skip Node.js builtins
+if (result.error) return null;      // Resolution failed (external package)
+return result.path;                 // Absolute resolved path
+```
+
+**Gotcha:** `resolver.sync()` takes the *directory* of the importing file as the first arg, NOT the file itself. Use `path.dirname(importingFile)`.
+
+### Vitest Plugin Architecture
+
+Two separate mechanisms needed for filtering tests:
+
+```typescript
+/// <reference types="vitest/config" />
+import type { Plugin } from 'vite';
+
+export interface VitestSmartOptions {
+  disabled?: boolean;
+  ref?: string;  // git ref to diff against (default: auto-detect)
+}
+
+export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
+  return {
+    name: 'vitest:smart',
+
+    async configureVitest({ vitest, project }) {
+      if (options.disabled) return;
+
+      const graph = await loadOrBuildGraph(vitest.config.root);
+      const changedFiles = await getChangedFiles(vitest.config.root, options.ref);
+      const affectedTests = bfsAffectedTests(changedFiles, graph.reverse);
+
+      // ONE-SHOT MODE (vitest run): mutate config.include before start() globs
+      // configureVitest runs during _setServer(), before start() — mutations here
+      // affect which files globTestSpecifications() finds
+      if (affectedTests.size > 0) {
+        vitest.config.include = [...affectedTests];
+      }
+
+      // WATCH MODE: filter which specs to rerun on file change
+      vitest.onFilterWatchedSpecification((spec) => {
+        return affectedTests.has(spec.moduleId);
+      });
+    }
+  };
+}
+```
+
+**Key timing:** `configureVitest` runs during `_setServer()`, called before `start()`. Mutating `vitest.config.include` here affects the initial `globTestSpecifications()` call. `onFilterWatchedSpecification` is watch-mode only.
+
+### Git Diff Integration
+
+Three commands needed for full coverage (same approach as Vitest's own implementation):
+
+```typescript
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+
+async function getChangedFiles(rootDir: string, ref?: string): Promise<string[]> {
+  const run = async (args: string[]) => {
+    const { stdout } = await exec('git', args, { cwd: rootDir });
+    return stdout.split('\n').filter(Boolean);
+  };
+
+  const [committed, staged, unstaged] = await Promise.all([
+    ref ? run(['diff', '--name-only', '--diff-filter=ACMR', `${ref}...HEAD`]) : [],
+    run(['diff', '--cached', '--name-only', '--diff-filter=ACMR']),
+    run(['ls-files', '--others', '--modified', '--exclude-standard']),
+  ]);
+
+  const { stdout: gitRoot } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
+
+  return [...new Set([...committed, ...staged, ...unstaged])]
+    .map(f => path.resolve(gitRoot.trim(), f));  // Resolve to absolute paths
+}
+```
+
+**Gotchas:**
+- `--name-only` output is relative to git root, not cwd — always resolve with `git rev-parse --show-toplevel`
+- `--diff-filter=ACMR` excludes deletions (no graph entry to look up)
+- `ref...HEAD` (three dots) = merge-base comparison (what diverged since branching) — correct for CI
+- Newly created files only appear in `git ls-files --others` — need all three commands
+- No external dependencies needed — `child_process.execFile` is sufficient (avoids `execa` dep)
 
 ---
 
@@ -91,17 +232,25 @@ Hook into Vitest via `configureVitest` (v3.1+ plugin API):
 
 ### Phase 1: Static Import Graph (MVP)
 
-**Effort:** ~500-1000 lines, days of work
-**Accuracy:** ~80% (catches all import-chain dependencies)
+**Effort:** ~500-1000 lines
+**Accuracy:** ~80% (catches all static import-chain dependencies)
 
-- Parse imports with `es-module-lexer`
-- Resolve paths with `oxc-resolver`
-- Build + invert dependency graph
-- BFS affected test discovery
-- File-hash-based caching to `.vitest-smart/`
-- CLI: `vitest --smart` or `vitest-smart` wrapper
+**Implementation Steps:**
 
-**Misses:** Dynamic imports, `fs.readFile` dependencies, shared global state, config file impacts
+1. **`graph/builder.ts`** — Glob all source files, parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`
+2. **`graph/inverter.ts`** — Invert forward graph to reverse graph (DONE — already implemented)
+3. **`graph/cache.ts`** — Persist graph + file hashes to `.vitest-smart/graph.json`. On rebuild, only re-parse files whose content hash changed.
+4. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged)
+5. **`selector.ts`** — BFS the reverse graph from changed files, collect affected test files (match `*.test.*` / `*.spec.*`)
+6. **`plugin.ts`** — Wire everything together in `configureVitest` hook
+7. **`index.ts`** — Export plugin function + standalone API
+8. **Fixture tests** — Small projects with known dependency structures to verify graph correctness
+
+**Type-only imports:** oxc-parser provides `imp.t` boolean — we skip these since they create no runtime dependency. This improves accuracy over naive parsing.
+
+**Dynamic imports:** Captured by `module.dynamicImports` — included in graph when specifier is a string literal. Computed specifiers (`import(variable)`) are ignored (Phase 2 handles via coverage).
+
+**Misses:** `fs.readFile` dependencies, shared global state, config file impacts, computed dynamic imports.
 
 ### Phase 2: Coverage-Enhanced Selection
 
@@ -118,7 +267,7 @@ Hook into Vitest via `configureVitest` (v3.1+ plugin API):
 **Effort:** Longer-term
 **Accuracy:** ~99%
 
-- Use tree-sitter or SCIP for symbol-level analysis
+- Use oxc-parser's full AST (already available — no new parser needed)
 - Track which specific exports each test uses
 - If only `functionA` changed in a file, skip tests that only import `functionB`
 - This is Wallaby-level precision, open-source
@@ -131,30 +280,36 @@ Hook into Vitest via `configureVitest` (v3.1+ plugin API):
 
 ---
 
-## Prior Art & References
+## Prior Art & Research Findings
 
 ### Algorithms
-- **Jest `resolveInverseModuleMap`** — BFS reverse-dependency walk. Three sets: `changed`, `relatedPaths`, `visitedModules`. [Deep-dive article](https://thesametech.com/under-the-hood-jest-related-tests/)
+- **Jest `resolveInverseModuleMap`** — BFS with 3 sets: `changed`, `relatedPaths`, `visitedModules`. Scans entire haste-map per BFS level (O(V × depth)). Our reverse adjacency list approach is O(V + E). [Deep-dive](https://thesametech.com/under-the-hood-jest-related-tests/)
 - **Martin Fowler's TIA taxonomy** — coverage-based vs graph-based vs predictive. [Article](https://martinfowler.com/articles/rise-test-impact-analysis.html)
 - **Meta Predictive Test Selection** — ML approach, 2x CI cost reduction. [Paper](https://arxiv.org/abs/1810.05286)
 
-### Graph Building Tools
-- **dependency-cruiser** (6.2k stars) — battle-tested graph builder, has `reachable` rule type. [GitHub](https://github.com/sverweij/dependency-cruiser)
-- **skott** (835 stars) — TS-native graph API with `collectFilesDependencies()`. [GitHub](https://github.com/antoine-coulon/skott)
-- **madge** (9.9k stars) — popular but TS 5.4+ broken. [GitHub](https://github.com/pahen/madge)
-- **Knip** — uses oxc-resolver, demonstrates full-project graph traversal. [GitHub](https://github.com/webpro-nl/knip)
+### Evaluated & Rejected
 
-### Agent Context / Knowledge Graphs
-- **Aider Repo Map** — tree-sitter + PageRank for symbol importance. [Docs](https://aider.chat/docs/repomap.html)
-- **Sourcegraph SCIP** — precise cross-references via TS type checker. [GitHub](https://github.com/sourcegraph/scip)
-- **code-graph-rag** — tree-sitter-based graph as MCP server. [GitHub](https://github.com/vitali87/code-graph-rag)
-- **GitLab Knowledge Graph** — Rust-based, entities + relationships. [Docs](https://docs.gitlab.com/user/project/repository/knowledge_graph/)
+| Tool | Reason for rejection |
+|---|---|
+| `dependency-cruiser` | No incremental update API — full scan on every call. 10-50x slower than oxc-parser + caching. |
+| `skott` | TS-native but no incremental update, no Vitest integration. |
+| `madge` | Broken on TS 5.4+. |
+| `Knip` | Uses oxc-resolver internally but does not expose graph traversal API. |
+| `es-module-lexer` | Cannot parse TypeScript files — requires esbuild pre-transform. oxc-parser is single-step and provides full AST for Phase 3. |
 
-### Fast Parsers
-- **es-module-lexer** — 4KiB WASM, ~5ms/MB, ESM-only. [GitHub](https://github.com/guybedford/es-module-lexer)
+### Chosen Stack
+
+| Tool | Role |
+|---|---|
+| `oxc-parser` | Parse imports from TS/JS/TSX/JSX — `result.module` API, type-only import detection |
+| `oxc-resolver` | Resolve specifiers to absolute file paths — tsconfig paths, project references |
+| `child_process.execFile` | Git diff — no external dependency needed |
+
+### Fast Parsers (Reference)
+- **oxc-parser** — full Rust parser, 3x faster than SWC, TS-native. [GitHub](https://github.com/oxc-project/oxc)
+- **es-module-lexer** — 4KiB WASM, ~5ms/MB, ESM-only (no TS). [GitHub](https://github.com/guybedford/es-module-lexer)
 - **oxc-resolver** — Rust, 28x faster than enhanced-resolve. [GitHub](https://github.com/oxc-project/oxc-resolver)
 - **tree-sitter** — incremental parsing, symbol-level. [GitHub](https://github.com/tree-sitter/tree-sitter)
-- **OXC parser** — full Rust parser, 3x faster than SWC. [GitHub](https://github.com/oxc-project/oxc)
 
 ### Commercial Competitors
 - **Wallaby.js** — static + dynamic analysis, IDE plugin, commercial. [Site](https://wallabyjs.com/)
@@ -166,8 +321,8 @@ Hook into Vitest via `configureVitest` (v3.1+ plugin API):
 ## Vitest Integration Points
 
 ### What Vitest already provides
-- `vitest --changed` — git-diff-based, uses Vite module graph (limited)
-- `vitest related <files>` — manual file list, uses same module graph
+- `vitest --changed` — git-diff-based, uses runtime Vite module graph (forward-only, non-persistent)
+- `vitest related <files>` — manual file list, uses same runtime module graph
 - `forceRerunTriggers` — glob patterns for "rerun everything" files
 - `configureVitest` plugin hook (v3.1+) — our primary extension point
 
@@ -175,7 +330,39 @@ Hook into Vitest via `configureVitest` (v3.1+ plugin API):
 - No persistent graph between runs (Vite module graph is runtime-only)
 - No incremental updates (rebuilds from scratch each time)
 - No reverse-dependency lookup (forward-only traversal)
+- Changed test files not detected (issue #1113)
 - Dynamic imports, `require()`, config files invisible to module graph
+
+### Plugin Hook Details (Verified)
+
+```typescript
+// vitest/config augments Vite's Plugin interface:
+declare module "vite" {
+  interface Plugin<A = any> {
+    configureVitest?: HookHandler<(context: VitestPluginContext) => void>;
+  }
+}
+
+interface VitestPluginContext {
+  vitest: Vitest;
+  project: TestProject;
+  injectTestProjects: (config: TestProjectConfiguration | TestProjectConfiguration[]) => Promise<TestProject[]>;
+}
+```
+
+**Filtering APIs on Vitest instance:**
+
+| Method | Purpose | Mode |
+|---|---|---|
+| `onFilterWatchedSpecification(fn)` | Filter which specs rerun on file change | Watch only |
+| `globTestSpecifications(filters?)` | Get all test specs (respects config.include) | Both |
+| `runTestSpecifications(specs)` | Run a specific set of specs | Both |
+| `config.include` / `config.exclude` | Mutable string[] — affects globbing | Both |
+
+**TestSpecification properties:**
+- `spec.moduleId` — absolute file path (the key for our Set lookups)
+- `spec.project` — which TestProject this belongs to
+- `spec.pool` — worker pool ('forks', 'threads', etc.)
 
 ---
 
@@ -200,6 +387,7 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
 ### Testing the Plugin Itself
 - Fixture-based tests: small sample projects with known dependency structures
 - Verify graph correctness against known dependency chains
+- Test edge cases: circular imports, re-exports, dynamic imports, type-only imports
 - Benchmark parse + resolve times on real-world project sizes
 
 ### CI Strategy
@@ -209,13 +397,32 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
 
 ---
 
+## Package Changes Needed
+
+```json
+{
+  "dependencies": {
+    "oxc-parser": "^0.114.0",
+    "oxc-resolver": "^6.0.0"
+  }
+}
+```
+
+Remove `es-module-lexer` — replaced by `oxc-parser`.
+
+Add new source file: `src/git.ts` — git diff integration.
+
+---
+
 ## Portfolio Positioning
 
 **What makes this stand out:**
-- Solves a real, unsolved problem in the OSS ecosystem
-- Built on respected foundations (es-module-lexer, oxc-resolver)
+- Solves a real, unsolved problem in the OSS ecosystem (verified: zero npm competitors)
+- Built on the OXC Rust toolchain (oxc-parser + oxc-resolver) — fastest available
 - Small surface area — plugin, not a full test runner
 - Clear, measurable value proposition
+- Type-only import filtering improves accuracy over naive approaches
 - Natural growth path from static graph → coverage → symbol-level → ML
+- Phase 3 needs zero parser change — oxc-parser's full AST is already available
 
-**npm name candidates:** `vitest-smart`, `vitest-affected`, `vitest-tia`
+**npm name:** `vitest-smart` (unclaimed, verified)
