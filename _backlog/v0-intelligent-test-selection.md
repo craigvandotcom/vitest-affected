@@ -126,10 +126,17 @@ const { module: mod, errors } = parseSync(filePath, sourceCode);
 
 const specifiers: string[] = [];
 
+// Binary assets that cannot meaningfully affect test behavior — skip before resolver
+// NOTE: .css/.json are NOT skipped — they are recorded as leaf nodes (no outgoing edges)
+// so BFS can trace dependents when these files change
+const BINARY_ASSET_EXT = /\.(svg|png|jpg|jpeg|gif|webp|woff2?|eot|ttf|ico)$/i;
+
 // Static imports — imp.moduleRequest.value = specifier string
 for (const imp of mod.staticImports) {
   // Check if ALL entries are type-only (no runtime dependency)
-  if (imp.entries.every(e => e.isType)) continue;
+  // IMPORTANT: side-effect imports have zero entries; do not treat them as type-only
+  if (imp.entries.length > 0 && imp.entries.every(e => e.isType)) continue;
+  if (BINARY_ASSET_EXT.test(imp.moduleRequest.value)) continue;  // skip binary assets
   specifiers.push(imp.moduleRequest.value);
 }
 
@@ -204,7 +211,9 @@ import type { Plugin } from 'vite';
 
 export interface VitestSmartOptions {
   disabled?: boolean;
-  ref?: string;  // git ref to diff against (default: auto-detect)
+  ref?: string;  // git ref to diff against (default: none = staged/unstaged/untracked only)
+  verbose?: boolean;  // log graph build time, changed files, and affected tests
+  threshold?: number;  // run full suite if affected ratio exceeds this (0-1, default 0.5)
 }
 
 // Files that affect all tests but are invisible to static import analysis.
@@ -218,8 +227,14 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
   return {
     name: 'vitest:smart',
 
-    async configureVitest({ vitest }) {
+    async configureVitest({ vitest, project }) {
       if (options.disabled) return;
+
+      // Guard: watch mode not supported in v0 (selection is computed once, becomes stale)
+      if (vitest.config.watch) {
+        console.warn('[vitest-smart] Watch mode not supported in v0 — running full suite');
+        return;
+      }
 
       // Guard: workspace mode not supported in v0
       if (vitest.projects && vitest.projects.length > 1) {
@@ -232,36 +247,72 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
 
         // Build graph inline (v0: always rebuild, ~166ms for 433 files)
         // Extract to loader.ts when Phase 2 caching is added
+        const verbose = options.verbose ?? false;
+        const t0 = performance.now();
         const forward = await buildFullGraph(rootDir);
         const reverse = invertGraph(forward);
+        if (verbose) console.log(`[vitest-smart] Graph: ${forward.size} files in ${(performance.now() - t0).toFixed(1)}ms`);
 
         const { changed, deleted } = await getChangedFiles(rootDir, options.ref);
 
-        // Deleted files that are graph nodes → run full suite (safety invariant)
-        // Only graph members can cause false negatives; deleted docs/logs are harmless
-        const deletedGraphNodes = deleted.filter(f => forward.has(f) || reverse.has(f));
-        if (deletedGraphNodes.length > 0) {
-          console.warn(`[vitest-smart] ${deletedGraphNodes.length} graph node(s) deleted — running full suite`);
+        // If nothing changed, do not filter (normal Vitest behavior = run full suite)
+        if (changed.length === 0 && deleted.length === 0) {
+          if (verbose) console.log('[vitest-smart] No git changes detected — running full suite');
           return;
         }
 
-        // Force full run if config/infra files changed
-        const hasForceRerun = changed.some(f =>
-          FORCE_RERUN_FILES.some(trigger => f.endsWith('/' + trigger))
-        );
+        // Deleted source files → run full suite (safety invariant)
+        // In v0 (always-rebuild), deleted files can't be graph members because the graph
+        // is built from current disk state. Check by extension instead.
+        const SOURCE_EXT = /\.(ts|tsx|js|jsx|mts|mjs|cts|cjs)$/;
+        const deletedSourceFiles = deleted.filter(f => SOURCE_EXT.test(f));
+        if (deletedSourceFiles.length > 0) {
+          console.warn(`[vitest-smart] ${deletedSourceFiles.length} source file(s) deleted — running full suite`);
+          return;
+        }
+
+        // Force full run if config/infra/setup files changed
+        // Auto-detect Vitest's own setup files and forceRerunTriggers
+        const setupFiles = [vitest.config.setupFiles, vitest.config.globalSetup]
+          .flat().filter(Boolean) as string[];
+        const allTriggers = [
+          ...FORCE_RERUN_FILES,
+          ...setupFiles,
+          ...(vitest.config.forceRerunTriggers ?? []),
+        ];
+        const hasForceRerun = changed.some(f => {
+          const relPath = path.relative(rootDir, f);
+          return allTriggers.some(trigger =>
+            // Simple filename: direct comparison. Glob/path pattern: use picomatch.
+            (!trigger.includes('/') && !trigger.includes('*'))
+              ? path.basename(f) === trigger
+              : picomatch.isMatch(relPath, trigger, { dot: true })
+          );
+        });
         if (hasForceRerun) {
           console.log('[vitest-smart] Config file changed — running full suite');
           return;
         }
 
-        // Test file detection via picomatch against Vitest's config.include patterns
-        const picomatch = await import('picomatch');  // declared as dependency (3KB, zero cost)
-        const isTestFile = picomatch.default(vitest.config.include, { cwd: rootDir });
+        // Test file detection: use Vitest's canonical spec discovery (most correct)
+        // globTestSpecifications respects config.include, config.exclude, and all Vitest rules
+        const specs = await project.globTestSpecifications();
+        const testFileSet = new Set(specs.map(s => s.moduleId));
+        const isTestFile = (f: string) => testFileSet.has(f);
         const affectedTests = bfsAffectedTests(changed, reverse, isTestFile);
+
+        // Threshold check: if too many tests affected, run full suite (more efficient)
+        // Use testFileSet.size from Vitest's spec discovery (single source of truth)
+        const ratio = testFileSet.size > 0 ? affectedTests.length / testFileSet.size : 0;
+        if (ratio > (options.threshold ?? 0.5)) {
+          if (verbose) console.log(`[vitest-smart] ${(ratio * 100).toFixed(0)}% of tests affected — running full suite`);
+          return;
+        }
 
         if (affectedTests.length > 0) {
           vitest.config.include = affectedTests;
           console.log(`[vitest-smart] ${affectedTests.length} affected tests`);
+          if (verbose) affectedTests.forEach(t => console.log(`  → ${path.relative(rootDir, t)}`));
         } else {
           console.log('[vitest-smart] No affected tests — skipping all tests');
           vitest.config.include = [];
@@ -288,7 +339,13 @@ export default defineConfig({
 })
 ```
 
-Then just run `npx vitest` as normal. IDE integrations, CI scripts, reporters — everything works unchanged.
+Then run one-shot mode:
+
+```bash
+npx vitest run
+```
+
+Watch mode (`npx vitest`) is not supported in v0 — the plugin will detect it and fall back to the full suite. IDE integrations, CI scripts, reporters — everything works unchanged.
 
 ### Git Diff Integration
 
@@ -301,17 +358,31 @@ import { promisify } from 'node:util';
 const exec = promisify(execFile);
 
 async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed: string[]; deleted: string[] }> {
+  // Detect shallow clone before attempting merge-base diff (CI safety)
+  if (ref) {
+    const { stdout: isShallow } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
+    if (isShallow.trim() === 'true') {
+      throw new Error(
+        '[vitest-smart] Shallow git clone detected. Smart selection requires commit history.\n' +
+        'Fix: Set fetch-depth: 0 (or >=50) in your CI checkout step:\n' +
+        '  - uses: actions/checkout@v4\n' +
+        '    with:\n' +
+        '      fetch-depth: 0'
+      );
+    }
+  }
+
   const run = async (args: string[]) => {
     const { stdout } = await exec('git', args, { cwd: rootDir });
     return stdout.split('\n').filter(Boolean);
   };
 
   const [committed, staged, unstaged] = await Promise.all([
-    ref ? run(['diff', '--name-only', '--diff-filter=ACMR', `${ref}...HEAD`]) : [],
-    run(['diff', '--cached', '--name-only', '--diff-filter=ACMR']),
-    // --others: new untracked files, --modified: changed but unstaged
-    // NOTE: --modified can include deleted files, so we filter by existence below
-    run(['ls-files', '--others', '--modified', '--exclude-standard']),
+    ref ? run(['diff', '--name-only', '--diff-filter=ACMRD', `${ref}...HEAD`]) : [],
+    run(['diff', '--cached', '--name-only', '--diff-filter=ACMRD']),
+    // --others: new untracked, --modified: changed but unstaged, --deleted: tracked files removed
+    // All paths resolved to absolute below; existence check separates changed vs deleted
+    run(['ls-files', '--others', '--modified', '--deleted', '--exclude-standard', '--full-name']),
   ]);
 
   const { stdout: gitRoot } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
@@ -323,14 +394,33 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
   const existing = allFiles.filter(f => existsSync(f));
   const deleted = allFiles.filter(f => !existsSync(f));
 
-  // Return both — plugin checks deleted against graph to decide fallback
-  return { changed: existing, deleted };
+  // Detect renames to avoid unnecessary full-suite fallbacks
+  const renamedPairs: Array<{ from: string; to: string }> = [];
+  if (ref) {
+    const { stdout: statusOutput } = await exec('git', ['diff', '--name-status', '-M', `${ref}...HEAD`], { cwd: rootDir });
+    for (const line of statusOutput.split('\n').filter(Boolean)) {
+      const match = line.match(/^R\d*\t(.+)\t(.+)$/);
+      if (match) {
+        renamedPairs.push({
+          from: path.resolve(gitRoot.trim(), match[1]),
+          to: path.resolve(gitRoot.trim(), match[2]),
+        });
+      }
+    }
+  }
+
+  // Renamed files: treat "to" as changed, remove "from" from deleted (it's not truly gone)
+  const renamedFromPaths = new Set(renamedPairs.map(r => r.from));
+  const filteredDeleted = deleted.filter(f => !renamedFromPaths.has(f));
+
+  // Rename handling is internal — callers only see changed + deleted
+  return { changed: existing, deleted: filteredDeleted };
 }
 ```
 
 **Gotchas:**
 - `--name-only` output is relative to git root, not cwd — always resolve with `git rev-parse --show-toplevel`
-- `--diff-filter=ACMR` excludes deletions (no graph entry to look up)
+- `--diff-filter=ACMRD` includes deletions — needed for the deleted-file safety invariant (full suite fallback)
 - `ref...HEAD` (three dots) = merge-base comparison (what diverged since branching) — correct for CI
 - Newly created files only appear in `git ls-files --others` — need all three commands
 - No external dependencies needed — `child_process.execFile` is sufficient (avoids `execa` dep)
@@ -366,7 +456,7 @@ If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually su
    - **Update:** `package.json` → peer dep `>=3.1.0`, remove `xxhash-wasm`, add `picomatch` to deps, add `tsup` to devDeps, update build script to `tsup`
    - **Create:** root `vitest.config.ts` and `tsup.config.ts` (dual ESM+CJS output)
 1. **Fixture tests** — Create small projects with known dependency structures FIRST. These define the contract. Include: `simple/` (linear A→B→C), `diamond/` (A→B→C, A→D→C), `circular/` (A→B→A). Write failing tests that assert expected graph shapes and affected test sets.
-2. **`graph/builder.ts`** — Glob source files using `**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` (exclude `node_modules/`, `dist/`, `.vitest-smart/`, `test/fixtures/`, `coverage/`, `.next/`). Parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`. When a parsed file imports a non-source file (e.g., `import data from './data.json'`), the resolved path is added as a forward-graph key with an empty dependency set — this ensures the inverter creates a reverse edge so BFS can trace dependents of that `.json`/`.css` file. Exports `buildFullGraph(rootDir)` returning the forward map. **Important:** the glob MUST include test files (they import source files and are BFS targets). Use `tinyglobby` (already in vitest's dep tree) for globbing.
+2. **`graph/builder.ts`** — Glob all code files (including test files) using `**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` (exclude `node_modules/`, `dist/`, `.vitest-smart/`, `test/fixtures/`, `coverage/`, `.next/`). The glob MUST return absolute paths (`tinyglobby` with `absolute: true`). Parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`. When a parsed file imports a non-source file (e.g., `import data from './data.json'`), the resolved path is added as a forward-graph key with an empty dependency set — this ensures the inverter creates a reverse edge so BFS can trace dependents of that `.json`/`.css` file. **Skip `node_modules` paths** returned by the resolver — only include files under `rootDir`. Exports `buildFullGraph(rootDir)` returning the forward map. Use `tinyglobby` for globbing. **Parse error handling:** If `oxc-parser` returns errors for a file, log a warning and add the file to the graph with an empty dependency set (graceful degradation). Do not crash the graph build for a single malformed file. **tsconfig discovery:** Search for `tsconfig.json` starting from `rootDir`. If not found, create the resolver without tsconfig config (path aliases will fail, but basic resolution works). Log a warning if tsconfig is missing.
 3. **`graph/inverter.ts`** — Invert forward graph to reverse graph (DONE — already implemented)
 4. **Orchestration lives in `plugin.ts`** — Build graph → invert → BFS is 3 lines of glue, inlined in the plugin's `configureVitest` hook. No separate orchestrator file in v0. Extract to `graph/loader.ts` when Phase 2 caching materializes.
 5. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged). Filter deleted files by existence check (see pseudocode above).
@@ -381,12 +471,13 @@ export function bfsAffectedTests(
 ): string[] {
   const visited = new Set<string>();
   const queue = [...changedFiles];
+  let i = 0;
   const affectedTests: string[] = [];
 
   // BFS seeds include changedFiles directly, so changed test files
   // are always captured (fixes vitest #1113 — no separate pass needed)
-  while (queue.length > 0) {
-    const file = queue.shift()!;
+  while (i < queue.length) {
+    const file = queue[i++]!;
     if (visited.has(file)) continue;
     visited.add(file);
     if (isTestFile(file)) affectedTests.push(file);
@@ -398,7 +489,7 @@ export function bfsAffectedTests(
     }
   }
 
-  return affectedTests;
+  return affectedTests.sort();
 }
 ```
 
@@ -409,9 +500,11 @@ export function bfsAffectedTests(
 
 **Force rerun triggers:** Changes to `vitest.config.*`, `tsconfig.json`, or `package.json` trigger a full test run regardless of graph analysis. Hardcoded as a const array in `plugin.ts` — no user-facing config option in v0.
 
-**Type-only imports:** oxc-parser provides `imp.entries[].isType` — if ALL entries are type-only, we skip the import since it creates no runtime dependency. Same filtering applies to `staticExports` re-exports (`entry.isType`). This improves accuracy over naive parsing.
+**Type-only imports:** oxc-parser provides `imp.entries[].isType` — if ALL entries are type-only AND there is at least one entry, we skip the import since it creates no runtime dependency. Side-effect imports (`import './polyfill'`) have zero entries and must NOT be skipped — they are runtime dependencies. Same filtering applies to `staticExports` re-exports (`entry.isType`). This improves accuracy over naive parsing.
 
 **Dynamic imports:** Captured by `module.dynamicImports` — included in graph when specifier is a string literal. Computed specifiers (`import(variable)`) are ignored (Phase 2 handles via coverage).
+
+**Non-code imports (`.css`, `.json`, `.svg`, images, fonts):** These are recorded as dependencies (leaf nodes in the graph) but NOT parsed for outgoing edges. This ensures BFS can trace dependents when a `.json` or `.css` file changes, while avoiding pointless parse attempts. The `ASSET_EXT` regex in the import extraction code skips binary assets (`.png`, `.svg`, fonts, etc.) that cannot meaningfully change test behavior — but `.json` and `.css` are kept because changes to them can affect runtime behavior.
 
 **Known limitations (Phase 1):**
 - `fs.readFile` dependencies, shared global state, config file impacts, computed dynamic imports
@@ -581,7 +674,8 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
   "dependencies": {
     "oxc-parser": "^0.114.0",
     "oxc-resolver": "^6.0.0",
-    "picomatch": "^4.0.0"
+    "picomatch": "^4.0.2",
+    "tinyglobby": "^0.2.10"
   },
   "peerDependencies": {
     "vitest": ">=3.1.0"
@@ -646,3 +740,18 @@ Add new source file: `src/git.ts` (git diff with deleted file detection).
 - **Key fixes:** Declared picomatch as explicit dependency (not transient), added git.ts to Step 0 rewrite list, removed stale loader.ts reference, noted builder must include test files in glob
 - **Consensus:** 6/6 agents declared plan implementation-ready. Remaining "High" items were execution gaps (stale code stubs, package.json) not plan design issues. All agents said "ship it."
 - **Trajectory:** CONVERGED — finalize
+
+### External Round 1 (GPT-5.2, GLM-5, Kimi K2.5, Gemini 3.1 Pro)
+
+- **Changes:** 10 applied (0 Critical, 4 High, 4 Medium, 2 Incremental)
+- **Key fixes:** BFS queue.shift() → index-based (O(1) per step), auto-detect Vitest setupFiles/globalSetup for force-rerun, shallow clone detection in git.ts, added verbose/threshold options, fixed deletion fallback to use extension check (not graph membership), added rename detection, replaced picomatch with `project.globTestSpecifications()`, added static asset filtering
+- **Consensus:** setupFiles auto-detect 3/4, verbose option 2/4, threshold bail-out 2/4. Unique insights: BFS performance (GPT), globTestSpecifications (GPT), static asset filtering (Gemini), rename detection (GPT+Kimi).
+- **Trajectory:** Significant changes → auto-continue to External Round 2
+
+### External Round 2 (GPT-5.2, GLM-5, Kimi K2.5, Gemini 3.1 Pro)
+
+- **Changes:** 12 applied (6 High, 4 Medium, 2 Low)
+- **Focus:** Implementation correctness — silent bugs, missing error handling, path issues
+- **Key fixes:** Force-rerun trigger matching with picomatch (4/4 consensus), side-effect import vacuous truth bug, no-changes guard, watch mode guard, git --diff-filter includes D, ls-files --full-name for monorepos, picomatch+tinyglobby in deps, builder parse error handling + absolute paths + node_modules filter, static asset contradiction resolved (css/json tracked as leaf nodes), ref docs + git.ts return type aligned
+- **Consensus:** Force-rerun picomatch 4/4 (strongest), syntax error 3/4, dead code 3/4, parse errors 3/4. Critical unique insights: side-effect import bug (GPT), ls-files --full-name (Gemini).
+- **Trajectory:** CONVERGED — all changes are correctness fixes, no architectural changes
