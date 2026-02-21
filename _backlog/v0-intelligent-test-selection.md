@@ -4,7 +4,7 @@
 
 An open-source Vitest plugin that maintains a persistent dependency graph of your codebase and uses it to run only the tests affected by your changes. Like Wallaby.js accuracy, but open-source, zero-config, and CI-ready.
 
-**Tagline:** "Run 80% fewer tests. Catch 99% of failures."
+**Tagline:** "Run only the tests that matter."
 
 ---
 
@@ -42,7 +42,7 @@ Vitest's `--changed` implementation (`packages/vitest/src/node/git.ts`) has thre
 3. **Build forward graph** — `file → [files it imports]`
 4. **Invert** — `file → [files that import it]` (reverse adjacency list)
 5. **Query** — Given `git diff` changed files, BFS the reverse graph to find all affected test files
-6. **Cache** — Persist graph to disk, use file content hashes for incremental updates
+6. **Cache** (Phase 2) — v0 always rebuilds (~166ms for 433 files). Caching with mtime+hash invalidation added in Phase 2 when profiling shows need
 
 ### Example
 
@@ -69,13 +69,12 @@ Jest's `resolveInverseModuleMap` scans the *entire* haste-map filesystem at ever
 vitest-smart/
 ├── src/
 │   ├── plugin.ts            # Vitest configureVitest hook (entry point)
-│   ├── index.ts             # Public API exports
+│   ├── index.ts             # Public API: exports only vitestSmart()
 │   ├── graph/
-│   │   ├── builder.ts       # oxc-parser + oxc-resolver → forward graph
-│   │   ├── inverter.ts      # Forward graph → reverse graph (DONE)
-│   │   └── cache.ts         # Persist to .vitest-smart/, hash-based invalidation
+│   │   ├── builder.ts       # oxc-parser + oxc-resolver → forward graph (Map<string, Set<string>>)
+│   │   └── inverter.ts      # Forward graph → reverse graph (DONE)
 │   ├── git.ts               # Git diff integration (3 commands)
-│   └── selector.ts          # BFS reverse graph → affected test file list
+│   └── selector.ts          # Pure BFS: (changedFiles, reverse, isTestFile) → affected tests
 ├── test/
 │   ├── fixtures/            # Sample projects with known dependency structures
 │   │   ├── simple/          # Linear A→B→C chain
@@ -84,6 +83,7 @@ vitest-smart/
 │   └── *.test.ts
 ├── package.json
 ├── tsconfig.json
+├── tsup.config.ts           # Build config (dual ESM+CJS output)
 └── vitest.config.ts
 ```
 
@@ -146,9 +146,10 @@ for (const imp of mod.dynamicImports) {
 // Re-exports — these are in staticExports, NOT staticImports
 // export { foo } from './bar'  →  entries[].moduleRequest.value
 // export * from './baz'        →  entries[].moduleRequest.value
+// NOTE: filter type-only re-exports (export type { Foo } from './bar') same as imports
 for (const exp of mod.staticExports) {
   for (const entry of exp.entries) {
-    if (entry.moduleRequest) {
+    if (entry.moduleRequest && !entry.isType) {
       specifiers.push(entry.moduleRequest.value);
     }
   }
@@ -206,6 +207,13 @@ export interface VitestSmartOptions {
   ref?: string;  // git ref to diff against (default: auto-detect)
 }
 
+// Files that affect all tests but are invisible to static import analysis.
+// If any of these change, skip smart selection and run the full suite.
+const FORCE_RERUN_FILES = [
+  'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
+  'tsconfig.json', 'package.json',
+];
+
 export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
   return {
     name: 'vitest:smart',
@@ -213,38 +221,61 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
     async configureVitest({ vitest }) {
       if (options.disabled) return;
 
-      try {
-        const graph = await loadOrBuildGraph(vitest.config.root);
-        const changedFiles = await getChangedFiles(vitest.config.root, options.ref);
-        const affectedTests = bfsAffectedTests(changedFiles, graph.reverse);
+      // Guard: workspace mode not supported in v0
+      if (vitest.projects && vitest.projects.length > 1) {
+        console.warn('[vitest-smart] Vitest workspaces not yet supported — running full suite');
+        return;
+      }
 
-        if (affectedTests.size > 0) {
-          // ONE-SHOT MODE: set include to only affected test file paths
-          // Verified: this mutation IS respected by globTestSpecifications()
-          vitest.config.include = [...affectedTests];
-          console.log(`[vitest-smart] ${affectedTests.size} affected tests (of ${graph.totalTests} total)`);
+      try {
+        const rootDir = vitest.config.root;
+
+        // Build graph inline (v0: always rebuild, ~166ms for 433 files)
+        // Extract to loader.ts when Phase 2 caching is added
+        const forward = await buildFullGraph(rootDir);
+        const reverse = invertGraph(forward);
+
+        const { changed, deleted } = await getChangedFiles(rootDir, options.ref);
+
+        // Deleted files that are graph nodes → run full suite (safety invariant)
+        // Only graph members can cause false negatives; deleted docs/logs are harmless
+        const deletedGraphNodes = deleted.filter(f => forward.has(f) || reverse.has(f));
+        if (deletedGraphNodes.length > 0) {
+          console.warn(`[vitest-smart] ${deletedGraphNodes.length} graph node(s) deleted — running full suite`);
+          return;
+        }
+
+        // Force full run if config/infra files changed
+        const hasForceRerun = changed.some(f =>
+          FORCE_RERUN_FILES.some(trigger => f.endsWith('/' + trigger))
+        );
+        if (hasForceRerun) {
+          console.log('[vitest-smart] Config file changed — running full suite');
+          return;
+        }
+
+        // Test file detection via picomatch against Vitest's config.include patterns
+        const picomatch = await import('picomatch');  // declared as dependency (3KB, zero cost)
+        const isTestFile = picomatch.default(vitest.config.include, { cwd: rootDir });
+        const affectedTests = bfsAffectedTests(changed, reverse, isTestFile);
+
+        if (affectedTests.length > 0) {
+          vitest.config.include = affectedTests;
+          console.log(`[vitest-smart] ${affectedTests.length} affected tests`);
         } else {
           console.log('[vitest-smart] No affected tests — skipping all tests');
           vitest.config.include = [];
         }
-
-        // WATCH MODE: filter which specs rerun on file change
-        vitest.onFilterWatchedSpecification((spec) => {
-          return affectedTests.has(spec.moduleId);
-        });
       } catch (err) {
         // GRACEFUL FALLBACK: if anything fails, run all tests
-        console.warn('[vitest-smart] Error building graph — running full suite:', err);
-        // Don't modify config.include — let Vitest run everything
+        console.warn('[vitest-smart] Error — running full suite:', err);
       }
     }
   };
 }
 ```
 
-**Two filtering mechanisms, one plugin:**
-1. **One-shot mode (`vitest run`):** Mutate `vitest.config.include` to absolute paths of affected tests
-2. **Watch mode:** `onFilterWatchedSpecification` filters which specs rerun on file change
+**v0 supports one-shot mode only (`vitest run`).** Mutates `vitest.config.include` to absolute paths of affected tests. Watch mode support deferred to Phase 2 — requires live graph updates on file change events (see Phase 2 section).
 
 **User experience — zero friction:**
 ```typescript
@@ -269,7 +300,7 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 
-async function getChangedFiles(rootDir: string, ref?: string): Promise<string[]> {
+async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed: string[]; deleted: string[] }> {
   const run = async (args: string[]) => {
     const { stdout } = await exec('git', args, { cwd: rootDir });
     return stdout.split('\n').filter(Boolean);
@@ -278,13 +309,22 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<string[]>
   const [committed, staged, unstaged] = await Promise.all([
     ref ? run(['diff', '--name-only', '--diff-filter=ACMR', `${ref}...HEAD`]) : [],
     run(['diff', '--cached', '--name-only', '--diff-filter=ACMR']),
+    // --others: new untracked files, --modified: changed but unstaged
+    // NOTE: --modified can include deleted files, so we filter by existence below
     run(['ls-files', '--others', '--modified', '--exclude-standard']),
   ]);
 
   const { stdout: gitRoot } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
 
-  return [...new Set([...committed, ...staged, ...unstaged])]
-    .map(f => path.resolve(gitRoot.trim(), f));  // Resolve to absolute paths
+  const allFiles = [...new Set([...committed, ...staged, ...unstaged])]
+    .map(f => path.resolve(gitRoot.trim(), f));
+
+  const { existsSync } = await import('node:fs');
+  const existing = allFiles.filter(f => existsSync(f));
+  const deleted = allFiles.filter(f => !existsSync(f));
+
+  // Return both — plugin checks deleted against graph to decide fallback
+  return { changed: existing, deleted };
 }
 ```
 
@@ -312,41 +352,84 @@ If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually su
 ### Phase 1: Static Import Graph (MVP)
 
 **Effort:** ~500-1000 lines
-**Accuracy:** ~80% (catches all static import-chain dependencies)
+**Accuracy:** Covers all static import-chain dependencies (exact accuracy TBD via fixture tests and real-world validation against body-compass-app)
 
 **Implementation Steps (test-first order):**
 
+0. **Project scaffolding + stub cleanup** — The existing code stubs are from pre-refinement and contradict the plan. Before feature work:
+   - **Delete:** `src/graph/cache.ts` (caching deferred to Phase 2)
+   - **Rewrite:** `src/graph/builder.ts` → export `buildFullGraph(rootDir)` returning `Map<string, Set<string>>` (forward only, not `DependencyGraph` with forward+reverse)
+   - **Rewrite:** `src/selector.ts` → pure `bfsAffectedTests` function (remove `SelectionResult`, `getAffectedTests`)
+   - **Rewrite:** `src/index.ts` → single export `vitestSmart` (remove all other exports)
+   - **Rewrite:** `src/plugin.ts` → remove `verify` option and `onFilterWatchedSpecification` references; orchestration (build → invert → BFS) lives here
+   - **Rewrite:** `src/git.ts` → return `{ changed: string[]; deleted: string[] }` (not flat `string[]`)
+   - **Update:** `package.json` → peer dep `>=3.1.0`, remove `xxhash-wasm`, add `picomatch` to deps, add `tsup` to devDeps, update build script to `tsup`
+   - **Create:** root `vitest.config.ts` and `tsup.config.ts` (dual ESM+CJS output)
 1. **Fixture tests** — Create small projects with known dependency structures FIRST. These define the contract. Include: `simple/` (linear A→B→C), `diamond/` (A→B→C, A→D→C), `circular/` (A→B→A). Write failing tests that assert expected graph shapes and affected test sets.
-2. **`graph/builder.ts`** — Glob all source files, parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`
+2. **`graph/builder.ts`** — Glob source files using `**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` (exclude `node_modules/`, `dist/`, `.vitest-smart/`, `test/fixtures/`, `coverage/`, `.next/`). Parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`. When a parsed file imports a non-source file (e.g., `import data from './data.json'`), the resolved path is added as a forward-graph key with an empty dependency set — this ensures the inverter creates a reverse edge so BFS can trace dependents of that `.json`/`.css` file. Exports `buildFullGraph(rootDir)` returning the forward map. **Important:** the glob MUST include test files (they import source files and are BFS targets). Use `tinyglobby` (already in vitest's dep tree) for globbing.
 3. **`graph/inverter.ts`** — Invert forward graph to reverse graph (DONE — already implemented)
-4. **`graph/cache.ts`** — Persist graph + file hashes to `.vitest-smart/graph.json`. On rebuild, only re-parse files whose content hash changed.
-5. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged)
-6. **`selector.ts`** — BFS the reverse graph from changed files, collect affected test files. **Must include graceful fallback:** if graph build or git commands fail, return `null` to signal "run all tests".
-7. **`plugin.ts`** — Wire everything together in `configureVitest` hook. Mutate `config.include` for one-shot mode, register `onFilterWatchedSpecification` for watch mode. Graceful fallback: on error, don't modify config (runs full suite).
-8. **`index.ts`** — Export plugin function + standalone API for programmatic use
+4. **Orchestration lives in `plugin.ts`** — Build graph → invert → BFS is 3 lines of glue, inlined in the plugin's `configureVitest` hook. No separate orchestrator file in v0. Extract to `graph/loader.ts` when Phase 2 caching materializes.
+5. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged). Filter deleted files by existence check (see pseudocode above).
+6. **`selector.ts`** — Pure BFS function with no IO or orchestration:
+
+```typescript
+// selector.ts — pure algorithm, no side effects
+export function bfsAffectedTests(
+  changedFiles: string[],
+  reverse: Map<string, Set<string>>,
+  isTestFile: (path: string) => boolean
+): string[] {
+  const visited = new Set<string>();
+  const queue = [...changedFiles];
+  const affectedTests: string[] = [];
+
+  // BFS seeds include changedFiles directly, so changed test files
+  // are always captured (fixes vitest #1113 — no separate pass needed)
+  while (queue.length > 0) {
+    const file = queue.shift()!;
+    if (visited.has(file)) continue;
+    visited.add(file);
+    if (isTestFile(file)) affectedTests.push(file);
+    const dependents = reverse.get(file);
+    if (dependents) {
+      for (const dep of dependents) {
+        if (!visited.has(dep)) queue.push(dep);
+      }
+    }
+  }
+
+  return affectedTests;
+}
+```
+
+7. **`plugin.ts`** — Wire everything together in `configureVitest` hook. One-shot mode only in v0: mutate `config.include` with affected test paths. Includes workspace guard and force-rerun check for config files. Graceful fallback: on error, don't modify config (runs full suite).
+8. **`index.ts`** — Export only the plugin function: `export { vitestSmart } from './plugin'`. Internal functions stay unexported — no public API surface to maintain until there are real consumers.
 
 **Safety invariant:** vitest-smart must NEVER silently skip tests. If any component fails (graph build, git diff, BFS), the fallback is to run the full test suite and log a warning. False positives (running too many tests) are acceptable; false negatives (missing failures) are not.
 
-**Graceful fallback:** If graph build, cache load, or git diff fails for any reason, vitest-smart runs the full test suite and logs a warning. Never silently skip tests.
+**Force rerun triggers:** Changes to `vitest.config.*`, `tsconfig.json`, or `package.json` trigger a full test run regardless of graph analysis. Hardcoded as a const array in `plugin.ts` — no user-facing config option in v0.
 
-**`verify` mode:** Validates accuracy by running affected tests first, then running ALL tests, and comparing results. Reports any failures that smart selection would have missed. Use this to prove the accuracy claim on your codebase before trusting it in CI.
-
-```typescript
-// vitest.config.ts
-vitestSmart({ verify: true })  // Run affected, then full, compare results
-```
-
-Or via environment variable: `VITEST_SMART_VERIFY=1 npx vitest run`
-
-**`forceRerunTriggers`:** Changes to `vitest.config.*`, `tsconfig.json`, `package.json`, or `.env*` trigger a full test run regardless of graph analysis. These files affect all tests but are invisible to static import analysis. Configurable via options.
-
-**Type-only imports:** oxc-parser provides `imp.entries[].isType` — if ALL entries are type-only, we skip the import since it creates no runtime dependency. This improves accuracy over naive parsing.
+**Type-only imports:** oxc-parser provides `imp.entries[].isType` — if ALL entries are type-only, we skip the import since it creates no runtime dependency. Same filtering applies to `staticExports` re-exports (`entry.isType`). This improves accuracy over naive parsing.
 
 **Dynamic imports:** Captured by `module.dynamicImports` — included in graph when specifier is a string literal. Computed specifiers (`import(variable)`) are ignored (Phase 2 handles via coverage).
 
-**Misses:** `fs.readFile` dependencies, shared global state, config file impacts, computed dynamic imports.
+**Known limitations (Phase 1):**
+- `fs.readFile` dependencies, shared global state, config file impacts, computed dynamic imports
+- `vi.mock()` with factory functions: mock factories that import helpers create invisible dependencies. The graph may over-select (running tests where mock fully replaces the module) or under-select (missing changes to mock factory helpers). Over-selection is acceptable per the safety invariant; under-selection from mock factory deps is a known edge case.
+- **Watch mode:** Not supported in v0. `configureVitest` runs once at startup — the affected test set would be stale after subsequent edits. Watch mode requires live graph updates on file change events (deferred to Phase 2).
+- **Vitest workspaces:** Not supported in v0. Plugin detects workspace mode and falls back to full suite with a warning.
+- **Temporal mismatch:** The graph reflects the *current* disk state, but the diff reflects *historical* changes. If an import edge was removed in the current change, the graph has no edge, so BFS cannot find affected tests from the old import. In practice this is rare (the test itself usually changes too, triggering a direct match), but it's a theoretical false-negative vector. Phase 3 coverage data eliminates this.
 
-### Phase 2: Coverage-Enhanced Selection
+### Phase 2: Watch Mode + Verify + Caching
+
+**Effort:** Days-weeks
+
+- **Watch mode:** Hook into Vite's file watcher events, incrementally update the graph for changed files, recompute affected tests per trigger via `onFilterWatchedSpecification`
+- **`verify` mode:** Run affected tests first, then full suite, compare results to measure real accuracy. Requires post-run reporter hook to capture per-run results.
+- **Graph caching:** Persist graph to `.vitest-smart/graph.json` with mtime+hash hybrid invalidation (Decision 4). Only add caching if profiling shows startup latency matters on 2000+ file projects.
+- **`xxhash-wasm`** dependency added here (not in v0) for fast content hashing
+
+### Phase 3: Coverage-Enhanced Selection
 
 **Effort:** Weeks
 **Accuracy:** ~95%
@@ -356,7 +439,7 @@ Or via environment variable: `VITEST_SMART_VERIFY=1 npx vitest run`
 - Merge coverage map with static graph (union = most complete picture)
 - Dynamic imports and runtime deps now captured
 
-### Phase 3: Symbol-Level Tracking
+### Phase 4: Symbol-Level Tracking
 
 **Effort:** Longer-term
 **Accuracy:** ~99%
@@ -366,7 +449,7 @@ Or via environment variable: `VITEST_SMART_VERIFY=1 npx vitest run`
 - If only `functionA` changed in a file, skip tests that only import `functionB`
 - This is Wallaby-level precision, open-source
 
-### Phase 4 (Aspirational): Predictive Selection
+### Phase 5 (Aspirational): Predictive Selection
 
 - ML model trained on historical test results (a la Meta's approach)
 - Predicts which tests are most likely to fail for a given diff
@@ -485,9 +568,9 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
 - Benchmark parse + resolve times on real-world project sizes
 
 ### CI Strategy
-- The cached graph ships as `.vitest-smart/` in the repo (gitignored in consumer projects)
-- CI rebuilds from scratch on first run, uses cache on subsequent runs
-- Cache key: hash of all source file content hashes
+- v0: graph rebuilds on every run (~166ms, negligible vs test execution time)
+- Phase 2: cached graph in `.vitest-smart/` (gitignored), cache key based on file content hashes
+- Requires `fetch-depth: 0` (or ≥50) in GitHub Actions for merge-base diff
 
 ---
 
@@ -497,14 +580,25 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
 {
   "dependencies": {
     "oxc-parser": "^0.114.0",
-    "oxc-resolver": "^6.0.0"
+    "oxc-resolver": "^6.0.0",
+    "picomatch": "^4.0.0"
+  },
+  "peerDependencies": {
+    "vitest": ">=3.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsup": "^8.5.0",
+    "vitest": "^3.2.0"
   }
 }
 ```
 
+**Peer dep note:** `configureVitest` hook requires Vitest >=3.1. Vitest 4.0 is current stable (4.0.18, Dec 2025) — test against both 3.2.x and 4.0.x. No `xxhash-wasm` in v0 — caching deferred to Phase 2.
+
 Remove `es-module-lexer` — replaced by `oxc-parser`.
 
-Add new source file: `src/git.ts` — git diff integration.
+Add new source file: `src/git.ts` (git diff with deleted file detection).
 
 ---
 
@@ -516,7 +610,39 @@ Add new source file: `src/git.ts` — git diff integration.
 - Small surface area — plugin, not a full test runner
 - Clear, measurable value proposition
 - Type-only import filtering improves accuracy over naive approaches
-- Natural growth path from static graph → coverage → symbol-level → ML
-- Phase 3 needs zero parser change — oxc-parser's full AST is already available
+- Natural growth path from static graph → watch+cache → coverage → symbol-level → ML
+- Phase 4 needs zero parser change — oxc-parser's full AST is already available
 
 **npm name:** `vitest-smart` (unclaimed, verified)
+
+---
+
+## Refinement Log
+
+### Round 1 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 11 applied (3 Critical, 4 High, 4 Medium)
+- **Key fixes:** Scoped watch mode out of v0 (broken by design — stale snapshot), added `loadOrBuildGraph` orchestrator spec, simplified to always-rebuild (no caching in v0), replaced selector god-function with pure BFS, deferred verify mode to Phase 2
+- **Consensus:** Watch mode stale snapshot flagged by 3/6 agents (strongest signal). Cache schema mismatch flagged by 5/6. Selector API wrong flagged by 4/6. Simplifier + Devil's Advocate agreed: cache + verify are premature for v0.
+- **Trajectory:** Critical/High issues found -> continue to Round 2 for verification
+
+### Round 2 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 4 applied (1 Critical, 2 High, 1 Medium)
+- **Key fixes:** Deleted files now trigger full suite fallback (was silently dropping them), Step 0 expanded with explicit stub cleanup list, matchesTestGlob gets runtime check + glob-based fallback, temporal mismatch documented as known limitation
+- **Consensus:** Deleted file false negative flagged by 3/6. Stale code stubs flagged by 6/6 (plan text was correct, code stubs needed cleanup call-out). matchesTestGlob unverified flagged by 2/6.
+- **Trajectory:** Critical issue found (deleted files) -> continue to Round 3 for verification
+
+### Round 3 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 4 applied (0 Critical, 3 High, 1 Medium)
+- **Key fixes:** Removed dead BFS post-loop (4/6 consensus), scoped deleted-file fallback to graph members only (was over-aggressive), inlined loader.ts into plugin.ts (3-line glue doesn't need its own file), simplified test detection to picomatch-only (dropped unverified matchesTestGlob speculation), added builder.ts to Step 0 cleanup, expanded builder glob exclusions
+- **Consensus:** Dead BFS code flagged by 4/6 (strongest signal). loader.ts trivial flagged by 3/6. Test detection simplification flagged by 3/6. All Simplifier cuts aligned with practical implementer concerns.
+- **Trajectory:** No Critical issues. High issues found -> continue to Round 4 for final verification
+
+### Round 4 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 4 minor cleanup (0 Critical, 0 High after analysis)
+- **Key fixes:** Declared picomatch as explicit dependency (not transient), added git.ts to Step 0 rewrite list, removed stale loader.ts reference, noted builder must include test files in glob
+- **Consensus:** 6/6 agents declared plan implementation-ready. Remaining "High" items were execution gaps (stale code stubs, package.json) not plan design issues. All agents said "ship it."
+- **Trajectory:** CONVERGED — finalize
