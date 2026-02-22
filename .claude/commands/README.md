@@ -61,7 +61,6 @@ plan-init → plan-refine-internal → beadify → bead-refine → bead-work →
 
 ### Optional
 
-- **Agent Mail** (MCP) — multi-session coordination, file reservations, messaging
 - **OpenRouter** (`openrouter` CLI) — required only for `plan-refine-external`
 - **Browser testing tool** (e.g., `agent-browser`) — optional UI validation in `bead-land`
 

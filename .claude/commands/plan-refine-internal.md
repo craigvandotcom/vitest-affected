@@ -10,19 +10,8 @@ Competitive framing: agents compete — only evidence-backed findings count. Cod
 
 ## Phase 0: Initialize
 
-### Register with Agent Mail (if available)
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "plan-refine-internal session"
-)
 ```
 
 ### Identify Plan File

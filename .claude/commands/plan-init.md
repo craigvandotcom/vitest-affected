@@ -24,19 +24,8 @@ description: Create implementation plans with validation baseline — parallel e
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting.**
 
-### Register with Agent Mail
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "plan-init session"
-)
 ```
 
 ### Main Branch Enforcement (CRITICAL)
@@ -77,7 +66,7 @@ mkdir -p "$ARTIFACTS_DIR"
 ### Create Workflow Tasks
 
 ```
-TaskCreate(subject: "Phase 0: Initialize and classify", description: "Register Agent Mail, verify branch, classify request type and complexity", activeForm: "Initializing plan session...")
+TaskCreate(subject: "Phase 0: Initialize and classify", description: "Verify branch, classify request type and complexity", activeForm: "Initializing plan session...")
 
 TaskCreate(subject: "Phase 1: Parallel code exploration", description: "Spawn 3 code-explorer agents: patterns, dependencies, constraints", activeForm: "Exploring codebase...")
 
@@ -92,13 +81,6 @@ TaskCreate(subject: "Phase 4: Get approval and commit", description: "Present pl
 
 If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If research files already exist in `.claude/plans/research/`, skip to the next incomplete phase.
 
-### Check Inbox
-
-```
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any pending messages.
 
 ### Classify the Request
 
@@ -668,12 +650,6 @@ Add to plan document:
 **Status:** Approved - Ready for Implementation
 **Approved:** YYYY-MM-DD
 ---
-```
-
-### Release Reservations
-
-```
-release_file_reservations(project_key, agent_name)
 ```
 
 ### Report Completion and Hand-Off

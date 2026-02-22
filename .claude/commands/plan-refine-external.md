@@ -21,19 +21,8 @@ description: Multi-model iterative plan refinement - sends plan to 3-4 AI models
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting.**
 
-### Register with Agent Mail (if available)
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "plan-refine-external session"
-)
 ```
 
 ### Identify Plan File

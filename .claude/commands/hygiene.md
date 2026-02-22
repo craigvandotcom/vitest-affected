@@ -10,21 +10,6 @@ Run this after a few bead-work sessions, or daily for maintenance. For feature-s
 
 ## Phase 0: Initialize
 
-### Register with Agent Mail
-
-```bash
-PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "hygiene review"
-)
-```
-
 ### Select Scope
 
 Ask user with `AskUserQuestion`:
@@ -80,14 +65,6 @@ ls -d */ | head -20
 ```
 
 Save this as `CODEBASE_CONTEXT` for agent prompts.
-
-### Check Inbox
-
-```
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any pending messages.
 
 ---
 
@@ -399,12 +376,6 @@ Remove the temp artifacts directory (safe — always under /tmp):
 
 ```bash
 find "$ARTIFACTS_DIR" -mindepth 1 -delete && rmdir "$ARTIFACTS_DIR" 2>/dev/null || true
-```
-
-### Release Reservations
-
-```
-release_file_reservations(project_key, agent_name)
 ```
 
 ---

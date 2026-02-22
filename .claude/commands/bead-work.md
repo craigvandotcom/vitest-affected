@@ -4,7 +4,7 @@ description: Sequential bead implementation — conductor reviews, engineers imp
 
 **You are the conductor.** Engineers implement. You review, verify, and commit. One bead at a time. Quality over velocity.
 
-For parallelism, open multiple terminal sessions — each runs `/bead-work` independently, coordinated via Agent Mail.
+For parallelism, open multiple terminal sessions — each runs `/bead-work` independently.
 
 ---
 
@@ -12,19 +12,8 @@ For parallelism, open multiple terminal sessions — each runs `/bead-work` inde
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting (after asking user for bead count).**
 
-### Register with Agent Mail
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "bead-work session"
-)
 ```
 
 ### Verify Beads Exist
@@ -61,7 +50,7 @@ All parallel sessions join the same wave branch. Trunk-based — merge to main w
 Ask two questions via `AskUserQuestion`:
 
 1. "How many beads to target this session?" (default: all unblocked)
-2. "Session mode?" → **Solo** (single terminal, default) or **Parallel** (multiple terminals with Agent Mail coordination)
+2. "Session mode?" → **Solo** (single terminal, default) or **Parallel** (multiple terminals)
 
 ### Configuration
 
@@ -85,7 +74,7 @@ mkdir -p "$ARTIFACTS_DIR"
 TaskCreate(subject: "Session config: {SESSION_MODE} | {TARGET_BEADS} beads", description: "SESSION_MODE={SESSION_MODE}. TARGET_BEADS={TARGET_BEADS}. Stop after {TARGET_BEADS} beads.", activeForm: "Configuring session...")
 TaskUpdate(task: "Session config", status: "completed")
 
-TaskCreate(subject: "Phase 0: Initialize bead-work session", description: "Register Agent Mail, verify beads, ensure wave branch, create tasks", activeForm: "Initializing session...")
+TaskCreate(subject: "Phase 0: Initialize bead-work session", description: "Verify beads, ensure wave branch, create tasks", activeForm: "Initializing session...")
 
 # "X of N" naming — makes the boundary crystal clear even after compaction
 for i in 1..TARGET_BEADS:
@@ -106,12 +95,6 @@ TaskUpdate(task: "Bead {N} of {TARGET_BEADS}", subject: "Bead {N} of {TARGET_BEA
 
 If `$ARTIFACTS_DIR/progress.md` exists, parse its header to recover `TARGET_BEADS` and `SESSION_MODE`. Count entries marked `COMPLETE` to recover `BEADS_COMPLETED`. Skip completed beads.
 
-### Check Inbox (parallel mode only)
-
-```
-# Skip in solo mode
-fetch_inbox(project_key, agent_name)
-```
 
 Acknowledge any pending messages.
 
@@ -140,30 +123,7 @@ br comments <id>
 TaskUpdate(task: "Bead {BEADS_COMPLETED + 1} of {TARGET_BEADS}", subject: "Bead {BEADS_COMPLETED + 1} of {TARGET_BEADS}: <bead-id> - <bead-title>", status: "in_progress", activeForm: "Implementing <bead-title>...")
 ```
 
-### Phase 1b: Reserve Files + Notify (parallel mode only)
-
-**Skip entirely in solo mode.** No contention possible with a single session.
-
-In parallel mode, parse the bead spec for files to touch. Reserve them:
-
-```
-file_reservation_paths(project_key, agent_name, paths=[...], ttl_seconds=3600, exclusive=true, reason="Bead <id>: <title>")
-```
-
-**If conflict:**
-
-- Wait if the other agent's bead looks nearly done
-- Coordinate via agent mail if partial overlap
-- Pick next bead (`bv --robot-next` again) if heavy overlap
-- Conflicts should be rare — `bv --robot-next` already filters claimed beads
-
-Send agent mail notification:
-
-```
-send_message(project_key, sender_name, to=[...], subject="Starting bead <id>: <title>", body_md="...", broadcast=true)
-```
-
-### Phase 1c: Identify Skills + Spawn Engineer Sub-Agent
+### Phase 1b: Identify Skills + Spawn Engineer Sub-Agent
 
 **Skill routing (conductor's job):** Read the bead spec and identify relevant domain skills from `AGENTS.md` > "Available Skills". Include the relevant skill paths in the engineer prompt below.
 
@@ -210,7 +170,7 @@ MANDATORY: Write your implementation report to $ARTIFACTS_DIR/bead-<id>-result.m
 """)
 ```
 
-### Phase 1d: Review Quality (Conductor's Core Job)
+### Phase 1c: Review Quality (Conductor's Core Job)
 
 **YOU are the quality gate.** Read the engineer's result file and verify:
 
@@ -253,7 +213,7 @@ UI validation is deferred to `/bead-land` where it runs once for the entire sess
 
 **Be extremely strict.** Do not move to the next bead until this one is fully complete.
 
-### Phase 1e: Commit + Close Bead
+### Phase 1d: Commit + Close Bead
 
 ```bash
 git add <specific files>
@@ -272,14 +232,7 @@ Close the bead:
 br close <id> --reason "Implemented and tested"
 ```
 
-Release file reservations (parallel mode only):
-
-```
-# Skip in solo mode
-release_file_reservations(project_key, agent_name)
-```
-
-### Phase 1f: Update Progress
+### Phase 1e: Update Progress
 
 **Mark bead task as completed:**
 
@@ -302,14 +255,7 @@ SESSION_MODE={SESSION_MODE}
 - Files: <list of modified files>
 ```
 
-Check inbox between beads (parallel mode only):
-
-```
-# Skip in solo mode
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any messages. Increment `BEADS_COMPLETED`.
+Increment `BEADS_COMPLETED`.
 
 **Loop control:**
 
@@ -372,18 +318,6 @@ AskUserQuestion(
 
 ---
 
-## Agent Mail Integration
-
-| When             | Solo Mode                  | Parallel Mode                            |
-| ---------------- | -------------------------- | ---------------------------------------- |
-| Session start    | `macro_start_session` only | `macro_start_session`                    |
-| Before each bead | Skip                       | `file_reservation_paths` + `fetch_inbox` |
-| Starting a bead  | Skip                       | `send_message` (broadcast)               |
-| After each bead  | Skip                       | `release_file_reservations`              |
-| On conflict      | N/A                        | Assess: wait / coordinate / pick next    |
-
----
-
 ## Multi-Session Parallelism
 
 ```
@@ -391,9 +325,7 @@ Terminal 1: /bead-work   → "target 5 beads"
 Terminal 2: /bead-work   → "target 5 beads"
 
 Each session independently:
-- Registers with Agent Mail (unique identity)
 - bv --robot-next picks best available bead (no pre-assigned ranges)
-- Agent mail file reservations prevent conflicts
 - Sessions may work on interleaved bead numbers — that's fine
 ```
 
@@ -404,14 +336,12 @@ Each session independently:
 - **YOU review, YOU commit** — engineers implement, you verify
 - **Be extremely strict** — bead must be fully complete before moving on
 - **Minor fixes: do them yourself. Major gaps: re-spawn engineer.**
-- **Release file reservations on error paths** (parallel mode)
 - **Temp files survive compaction** — read from `$ARTIFACTS_DIR`, not memory
 - **Progress file is compaction recovery** — parse it on restart for TARGET_BEADS + SESSION_MODE
 - **Per-bead: tests + type-check + lint. Full quality gate at session end.**
 - **UI validation runs once at session end** (in bead-land) — not per-bead
 - **No new code without new tests** — verify engineer wrote tests before approving
 - **"Bead X of N" task naming prevents drift** — the task list IS the stop condition
-- **Solo mode skips all Agent Mail per-bead ops** — broadcasts, inbox, file reservations
 
 ---
 

@@ -29,19 +29,8 @@ For codebase-wide health checks, use `/hygiene` instead.
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting.**
 
-### Register with Agent Mail
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "work-review session"
-)
 ```
 
 ### Configuration
@@ -90,7 +79,7 @@ If a command doesn't exist for this project, set it to empty and skip in validat
 ### Create Workflow Tasks
 
 ```
-TaskCreate(subject: "Phase 0: Initialize", description: "Register Agent Mail, discover commands, create tasks", activeForm: "Initializing review...")
+TaskCreate(subject: "Phase 0: Initialize", description: "Discover commands, create tasks", activeForm: "Initializing review...")
 
 TaskCreate(subject: "Phase 1: Gather context", description: "Branch safety, diff scope, plan context, baseline check", activeForm: "Gathering context...")
 
@@ -112,14 +101,6 @@ TaskCreate(subject: "Phase 8: Final report + hand-off", description: "Summary, n
 ### Compaction Recovery
 
 If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If reviewer findings files exist, skip to Phase 3 (synthesis).
-
-### Check Inbox
-
-```
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any pending messages.
 
 **TaskUpdate(task: "Phase 0", status: "completed")**
 
@@ -776,12 +757,6 @@ AskUserQuestion(
 
 ```bash
 rm -rf "$ARTIFACTS_DIR"
-```
-
-### Release Reservations
-
-```
-release_file_reservations(project_key, agent_name)
 ```
 
 **TaskUpdate(task: "Phase 8", status: "completed")**

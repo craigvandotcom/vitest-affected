@@ -24,19 +24,8 @@ Convert refined plan to beads task structure using beads_rust.
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting.**
 
-### Register with Agent Mail
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "beadify session"
-)
 ```
 
 ### Configuration
@@ -384,12 +373,6 @@ AskUserQuestion(
 ```
 
 **TaskUpdate(task: "Phase 4", status: "completed")**
-
-### Release Reservations
-
-```
-release_file_reservations(project_key, agent_name)
-```
 
 ---
 

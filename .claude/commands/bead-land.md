@@ -10,21 +10,6 @@ Run this after `/bead-work` completes its target beads.
 
 ## Phase 0: Initialize
 
-### Register with Agent Mail (if not already registered)
-
-```bash
-PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "bead-land session closure"
-)
-```
-
 ### Gather Session Context
 
 ```
@@ -46,14 +31,6 @@ git log --oneline -20
 git status
 git diff --stat
 ```
-
-### Check Inbox
-
-```
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any pending messages.
 
 ---
 
@@ -165,18 +142,6 @@ git status   # Must show "up to date with origin"
 ```
 
 **If push fails:** Resolve and retry. Do not proceed until pushed.
-
-### 1e. Release All Reservations
-
-```
-release_file_reservations(project_key, agent_name)
-```
-
-### 1f. Notify
-
-```
-send_message(project_key, sender_name, to=[...], subject="Session landed", body_md="Completed N beads, pushed to remote.", broadcast=true)
-```
 
 ---
 
@@ -367,16 +332,6 @@ git status          # Clean working tree
 git log --oneline -1  # Latest commit pushed
 br ready --json     # What's left
 ```
-
----
-
-## Agent Mail Integration
-
-| When           | Action                                     |
-| -------------- | ------------------------------------------ |
-| Session start  | `macro_start_session`                      |
-| After landing  | `send_message` (broadcast: session landed) |
-| After compound | `release_file_reservations`                |
 
 ---
 

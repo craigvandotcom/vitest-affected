@@ -24,19 +24,8 @@ description: Refine bead structure before implementation — iterative rounds un
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting.**
 
-### Register with Agent Mail
-
 ```bash
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-```
-
-```
-macro_start_session(
-  human_key: "$PROJECT_ROOT",
-  program: "claude-code",
-  model: "<your model>",
-  task_description: "bead-refine session"
-)
 ```
 
 ### Configuration
@@ -82,20 +71,13 @@ done > "$ARTIFACTS_DIR/beads-full-dump.txt"
 ### Create Workflow Tasks
 
 ```
-TaskCreate(subject: "Phase 0: Initialize bead-refine session", description: "Register Agent Mail, identify plan file, gather bead snapshot, create tasks", activeForm: "Initializing bead-refine...")
+TaskCreate(subject: "Phase 0: Initialize bead-refine session", description: "Identify plan file, gather bead snapshot, create tasks", activeForm: "Initializing bead-refine...")
 
 TaskCreate(subject: "Phase 1-4: Refinement loop", description: "Parallel agent review -> synthesize -> apply fixes -> convergence check. Repeat up to MAX_ROUNDS.", activeForm: "Refining beads...")
 
 TaskCreate(subject: "Phase 5: Finalize and verify", description: "Final verification, commit, present summary", activeForm: "Finalizing refinement...")
 ```
 
-### Check Inbox
-
-```
-fetch_inbox(project_key, agent_name)
-```
-
-Acknowledge any pending messages.
 
 **TaskUpdate(task: "Phase 0", status: "completed")**
 
@@ -387,12 +369,6 @@ AskUserQuestion(
 ```
 
 **TaskUpdate(task: "Phase 5: Finalize", status: "completed")**
-
-### Release Reservations
-
-```
-release_file_reservations(project_key, agent_name)
-```
 
 ---
 
