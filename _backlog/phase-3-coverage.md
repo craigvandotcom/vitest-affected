@@ -49,11 +49,11 @@ Phase 1's static graph misses:
 6. Union into the static graph and persist
 
 ```typescript
-// Reporter hook — runs after all tests complete
-onTestRunEnd(testModules: TestModule[], unhandledErrors: Error[]) {
-  const reportsDir = vitest.config.coverage?.reportsDirectory ?? 'coverage';
-  const coverageDir = path.resolve(rootDir, reportsDir, '.tmp');
-  const edges = readCoverageEdges(coverageDir, rootDir, testModules);
+// Reporter hook — runs after all tests complete (registered via onAfterSetServer)
+onTestRunEnd(testModules: ReadonlyArray<TestModule>,
+  unhandledErrors: ReadonlyArray<SerializedError>,
+  reason: TestRunEndReason) {
+  const edges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
   // Union into existing graph and save
 }
 ```
@@ -124,7 +124,12 @@ export function readCoverageEdges(
       continue; // ENOENT — file cleaned mid-read, skip
     }
 
-    const parsed = JSON.parse(raw);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue; // Malformed JSON — partial write, skip
+    }
     const scriptCoverages = parsed.result ?? [];
 
     // Single pass: separate test files from source files
@@ -140,11 +145,8 @@ export function readCoverageEdges(
       if (testFileSet.has(filePath)) {
         testFilesInWorker.push(filePath);
       } else {
-        // Only include files actually executed (any function with count > 0)
-        const executed = sc.functions?.some((fn: any) =>
-          fn.ranges?.some((r: any) => r.count > 0)
-        );
-        if (executed) sourceFilesInWorker.push(filePath);
+        // With all:false, every file in V8 coverage was actually loaded
+        sourceFilesInWorker.push(filePath);
       }
     }
 
@@ -242,9 +244,9 @@ Between coverage collections, stale mappings are still used — better than no m
 
 ### Reporter Registration
 
-The reporter must be pushed to `vitest.reporters` (the runtime array that `vitest.report()` iterates), **not** `vitest.config.reporters` (config-level tuples that are already resolved). This must happen after reporter initialization — in `configureVitest`, `vitest.reporters` is the live array.
+**Verified against Vitest 3.2.4 source:** `configureVitest` hooks fire at line 9322, then `this.reporters = createReporters(...)` overwrites the entire array at line 9341. Pushing to `vitest.reporters` inside `configureVitest` is overwritten. The reporter must be registered **after** reporter initialization completes.
 
-**Lifecycle assumption:** `configureVitest` fires after reporters are instantiated. If Vitest changes this order, the reporter push would be overwritten. Verify against the Vitest version at implementation time. If `vitest.reporters` is overwritten after `configureVitest`, fall back to a separate reporter file registered via `vitest.config.reporters` tuple in the Vite `config` hook.
+**Strategy:** Use `vitest.onAfterSetServer()` callback (fires at line 9342, after reporters are finalized). This matches how Vitest's own internal reporters are pushed post-initialization.
 
 ```typescript
 // In plugin.ts — Phase 3 additions to configureVitest
@@ -253,23 +255,33 @@ The reporter must be pushed to `vitest.reporters` (the runtime array that `vites
 const reportsDir = vitest.config.coverage?.reportsDirectory ?? 'coverage';
 const coverageTmpDir = path.resolve(rootDir, reportsDir, '.tmp');
 
+// Build testFileSet from ALL project test files (not just ran-this-run)
+// to correctly classify test files vs source files in coverage data
+const specs = await project.globTestSpecifications();
+const testFileSet = new Set(specs.map(s => s.moduleId));
+
 // After building/loading graph, merge cached coverage edges if available
 const coverageEdges = snapshot.coverageEdges;  // From cached graph.json
 if (coverageEdges) {
   mergeIntoGraph(snapshot.reverse, coverageEdges);
 }
 
-// Register reporter to collect new coverage after each run
-vitest.reporters.push({
-  onTestRunEnd(testModules: TestModule[]) {
-    const testFileSet = new Set(testModules.map(m => m.moduleId));
-    const newEdges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
-    mergeIntoGraph(snapshot.reverse, newEdges);
-    // Persist updated graph with coverage edges
-    saveGraph(snapshot, cacheDir);
-  }
+// Register reporter AFTER reporters are initialized (not during configureVitest)
+vitest.onAfterSetServer(() => {
+  vitest.reporters.push({
+    onTestRunEnd(testModules: ReadonlyArray<TestModule>,
+      unhandledErrors: ReadonlyArray<SerializedError>,
+      reason: TestRunEndReason) {
+      const newEdges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
+      mergeIntoGraph(snapshot.reverse, newEdges);
+      // Persist updated graph with coverage edges
+      saveGraph(snapshot, cacheDir);
+    }
+  });
 });
 ```
+
+**Fallback:** If `vitest.onAfterSetServer` doesn't exist in older Vitest versions, register via a separate reporter file referenced in the Vite `config` hook as a `test.reporters` tuple entry.
 
 ### Auto-Enabling Coverage
 
@@ -322,7 +334,7 @@ export interface VitestAffectedOptions {
 
 1. **Implement `coverage.ts`** — `readCoverageEdges` (single-pass with URL matching inlined), `mergeIntoGraph`, `normalizeUrl`. Single file, pure functions, sync I/O.
 2. **Update cache format** — Bump `version` to 2. Add `coverageEdges` (relative path strings) and `coverageCollectedAt` to `graph.json`. Handle v1→v2 migration (treat v1 cache as valid with empty coverage edges).
-3. **Update `plugin.ts`** — Auto-enable V8 coverage in Vite `config` hook (before Vitest init). Push reporter to `vitest.reporters` in `configureVitest`. Merge cached coverage edges into BFS graph.
+3. **Update `plugin.ts`** — Auto-enable V8 coverage in Vite `config` hook (before Vitest init). Register reporter via `vitest.onAfterSetServer()` (after reporter initialization). Build `testFileSet` from `project.globTestSpecifications()` in `configureVitest`. Merge cached coverage edges into BFS graph.
 4. **Tests** — Coverage file parsing, URL normalization, edge extraction, merge correctness, v1→v2 migration, user-opt-out respect.
 
 ---
@@ -338,6 +350,10 @@ export interface VitestAffectedOptions {
 - **Per-worker union with `isolate: false`:** All loaded files assigned to all tests in the worker. Over-selects but never under-selects.
 - **Auto-enable coverage lifecycle:** Auto-enabling happens in Vite `config` hook. If Vitest changes when coverage config is consumed, auto-enable may stop working. Users can always explicitly set `coverage.enabled: true` as a guaranteed fallback.
 - **Coverage JSON parsing:** Large coverage files (>10MB for complex projects) may cause memory spikes during `JSON.parse`. Add a file-size guard: skip files >20MB with a warning.
+- **Shard mode:** `vitest --shard=N/M` changes the tmp directory name to `.tmp-N-M`. The current plan hardcodes `.tmp`. At implementation time, read `vitest.config.shard` and construct the correct suffix.
+- **Version downgrade:** Phase 2 code reading a version-2 cache (written by Phase 3) will see an unknown version and trigger a full rebuild. This is safe but discards the cache silently.
+- **`TestModule.moduleId`:** May be a virtual ID for non-file-based tests. Virtual IDs won't match coverage URLs — these tests are silently excluded from coverage edges (safe, never under-selects).
+- **Coverage reporter output:** `reporter: ['json']` produces `coverage-final.json`. Verify empirically whether `reporter: []` works without breaking the V8 provider — if so, prefer it to avoid polluting the user's project.
 
 ---
 
@@ -379,3 +395,16 @@ merged_graph = static_graph ∪ coverage_graph
   - Changed `reporter: []` to `reporter: ['json']` to avoid breaking V8 provider (Breaker HIGH — noted)
 - **Noted (1/3, not auto-applied):** Separate reporter file if `vitest.reporters` is overwritten (Breaker CRITICAL-1 fallback). One-run-behind semantics documented (Breaker HIGH-3).
 - **Trajectory:** No Critical issues remain. Implementation steps reduced from 6 to 4. Plan converging.
+
+### Round 3 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 6 applied (1 Critical consensus, 2 High consensus, 3 beneficial single-agent fixes)
+- **Key fixes:**
+  - Fixed reporter registration timing: `vitest.reporters.push()` in `configureVitest` is overwritten by `createReporters()` — use `vitest.onAfterSetServer()` instead (Builder CRITICAL + Breaker CRITICAL = 2/3, verified against Vitest 3.2.4 source lines 9322-9341)
+  - Fixed `onTestRunEnd` signature: 3 params not 2, `ReadonlyArray` not `Array`, `SerializedError` not `Error` (Builder HIGH + Trimmer HIGH = 2/3)
+  - Build `testFileSet` from `project.globTestSpecifications()` (all test files), not `testModules` parameter (only ran-this-run) — prevents misclassifying unrun test files as sources (Breaker CRITICAL-2, applied as defensive fix)
+  - Added JSON.parse try-catch for malformed coverage files (Breaker HIGH-1)
+  - Removed `executed` filter — unnecessary with `all: false` (Trimmer HIGH)
+  - Added Known Limitations: shard mode, version downgrade, virtual moduleId, reporter output verification
+- **Noted (1/3, not applied):** Coverage file timing dispute (Trimmer CRITICAL — claims `.tmp/` files don't exist at `onTestRunEnd` time, contradicted by Round 2 Builder's source verification). Windows `/@fs/` normalization edge case (Breaker HIGH-2). `reportsDirectory` double-resolution if user passes absolute path (Breaker HIGH-4).
+- **Trajectory:** 1 Critical found and fixed (reporter timing). Remaining findings are Medium or implementation-time verifications. Plan converged — finalize.
