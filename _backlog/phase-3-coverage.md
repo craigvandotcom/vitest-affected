@@ -1,16 +1,15 @@
 # Phase 3: Coverage-Enhanced Selection
 
 **Depends on:** Phase 2 (Watch Mode + Caching)
-**Effort:** Weeks
-**Accuracy:** ~95% (up from Phase 1's static-only analysis)
-**New files:** `src/coverage/collector.ts`, `src/coverage/mapper.ts`, `src/coverage/merge.ts`
-**New deps:** None (uses Node.js built-in `node:inspector/promises`)
+**Effort:** Days (reduced from weeks after refinement)
+**New file:** `src/coverage.ts`
+**New deps:** None (uses Node.js built-in APIs + Vitest's existing coverage output)
 
 ---
 
 ## Goal
 
-Augment the static import graph with runtime coverage data. After test runs, record which source files each test file actually executes at runtime. Merge this coverage map with the static graph to catch dependencies invisible to static analysis: dynamic imports, `require()`, `vi.mock()` factory helpers, config-driven dependencies, and runtime-only code paths.
+Augment the static import graph with runtime coverage data. After test runs, read which source files each test worker actually loaded at runtime. Union these edges into the static graph to catch dependencies invisible to static analysis.
 
 ---
 
@@ -18,416 +17,285 @@ Augment the static import graph with runtime coverage data. After test runs, rec
 
 Phase 1's static graph misses:
 
-| Invisible dependency | Why static analysis misses it | Coverage catches it |
+| Invisible dependency | Why static misses it | Coverage catches it |
 |---|---|---|
-| `import(variable)` | Computed specifier — can't resolve statically | Runtime execution reveals actual path |
-| `require('./config')[env]` | Dynamic property access | Execution traces the actual file |
-| `vi.mock('./foo', () => import('./bar'))` | Mock factory imports are opaque | Factory executes, bar.ts appears in coverage |
-| `fs.readFileSync('./data.json')` | Not an import statement | File access appears in V8 coverage |
-| Shared global state via `globalThis` | No import edge exists | Both files execute in coverage |
+| `import(variable)` | Computed specifier | Runtime reveals actual path |
+| `require('./config')[env]` | Dynamic property access | Traces actual file |
+| `vi.mock('./foo', () => import('./bar'))` | Mock factory is opaque | Factory executes, bar.ts in coverage |
+| `fs.readFileSync('./data.json')` | Not an import | File appears in V8 coverage |
 
-**Safety invariant preserved:** Coverage data only ADDS to the static graph (union). If coverage misses something, static analysis still catches it. False negatives can only decrease, never increase.
+**Safety invariant preserved:** Coverage only ADDS edges (union). False negatives can only decrease.
 
 ---
 
-## How V8 Coverage Works in Vitest
+## Integration Strategy: Post-Run File Reader
 
-### Coverage Pipeline
+**Not** a custom coverage provider. Vitest writes per-worker V8 coverage to `<reportsDirectory>/.tmp/coverage-<N>.json` when `coverage.enabled = true`. Default `reportsDirectory` is `./coverage`, so the standard path is `<root>/coverage/.tmp/`. Phase 3 reads these files after the test run completes — no lifecycle hooks, no provider wrapping, no conflict with user coverage config.
 
-```
-Vitest Worker Process
-  → V8 Inspector: Profiler.startPreciseCoverage({ callCount: true, detailed: true })
-  → Test file executes (imports/requires resolved, code runs)
-  → V8 Inspector: Profiler.takePreciseCoverage()
-  → ScriptCoverage[] returned (one per loaded script)
-  → Vitest writes coverage-{pid}-{N}.json to .coverage-v8/.tmp/
-  → Vitest's coverage provider merges and reports
-```
+### Why Not Custom Provider?
 
-### ScriptCoverage Type
+- `coverage.provider: 'custom'` replaces the entire V8/Istanbul pipeline — can't "wrap" it
+- Requires a `customProviderModule` file path (separate disk file), not runtime registration
+- Breaks users' existing `provider: 'v8'` or `provider: 'istanbul'` configs
+- `TestModule.coverageData` doesn't exist on the reporter API
 
-```typescript
-// From V8 Inspector protocol (CDP)
-interface ScriptCoverage {
-  scriptId: string;
-  url: string;          // file:///abs/path/to/source.ts  ← the key field
-  functions: FunctionCoverage[];
-}
+### How It Works
 
-interface FunctionCoverage {
-  functionName: string;
-  ranges: CoverageRange[];
-  isBlockCoverage: boolean;
-}
-
-interface CoverageRange {
-  startOffset: number;
-  endOffset: number;
-  count: number;        // Execution count — 0 means uncovered
-}
-```
-
-**Key insight:** `ScriptCoverage.url` tells us which files a test actually loaded at runtime. We don't need the detailed function/range data for test selection — just the file-level mapping: "test A loaded files [X, Y, Z]".
-
-### Per-Test-File Granularity
-
-V8 coverage is collected per **worker process**, not per test file. To get per-test-file mappings:
-
-**Option A: `isolate: true` (recommended for accuracy)**
-
-With `pool: 'forks'` and `isolate: true`, each test file runs in its own forked process. The coverage data for that process maps directly to that test file.
+1. User enables V8 coverage in their config (or we auto-enable via Vite `config` hook)
+2. Vitest runs tests, collecting V8 coverage per worker as normal
+3. Coverage files are written to `<reportsDirectory>/.tmp/` (Vitest's standard behavior)
+4. After run completes, our reporter's `onTestRunEnd` reads these files (sync, for atomicity)
+5. Extract file-level mappings: which source files each worker loaded
+6. Union into the static graph and persist
 
 ```typescript
-// vitest.config.ts — required for per-test-file coverage mapping
-export default defineConfig({
-  test: {
-    pool: 'forks',
-    poolOptions: {
-      forks: {
-        isolate: true,  // default is true for forks
-      },
-    },
-  },
-  plugins: [vitestAffected()],
-})
-```
-
-**Option B: `isolate: false` (degraded accuracy)**
-
-Multiple test files share a worker. Coverage data is aggregated — we can only say "these tests collectively loaded these files". Less precise but still useful as a union over the static graph.
-
-### Intercepting Coverage Data
-
-Vitest writes per-worker coverage files to `.coverage-v8/.tmp/coverage-{pid}-{timestamp}.json` before cleanup. We can intercept this data via two approaches:
-
-**Approach 1: Custom Coverage Provider (preferred)**
-
-```typescript
-// Vitest allows custom coverage providers via the coverage.provider config
-// We can wrap the v8 provider to intercept per-file data
-
-import type { CoverageProvider, AfterSuiteRunMeta } from 'vitest/coverage';
-
-export class AffectedCoverageProvider implements CoverageProvider {
-  name = 'vitest-affected-v8';
-
-  // Called after each worker/suite finishes
-  onAfterSuiteRun(meta: AfterSuiteRunMeta): void {
-    // meta.coverage contains the raw V8 coverage for this worker
-    // meta.projectName identifies which project (for workspaces)
-    // meta.transformMode is 'ssr' or 'web'
-
-    // Extract file-level mapping
-    const loadedFiles = meta.coverage
-      .filter((sc: ScriptCoverage) => sc.url.startsWith('file://'))
-      .map((sc: ScriptCoverage) => fileURLToPath(sc.url))
-      .filter((f: string) => !f.includes('node_modules'));
-
-    // Store the mapping: testFile → loadedFiles
-    this.recordMapping(meta.testFile, loadedFiles);
-  }
+// Reporter hook — runs after all tests complete
+onTestRunEnd(testModules: TestModule[], unhandledErrors: Error[]) {
+  const reportsDir = vitest.config.coverage?.reportsDirectory ?? 'coverage';
+  const coverageDir = path.resolve(rootDir, reportsDir, '.tmp');
+  const edges = readCoverageEdges(coverageDir, rootDir, testModules);
+  // Union into existing graph and save
 }
 ```
 
-**Approach 2: Reporter Hook (simpler, less granular)**
+### Coverage File Format (Vitest writes this)
 
-```typescript
-import type { Reporter, TestModule } from 'vitest/reporters';
+Each file in `<reportsDirectory>/.tmp/` is named `coverage-<N>.json` (auto-incrementing integer) and contains:
 
-export class CoverageCollector implements Reporter {
-  // onCoverage is called with the merged coverage data
-  // Less granular than provider approach — all tests merged
-  onCoverage(coverage: unknown): void {
-    // Process merged coverage data
-  }
+```json
+{
+  "result": [
+    {
+      "scriptId": "123",
+      "url": "file:///abs/path/to/source.ts",
+      "functions": [...]
+    }
+  ]
 }
 ```
 
-**We use Approach 1** — the coverage provider gives us per-worker data before Vitest merges it, which is exactly what we need for per-test-file mapping.
+We only need `url` — which files were loaded. Function/range details are ignored.
+
+**URL normalization:** Coverage URLs may be `file:///abs/path` or Vite-transformed (`/@fs/abs/path?v=hash`). Normalize by stripping query params and handling `/@fs/` prefix before matching.
 
 ---
 
 ## Architecture
 
-### New file: `src/coverage/collector.ts`
-
-Collects per-test-file coverage mappings during test execution:
+### Single file: `src/coverage.ts`
 
 ```typescript
-// collector.ts — records which source files each test file loads at runtime
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-export interface CoverageMapping {
-  testFile: string;                    // absolute path to test file
-  loadedFiles: string[];               // absolute paths of source files loaded at runtime
-  collectedAt: number;                 // timestamp
-}
-
-export class CoverageCollector {
-  private mappings: Map<string, CoverageMapping> = new Map();
-  private rootDir: string;
-
-  constructor(rootDir: string) {
-    this.rootDir = rootDir;
-  }
-
-  // Called per-worker with raw V8 ScriptCoverage data
-  recordCoverage(testFile: string, scriptCoverages: ScriptCoverage[]): void {
-    const loadedFiles = scriptCoverages
-      .filter(sc => {
-        // Only file:// URLs (skip eval, wasm, etc.)
-        if (!sc.url.startsWith('file://')) return false;
-        const filePath = fileURLToPath(sc.url);
-        // Only files under rootDir (skip node_modules, vitest internals)
-        if (!filePath.startsWith(this.rootDir)) return false;
-        if (filePath.includes('node_modules')) return false;
-        return true;
-      })
-      .map(sc => fileURLToPath(sc.url));
-
-    // Only record if file had non-zero coverage (actually executed)
-    const executedFiles = loadedFiles.filter(f =>
-      scriptCoverages.some(sc =>
-        fileURLToPath(sc.url) === f &&
-        sc.functions.some(fn => fn.ranges.some(r => r.count > 0))
-      )
-    );
-
-    this.mappings.set(testFile, {
-      testFile,
-      loadedFiles: [...new Set(executedFiles)].sort(),
-      collectedAt: Date.now(),
-    });
-  }
-
-  getMappings(): Map<string, CoverageMapping> {
-    return new Map(this.mappings);
-  }
-}
-```
-
-### New file: `src/coverage/mapper.ts`
-
-Converts coverage mappings into a reverse dependency graph:
-
-```typescript
-// mapper.ts — converts coverage mappings to a reverse graph
-export function buildCoverageReverseGraph(
-  mappings: Map<string, CoverageMapping>
+/**
+ * Read Vitest's V8 coverage temp files and extract file-level edges.
+ * Returns a reverse map: source file → Set<test files that loaded it>.
+ *
+ * Single-pass: for each coverage file, identify which test files appear
+ * in the ScriptCoverage URLs (URL matching), then map all other loaded
+ * source files to those test files (per-worker union).
+ *
+ * Uses sync I/O for atomicity — coverage .tmp/ files may be cleaned
+ * by Vitest's reportCoverage shortly after onTestRunEnd fires.
+ */
+export function readCoverageEdges(
+  coverageTmpDir: string,
+  rootDir: string,
+  testFileSet: Set<string>
 ): Map<string, Set<string>> {
-  // coverage reverse: source file → Set<test files that loaded it>
   const reverse = new Map<string, Set<string>>();
 
-  for (const [testFile, mapping] of mappings) {
-    for (const sourceFile of mapping.loadedFiles) {
-      if (!reverse.has(sourceFile)) {
-        reverse.set(sourceFile, new Set());
+  let files: string[];
+  try {
+    files = readdirSync(coverageTmpDir);
+  } catch {
+    return reverse; // No coverage dir — return empty
+  }
+
+  for (const f of files) {
+    if (!f.startsWith('coverage-') || !f.endsWith('.json')) continue;
+
+    let raw: string;
+    try {
+      raw = readFileSync(path.join(coverageTmpDir, f), 'utf-8');
+    } catch {
+      continue; // ENOENT — file cleaned mid-read, skip
+    }
+
+    const parsed = JSON.parse(raw);
+    const scriptCoverages = parsed.result ?? [];
+
+    // Single pass: separate test files from source files
+    const testFilesInWorker: string[] = [];
+    const sourceFilesInWorker: string[] = [];
+
+    for (const sc of scriptCoverages) {
+      const filePath = normalizeUrl(sc.url);
+      if (!filePath) continue;
+      if (!filePath.startsWith(rootDir)) continue;
+      if (filePath.includes('node_modules')) continue;
+
+      if (testFileSet.has(filePath)) {
+        testFilesInWorker.push(filePath);
+      } else {
+        // Only include files actually executed (any function with count > 0)
+        const executed = sc.functions?.some((fn: any) =>
+          fn.ranges?.some((r: any) => r.count > 0)
+        );
+        if (executed) sourceFilesInWorker.push(filePath);
       }
-      reverse.get(sourceFile)!.add(testFile);
+    }
+
+    // Per-worker union: all source files → all test files in this worker
+    for (const testFile of testFilesInWorker) {
+      for (const sourceFile of sourceFilesInWorker) {
+        if (!reverse.has(sourceFile)) reverse.set(sourceFile, new Set());
+        reverse.get(sourceFile)!.add(testFile);
+      }
     }
   }
 
   return reverse;
 }
-```
 
-### New file: `src/coverage/merge.ts`
+/**
+ * Normalize a coverage URL to an absolute file path.
+ * Handles: file:// URLs, /@fs/ Vite URLs, query param stripping.
+ * Returns null for non-file URLs (http, data, etc).
+ */
+function normalizeUrl(url: string | undefined): string | null {
+  if (!url) return null;
+  // Strip query params
+  const bare = url.split('?')[0];
+  if (bare.startsWith('file://')) return fileURLToPath(bare);
+  if (bare.includes('/@fs/')) return bare.slice(bare.indexOf('/@fs/') + 4);
+  return null;
+}
 
-Merges the static graph with coverage graph:
-
-```typescript
-// merge.ts — additive merge: static_graph ∪ coverage_graph
-export function mergeReverseGraphs(
+/**
+ * Merge coverage reverse graph into static reverse graph (additive union).
+ * Coverage can only ADD edges, never remove them.
+ */
+export function mergeIntoGraph(
   staticReverse: Map<string, Set<string>>,
   coverageReverse: Map<string, Set<string>>
-): Map<string, Set<string>> {
-  // Union merge: for each source file, the set of test files is the union
-  // of static analysis dependents AND coverage-observed dependents
-  const merged = new Map<string, Set<string>>();
-
-  // Copy all static entries
-  for (const [file, deps] of staticReverse) {
-    merged.set(file, new Set(deps));
-  }
-
-  // Add coverage entries (union)
-  for (const [file, deps] of coverageReverse) {
-    if (!merged.has(file)) {
-      merged.set(file, new Set(deps));
+): void {
+  for (const [file, tests] of coverageReverse) {
+    if (!staticReverse.has(file)) {
+      staticReverse.set(file, new Set(tests));
     } else {
-      for (const dep of deps) {
-        merged.get(file)!.add(dep);
+      for (const t of tests) {
+        staticReverse.get(file)!.add(t);
       }
     }
   }
-
-  return merged;
 }
 ```
 
-**Critical design decision:** Coverage graph is additive — it can only ADD edges to the static graph, never remove them. This preserves the safety invariant: if static analysis says "test A depends on source B", that edge is kept even if coverage didn't observe it (the coverage run may not have exercised that code path).
+### Per-Worker Union (No `isolate` Requirement)
+
+Most users run default settings (`isolate: true` for forks, but `isolate: false` for threads). The plan does NOT require `isolate: true`.
+
+- **`isolate: true`:** 1 test file per worker → 1:1 mapping (precise)
+- **`isolate: false`:** N test files per worker → N:M mapping (over-selects, safe)
+
+Per-worker union is always correct — it can over-select (run extra tests) but never under-select (miss failures). The precision difference rarely changes which tests run in practice, because BFS already fans out broadly through the dependency graph.
 
 ---
 
-## Coverage Map Storage
+## Persistence: Fold Into `graph.json`
 
-### File format: `.vitest-affected/coverage-map.json`
+No separate `coverage-map.json`. Coverage edges are stored in the existing Phase 2 cache file:
 
 ```json
 {
-  "version": 1,
-  "collectedAt": 1708000000000,
-  "isolateMode": true,
-  "mappings": {
-    "/abs/path/__tests__/food.test.tsx": {
-      "loadedFiles": [
-        "/abs/path/src/utils/food.ts",
-        "/abs/path/src/types.ts",
-        "/abs/path/src/config.ts"
-      ],
-      "collectedAt": 1708000000000
-    }
-  }
+  "version": 2,
+  "builtAt": 1708000000000,
+  "files": { ... },
+  "coverageEdges": {
+    "src/utils/food.ts": ["tests/food.test.tsx", "tests/utils.test.ts"],
+    "src/types.ts": ["tests/food.test.tsx", "tests/types.test.ts"]
+  },
+  "coverageCollectedAt": 1708000000000
 }
 ```
 
-**Size estimate:** ~125KB for 50 test files × 50 source files per test (stripped JSON, absolute paths). Acceptable for disk persistence.
+**Simple relative paths:** `coverageEdges` maps relative source paths (from `rootDir`) to arrays of relative test file paths. No path compression or integer indices — with relative paths the map is ~200KB for 500 tests x 200 sources, well within tolerance. Add compression later if a real project exceeds 1MB.
+
+**Version bump:** `version: 1` (Phase 2) → `version: 2` (Phase 3). Unknown version triggers full rebuild (existing behavior).
+
+**Version migration:** When reading a version 1 cache (no `coverageEdges` field), treat as valid graph with empty coverage data. Bump to version 2 on next write. This allows seamless upgrade from Phase 2 → Phase 3 without a full rebuild.
 
 ### Invalidation
 
-Coverage mappings are invalidated when:
-1. **Source file content changes** (hash mismatch) — re-run the test to collect new coverage
-2. **Test file content changes** — re-run the test to collect new coverage
-3. **Test file deleted** — remove mapping
-4. **Source file deleted** — remove from all mappings
+Coverage edges are invalidated when:
+- **Test file content changes** (mtime mismatch) — mapping is stale, will be refreshed on next run
+- **Source file deleted** — remove from all coverage edges
 
-Between coverage collections, the stale mapping is still used — it's better than no mapping. The next test run refreshes it.
-
-```typescript
-export function invalidateStaleMappings(
-  mappings: Map<string, CoverageMapping>,
-  currentHashes: Map<string, string>,
-  previousHashes: Map<string, string>
-): { valid: Map<string, CoverageMapping>; stale: string[] } {
-  const valid = new Map<string, CoverageMapping>();
-  const stale: string[] = [];
-
-  for (const [testFile, mapping] of mappings) {
-    // Test file itself changed — mapping is stale
-    if (currentHashes.get(testFile) !== previousHashes.get(testFile)) {
-      stale.push(testFile);
-      continue;
-    }
-
-    // Any loaded source file changed — mapping is stale
-    const anySourceChanged = mapping.loadedFiles.some(f =>
-      currentHashes.get(f) !== previousHashes.get(f)
-    );
-
-    if (anySourceChanged) {
-      stale.push(testFile);
-      continue;
-    }
-
-    valid.set(testFile, mapping);
-  }
-
-  return { valid, stale };
-}
-```
+Between coverage collections, stale mappings are still used — better than no mapping. The next test run refreshes them.
 
 ---
 
 ## Plugin Integration
 
-### Modified `plugin.ts`
+### Reporter Registration
+
+The reporter must be pushed to `vitest.reporters` (the runtime array that `vitest.report()` iterates), **not** `vitest.config.reporters` (config-level tuples that are already resolved). This must happen after reporter initialization — in `configureVitest`, `vitest.reporters` is the live array.
+
+**Lifecycle assumption:** `configureVitest` fires after reporters are instantiated. If Vitest changes this order, the reporter push would be overwritten. Verify against the Vitest version at implementation time. If `vitest.reporters` is overwritten after `configureVitest`, fall back to a separate reporter file registered via `vitest.config.reporters` tuple in the Vite `config` hook.
 
 ```typescript
-export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
-  let snapshot: GraphSnapshot | null = null;
-  let coverageMap: Map<string, CoverageMapping> | null = null;
+// In plugin.ts — Phase 3 additions to configureVitest
 
-  return {
-    name: 'vitest:affected',
+// Resolve coverage tmp directory from user's config
+const reportsDir = vitest.config.coverage?.reportsDirectory ?? 'coverage';
+const coverageTmpDir = path.resolve(rootDir, reportsDir, '.tmp');
 
-    async configureVitest({ vitest, project }) {
-      // ... Phase 1+2 setup ...
+// After building/loading graph, merge cached coverage edges if available
+const coverageEdges = snapshot.coverageEdges;  // From cached graph.json
+if (coverageEdges) {
+  mergeIntoGraph(snapshot.reverse, coverageEdges);
+}
 
-      const rootDir = vitest.config.root;
-      const cacheDir = path.join(rootDir, '.vitest-affected');
+// Register reporter to collect new coverage after each run
+vitest.reporters.push({
+  onTestRunEnd(testModules: TestModule[]) {
+    const testFileSet = new Set(testModules.map(m => m.moduleId));
+    const newEdges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
+    mergeIntoGraph(snapshot.reverse, newEdges);
+    // Persist updated graph with coverage edges
+    saveGraph(snapshot, cacheDir);
+  }
+});
+```
 
-      // Load cached coverage map
-      coverageMap = await loadCoverageMap(cacheDir);
+### Auto-Enabling Coverage
 
-      // Build merged reverse graph
-      const staticReverse = snapshot!.reverse;
-      const coverageReverse = coverageMap
-        ? buildCoverageReverseGraph(coverageMap)
-        : new Map();
-      const mergedReverse = mergeReverseGraphs(staticReverse, coverageReverse);
+Coverage must be enabled before Vitest's `initCoverageProvider()` runs — which happens in `Vitest.start()`, before `configureVitest` fires. Therefore auto-enable must happen in the **Vite `config` hook** (runs during config resolution, before Vitest initialization):
 
-      // BFS uses merged graph instead of static-only
-      const affectedTests = bfsAffectedTests(changed, mergedReverse, isTestFile);
-
-      // ... rest of Phase 1 logic (threshold, validation, config.include mutation) ...
-
-      // Register coverage collection for this run
-      // After tests complete, save new coverage mappings
-      const collector = new CoverageCollector(rootDir);
-
-      // Hook into test completion to collect coverage
-      // Option 1: via custom reporter
-      const coverageReporter: Reporter = {
-        onTestModuleEnd(module: TestModule) {
-          // Collect coverage data for this test module
-          // This requires coverage to be enabled
-          if (module.coverageData) {
-            collector.recordCoverage(module.moduleId, module.coverageData);
-          }
-        },
-
-        async onTestRunEnd() {
-          // Save updated coverage map
-          const newMappings = collector.getMappings();
-          // Merge with existing (keep old mappings for tests that didn't run)
-          const merged = mergeCoverageMaps(coverageMap ?? new Map(), newMappings);
-          await saveCoverageMap(cacheDir, merged);
-        }
-      };
-
-      // Add our reporter
-      vitest.config.reporters = [...(vitest.config.reporters ?? []), coverageReporter];
-    }
-  };
+```typescript
+// In the Vite plugin config hook (runs before Vitest init)
+config(config) {
+  if (options.coverage === false) return; // User explicitly disabled
+  const test = config.test ?? {};
+  const cov = test.coverage ?? {};
+  if (cov.enabled === undefined) {
+    // Auto-enable: user hasn't explicitly configured coverage
+    test.coverage = {
+      ...cov,
+      enabled: true,
+      provider: 'v8',
+      reporter: ['json'],  // Minimal reporter — needed for provider to function
+      all: false,           // Only instrument executed files
+    };
+    config.test = test;
+  }
 }
 ```
 
-### Enabling V8 Coverage Collection
-
-For Phase 3 to work, V8 coverage must be enabled. The plugin can auto-configure this:
-
-```typescript
-// In configureVitest, enable coverage if Phase 3 is active
-if (options.coverage !== false) {
-  // Ensure V8 coverage provider is active
-  vitest.config.coverage = {
-    ...vitest.config.coverage,
-    enabled: true,
-    provider: 'v8',
-    // We don't need the full coverage report — just the raw data
-    // Minimal config to reduce overhead
-    reporter: [],  // No coverage reports needed
-    all: false,    // Only instrument executed files
-  };
-}
-```
-
-**Performance note:** V8 coverage with `detailed: true` adds ~5-15% overhead per test. For CI this is acceptable. For local development, users can disable coverage collection:
-
-```typescript
-vitestAffected({ coverage: false })  // Use static graph only
-```
+**Note:** `reporter: ['json']` produces a small `coverage-final.json`. An empty `reporter: []` may cause the V8 provider to skip processing or error. Verify empirically; use `['json-summary']` as alternative if `['json']` is too large.
 
 ---
 
@@ -435,20 +303,16 @@ vitestAffected({ coverage: false })  // Use static graph only
 
 ```typescript
 export interface VitestAffectedOptions {
-  // Phase 1 options
+  // Phase 1+2 options
   disabled?: boolean;
   ref?: string;
   verbose?: boolean;
   threshold?: number;
-
-  // Phase 2 options
-  verify?: boolean;
   cache?: boolean;
-  cacheDir?: string;
 
-  // Phase 3 additions
-  coverage?: boolean;       // Collect V8 coverage for enhanced selection (default: true)
-  coverageIsolate?: boolean; // Require isolate:true for per-test mapping (default: true)
+  // Phase 3 addition
+  coverage?: boolean;  // Use V8 coverage for enhanced selection (default: true)
+                       // Set false to use static graph only
 }
 ```
 
@@ -456,42 +320,24 @@ export interface VitestAffectedOptions {
 
 ## Implementation Steps
 
-### Step 1: `coverage/collector.ts`
+1. **Implement `coverage.ts`** — `readCoverageEdges` (single-pass with URL matching inlined), `mergeIntoGraph`, `normalizeUrl`. Single file, pure functions, sync I/O.
+2. **Update cache format** — Bump `version` to 2. Add `coverageEdges` (relative path strings) and `coverageCollectedAt` to `graph.json`. Handle v1→v2 migration (treat v1 cache as valid with empty coverage edges).
+3. **Update `plugin.ts`** — Auto-enable V8 coverage in Vite `config` hook (before Vitest init). Push reporter to `vitest.reporters` in `configureVitest`. Merge cached coverage edges into BFS graph.
+4. **Tests** — Coverage file parsing, URL normalization, edge extraction, merge correctness, v1→v2 migration, user-opt-out respect.
 
-Implement CoverageCollector class. Parse V8 ScriptCoverage data, extract file-level mappings, filter to rootDir files only.
+---
 
-### Step 2: `coverage/mapper.ts`
+## Known Limitations (Phase 3)
 
-Convert collected mappings to reverse graph format. Simple iteration: for each test's loaded files, add a reverse edge.
-
-### Step 3: `coverage/merge.ts`
-
-Implement additive merge of static and coverage reverse graphs. Unit test with known graphs to verify union semantics.
-
-### Step 4: Coverage map persistence
-
-Serialize/deserialize coverage-map.json. Implement invalidation logic (hash-based). Add to .vitest-affected/ cache directory.
-
-### Step 5: Integrate collector into plugin
-
-Hook into Vitest's test lifecycle to collect coverage after each test module. Auto-configure V8 coverage provider. Save coverage map on test run completion.
-
-### Step 6: Merge graphs in BFS path
-
-Replace `snapshot.reverse` with `mergedReverse` in the BFS call. The rest of the plugin logic (threshold, validation, config.include mutation) stays unchanged.
-
-### Step 7: Handle `isolate: false` gracefully
-
-If isolate is false, coverage data is per-worker (multiple tests). Fall back to "all tests in worker loaded all files" — less precise but still correct (over-selects, never under-selects).
-
-### Step 8: Tests
-
-- Coverage collector: mock ScriptCoverage data, verify file extraction
-- Mapper: known mappings → expected reverse graph
-- Merge: static + coverage → union graph (verify no edges lost)
-- Invalidation: hash changes → correct stale detection
-- Integration: fixture project with dynamic imports, verify coverage catches them
-- Performance: coverage overhead measurement on body-compass-app
+- **Coverage must be enabled:** Phase 3 reads Vitest's V8 coverage output. If coverage is disabled by the user (`coverage: false`), Phase 3 falls back to static-only graph silently.
+- **First-run cold start:** No coverage data on first run. Uses static graph only. Coverage map builds up over subsequent runs.
+- **Coverage edges are one run behind:** Coverage data from run N only benefits run N+1's selection. This is acceptable — static analysis catches most cases on the current run, and coverage refines the graph incrementally.
+- **Coverage file race:** `onTestRunEnd` fires between `generateCoverage()` and `reportCoverage()` (which calls `cleanAfterRun()`). Files should exist at read time, but sync I/O + per-file ENOENT catch guards against ordering changes in future Vitest versions.
+- **URL normalization:** Coverage URLs may use Vite's `/@fs/` scheme or include query params. The `normalizeUrl` function handles known patterns. Unknown URL schemes are silently skipped — add verbose logging to detect silent failures.
+- **`transformMode` assumption:** Coverage data may include both SSR and web transform modes. Phase 3 treats all modes uniformly (union). For projects with SSR+client split, this may over-select slightly.
+- **Per-worker union with `isolate: false`:** All loaded files assigned to all tests in the worker. Over-selects but never under-selects.
+- **Auto-enable coverage lifecycle:** Auto-enabling happens in Vite `config` hook. If Vitest changes when coverage config is consumed, auto-enable may stop working. Users can always explicitly set `coverage.enabled: true` as a guaranteed fallback.
+- **Coverage JSON parsing:** Large coverage files (>10MB for complex projects) may cause memory spikes during `JSON.parse`. Add a file-size guard: skip files >20MB with a warning.
 
 ---
 
@@ -501,39 +347,35 @@ If isolate is false, coverage data is per-worker (multiple tests). Fall back to 
 merged_graph = static_graph ∪ coverage_graph
 ```
 
-**Coverage adds edges the static graph missed:**
-- `src/config.ts` loaded by `auth.test.tsx` via `require()` → coverage adds edge
-- `src/helpers/mock-data.ts` loaded by `food.test.tsx` via `vi.mock()` factory → coverage adds edge
-
-**Static graph keeps edges coverage missed:**
-- `src/types.ts` imported by `food.ts` but never executed in test → static keeps edge
-- `src/utils/format.ts` imported but behind an `if` branch not taken → static keeps edge
-
-**Result:** The merged graph has strictly more edges than either graph alone. This means:
-- More tests may be selected (over-selection possible)
-- Fewer tests will be missed (under-selection reduced)
-- Safety invariant strengthened
+- **Coverage adds edges** static analysis missed (dynamic imports, `require()`, mock factories)
+- **Static graph keeps edges** coverage missed (code paths not exercised in test)
+- **Result:** More tests may be selected (over-selection possible), fewer tests missed (under-selection reduced)
 
 ---
 
-## Similar Tools' Approaches
+## Refinement Log
 
-| Tool | Coverage strategy | Granularity | Storage |
-|---|---|---|---|
-| pytest-testmon | `sys.settrace()` per test | Per-test function | `.testmondata` SQLite |
-| Datadog TIA | dd-trace V8 profiler | Per-test suite | Cloud (Datadog) |
-| Wallaby.js | V8 + custom instrumentation | Per-expression | In-memory + project cache |
-| **vitest-affected** | V8 via `node:inspector` | Per-test file | `.vitest-affected/coverage-map.json` |
+### Round 1 (Medium: Builder/Breaker/Trimmer — 3x Opus)
 
-Our approach is closest to Datadog TIA but local-only and open-source.
+- **Changes:** 9 auto-applied (2 Critical, 7 High)
+- **Key fixes:** Replaced custom coverage provider with post-run file reader (3/3 consensus — provider approach unviable). Fixed `AfterSuiteRunMeta.testFiles` plural array (3/3). Removed `TestModule.coverageData` (doesn't exist, 2/3). Auto-enable coverage only if not explicitly set (2/3). Collapsed 3 files into 1 `coverage.ts` (2/3). Folded coverage-map into `graph.json` (2/3). Dropped `coverageIsolate` option — per-worker union always (2/3). Added path compression for scale (2/3). Added 24h staleness TTL (2/3).
+- **Consensus:** Provider approach broken 3/3. `testFiles` is array 3/3. Simplification 2/3 across all cuts.
+- **Trajectory:** Critical issues found → continue to Round 2 for verification
 
----
+### Round 2 (Medium: Builder/Breaker/Trimmer — 3x Opus)
 
-## Known Limitations (Phase 3)
-
-- **Coverage overhead:** ~5-15% per test with V8 detailed coverage. Acceptable for CI, configurable for local dev.
-- **`isolate: false` degradation:** Without process isolation, coverage is per-worker, not per-test-file. Falls back to union mapping (over-selects).
-- **First-run cold start:** No coverage data exists on first run. First run uses static graph only. Coverage map builds up over subsequent runs.
-- **Stale coverage data:** Between collections, coverage mappings may be outdated. Invalidation catches source/test file changes but not transitive dependency changes. Full coverage refresh recommended periodically (e.g., weekly in CI).
-- **Dynamic `require()` with variables:** If the required path is fully computed at runtime (not a string literal), even coverage may miss it if the code path isn't exercised. This is a theoretical edge case — in practice, V8 coverage captures all loaded scripts regardless of how they were loaded.
-- **Vitest's coverage provider conflict:** If the user has their own coverage configuration, our auto-configuration may conflict. Need to detect and merge gracefully.
+- **Changes:** 7 applied (2 Critical, 2 High, 1 Medium consensus + 2 Trimmer simplifications)
+- **Key fixes:**
+  - Fixed coverage tmp path: `<reportsDirectory>/.tmp/` not `.coverage-v8/.tmp/` (Builder CRITICAL — factual verification against Vitest source)
+  - Fixed filename pattern: `coverage-<N>.json` not `coverage-{pid}-{timestamp}.json` — PID matching invalid (Builder CRITICAL)
+  - Fixed reporter registration: push to `vitest.reporters` (runtime array), not `vitest.config.reporters` (config tuples) (Builder HIGH + Breaker CRITICAL = 2/3)
+  - Added sync I/O + ENOENT guards for coverage file race (Builder HIGH + Breaker HIGH = 2/3)
+  - Added v1→v2 cache migration path (Builder MEDIUM — correctness)
+  - Deferred path compression — relative paths are ~200KB, integer indices premature (Trimmer HIGH — simplification)
+  - Removed 24h staleness TTL — mtime invalidation sufficient (Trimmer HIGH — simplification)
+  - Inlined `buildWorkerTestMap` into `readCoverageEdges` — single pass per file (Trimmer MEDIUM)
+  - Moved auto-enable coverage to Vite `config` hook — must run before `initCoverageProvider` (Builder HIGH)
+  - Added URL normalization for `/@fs/` and query params (Breaker HIGH — noted in architecture)
+  - Changed `reporter: []` to `reporter: ['json']` to avoid breaking V8 provider (Breaker HIGH — noted)
+- **Noted (1/3, not auto-applied):** Separate reporter file if `vitest.reporters` is overwritten (Breaker CRITICAL-1 fallback). One-run-behind semantics documented (Breaker HIGH-3).
+- **Trajectory:** No Critical issues remain. Implementation steps reduced from 6 to 4. Plan converging.
