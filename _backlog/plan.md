@@ -5,6 +5,21 @@ An open-source Vitest plugin that maintains a persistent dependency graph and us
 **GitHub:** https://github.com/craigvandotcom/vitest-affected
 **npm:** `vitest-affected` (unclaimed, verified)
 
+### Why Not `vitest --changed`?
+
+Vitest's built-in `--changed` flag does follow transitive dependencies via Vite's module graph. The key differences are **speed** and **workflow**:
+
+| | `vitest --changed` | `vitest-affected` |
+|---|---|---|
+| Graph source | On-demand Vite transforms (slow cold start) | Pre-built static analysis (fast, cacheable) |
+| First run | Must transform every reachable module | oxc-parser is 8x faster, results cached |
+| CI friendliness | No persistence between runs | Cached graph persists across runs |
+| Dynamic deps | Catches all (runtime graph) | Static-only until Phase 3 coverage |
+
+The primary value proposition is **speed**: a cached static graph resolves affected tests in milliseconds, vs Vite's on-demand module transformation which scales with project size. Phase 3 coverage data closes the accuracy gap for dynamic dependencies.
+
+**Note:** `--changed` uses Vite's in-memory module graph cache when warm (watch mode). The speed advantage is largest on cold CI runs where Vite must transform on demand. Benchmark against `vitest --changed` on a real 500+ file project before launch to quantify the actual speedup.
+
 ---
 
 ## Safety Invariant
@@ -54,7 +69,6 @@ vitest-affected/
 |---|---|---|
 | `oxc-parser` | Parse imports from TS/JS/TSX/JSX | 8x faster than esbuild, pre-extracted imports |
 | `oxc-resolver` | Resolve specifiers to file paths | 28x faster than enhanced-resolve, handles TS aliases |
-| `picomatch` | Glob matching for force-rerun triggers | Lightweight, zero-dep |
 | `tinyglobby` | File globbing with absolute paths | Fast, minimal |
 
 ```json
@@ -62,11 +76,10 @@ vitest-affected/
   "dependencies": {
     "oxc-parser": "^0.114.0",
     "oxc-resolver": "^6.0.0",
-    "picomatch": "^4.0.2",
     "tinyglobby": "^0.2.10"
   },
   "peerDependencies": {
-    "vitest": ">=3.1.0"
+    "vitest": ">=3.2.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
@@ -88,16 +101,33 @@ export default defineConfig({
 })
 ```
 
-### Options Interface (cumulative across phases)
+### CI Usage
+
+The plugin works without a cache (Phase 1 builds the graph from scratch each run). For best performance in CI, persist the cache directory:
+
+```yaml
+# GitHub Actions example
+- uses: actions/cache@v4
+  with:
+    path: .vitest-affected/
+    key: vitest-affected-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+    restore-keys: vitest-affected-${{ runner.os }}-
+```
+
+Without cache restoration, Phase 1 still provides full benefit (graph build is fast — oxc-parser is ~8x faster than esbuild). Cache primarily helps Phase 2+ skip reparsing unchanged files.
+
+**Important:** `fetch-depth: 0` is required when using `ref` option for cross-branch diffs. The plugin detects shallow clones and throws a clear error.
+
+### Options Interface
+
+Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true). Phase 3 adds `coverage?: boolean` (default: true). See each phase for details.
 
 ```typescript
 export interface VitestAffectedOptions {
-  disabled?: boolean;      // Phase 1: skip plugin entirely
-  ref?: string;            // Phase 1: git ref to diff against
-  verbose?: boolean;       // Phase 1: log graph build time, changed files, affected tests
-  threshold?: number;      // Phase 1: run full suite if affected ratio > threshold (0-1, default 0.5)
-  cache?: boolean;         // Phase 2: persist graph (default: true)
-  coverage?: boolean;      // Phase 3: use V8 coverage for enhanced selection (default: true)
+  disabled?: boolean;      // Skip plugin entirely
+  ref?: string;            // Git ref to diff against (e.g., 'main', 'HEAD~3')
+  verbose?: boolean;       // Log graph build time, changed files, affected tests
+  threshold?: number;      // Run full suite if affected ratio > threshold (0-1, default 1.0 = disabled)
 }
 ```
 
@@ -121,17 +151,22 @@ Ship a working Vitest plugin that pre-filters test files using static import ana
 
 ### Step 0: Project Scaffolding + Stub Cleanup
 
-The existing code stubs are from pre-refinement and contradict the plan. Before feature work:
+The existing code stubs are from pre-refinement and contradict the plan. **This is an atomic prerequisite — complete ALL sub-steps and verify the build passes before starting Step 1.**
 
-- **Delete:** `src/graph/cache.ts` (caching deferred to Phase 2)
-- **Delete:** `src/graph/inverter.ts` (inlined into builder.ts)
-- **Rewrite:** `src/graph/builder.ts` → export `buildFullGraph(rootDir)` returning `{ forward, reverse }` (see Step 2 for full spec). Delete `DependencyGraph` interface.
-- **Rewrite:** `src/selector.ts` → pure `bfsAffectedTests` function (remove `SelectionResult`, `getAffectedTests`)
-- **Rewrite:** `src/index.ts` → single export `vitestAffected` (do this EARLY — current exports reference symbols that will be renamed/deleted in later steps, causing build failures if deferred)
-- **Rewrite:** `src/plugin.ts` → remove `verify` option and `onFilterWatchedSpecification` references; orchestration (build → BFS) lives here. Destructure `{ vitest, project }` (not just `vitest`) — `project.globTestSpecifications()` is needed.
-- **Rewrite:** `src/git.ts` → return `{ changed: string[]; deleted: string[] }` (not flat `string[]`). Stub comments say `ACMR` — plan requires `ACMRD` (includes deletions). Follow the pseudocode, not stub comments.
-- **Update:** `package.json` → peer dep `>=3.1.0`, remove `xxhash-wasm`, add `picomatch` to deps, add `tsup` to devDeps, update build script to `tsup`
-- **Create:** root `vitest.config.ts` and `tsup.config.ts` — tsup config: `{ entry: ['src/index.ts'], format: ['esm', 'cjs'], dts: true, clean: true }`
+Execute in this order:
+
+1. **Rewrite `src/index.ts`** → single export `vitestAffected` (MUST be first — current exports reference symbols deleted in later steps)
+2. **Delete** `src/graph/cache.ts` (caching deferred to Phase 2)
+3. **Delete** `src/graph/inverter.ts` (inlined into builder.ts)
+4. **Rewrite `src/graph/builder.ts`** → export `buildFullGraph(rootDir)` returning `{ forward, reverse }` (see Step 2 for full spec). Delete `DependencyGraph` interface.
+5. **Rewrite `src/selector.ts`** → pure `bfsAffectedTests` function (remove `SelectionResult`, `getAffectedTests`)
+6. **Rewrite `src/plugin.ts`** → remove `verify` option and `onFilterWatchedSpecification` references; orchestration (build → BFS) lives here. Destructure `{ vitest, project }` (not just `vitest`) — `project.config.include` patterns needed for test file identification via `tinyglobby`.
+7. **Rewrite `src/git.ts`** → return `{ changed: string[]; deleted: string[] }` (not flat `string[]`). Stub comments say `ACMR` — plan requires `ACMRD` (includes deletions). Follow the pseudocode, not stub comments.
+8. **Update `package.json`** → peer dep `>=3.2.0` (required for `onAfterSetServer` in Phase 2b/3), remove `xxhash-wasm`, add `tinyglobby` to deps (picomatch deferred to Phase 2), add `tsup` to devDeps, update `scripts.build` from `"tsc"` to `"tsup"`, remove or update `scripts.dev` to `"tsup --watch"`
+9. **Run `npm install`** — install new deps before creating config files
+10. **Create** root `vitest.config.ts` and `tsup.config.ts` — tsup config: `{ entry: ['src/index.ts'], format: ['esm', 'cjs'], dts: true, clean: true }`
+11. **Create/update `.gitignore`** — add `dist/`, `.vitest-affected/`, `coverage/`, `node_modules/`
+12. **Build gate:** Run `npm run build` and verify zero errors before proceeding to Step 1.
 
 ### Step 1: Fixture Tests
 
@@ -162,7 +197,7 @@ The `invertGraph` function is internal to this file (inlined from the former `in
 
 **tsconfig discovery:** Search for `tsconfig.json` starting from `rootDir`. If not found, create the resolver without tsconfig config (path aliases will fail, but basic resolution works). Log a warning if tsconfig is missing.
 
-**Phase 2 exports required:** `parseImports(file, source, rootDir, resolver)` — extract single-file parse+resolve from the `buildFullGraph` loop. Also export `createResolver(rootDir)` so both `buildFullGraph` and `updateGraphForFiles` share the same resolver instance.
+**Phase 2 exports required:** `resolveFileImports(file, source, rootDir, resolver)` → parses import specifiers from source AND resolves them to absolute paths using the provided resolver. Returns `string[]` of resolved absolute import paths. Extract single-file parse+resolve from the `buildFullGraph` loop. Also export `createResolver(rootDir)` so both `buildFullGraph` and `updateGraphForFiles` share the same resolver instance.
 
 ### Step 3: Orchestration in `plugin.ts`
 
@@ -220,15 +255,22 @@ Export only the plugin function: `export { vitestAffected } from './plugin'`. In
 /// <reference types="vitest/config" />
 import type { Plugin } from 'vite';
 
-const FORCE_RERUN_FILES = [
+// Basename check for known config files. Vitest's forceRerunTriggers uses glob patterns
+// designed for watch mode (e.g., **/package.json/**) which may not match one-shot paths.
+// setupFiles are handled separately by Vitest in watch mode, so we check them explicitly.
+const CONFIG_BASENAMES = new Set([
+  'package.json', 'tsconfig.json',
   'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
-  'tsconfig.json', 'package.json',
-];
+  'vite.config.ts', 'vite.config.js', 'vite.config.mts',
+]);
 
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   return {
     name: 'vitest:affected',
 
+    // NOTE: configureVitest is typed as returning void, but Vite's HookHandler
+    // supports async hooks via callHookWithContext. Verify this works in the
+    // integration test — if not, wrap body in a .then() chain or use top-level await.
     async configureVitest({ vitest, project }) {
       if (options.disabled) return;
 
@@ -264,46 +306,52 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        const SOURCE_EXT = /\.(ts|tsx|js|jsx|mts|mjs|cts|cjs)$/;
-        const deletedSourceFiles = deleted.filter(f => SOURCE_EXT.test(f));
-        if (deletedSourceFiles.length > 0) {
-          if (verbose) console.warn(`[vitest-affected] ${deletedSourceFiles.length} source file(s) deleted — running full suite`);
-          else console.warn('[vitest-affected] Deleted source file(s) detected — running full suite');
+        // Phase 1 (no cache): deleted files aren't in the freshly-built graph,
+        // so we can't trace their dependents. ANY deleted file triggers full suite —
+        // including .json/.css that may have been in the graph as non-source imports.
+        // Phase 2 improvement: use cached graph's reverse edges for smart tracing.
+        if (deleted.length > 0) {
+          if (verbose) console.warn(`[vitest-affected] ${deleted.length} file(s) deleted — running full suite`);
+          else console.warn('[vitest-affected] Deleted file(s) detected — running full suite');
           return;
         }
 
-        // Force full run if config/infra/setup files changed
-        const setupFiles = [vitest.config.setupFiles, vitest.config.globalSetup]
-          .flat().filter(Boolean) as string[];
-        const allTriggers = [...FORCE_RERUN_FILES, ...setupFiles, ...(vitest.config.forceRerunTriggers ?? [])];
-        const localChanged = changed.filter(f => f.startsWith(rootDir + path.sep) || f === rootDir);
-        const hasForceRerun = localChanged.some(f => {
-          const relPath = path.relative(rootDir, f);
-          return allTriggers.some(trigger =>
-            (!trigger.includes('/') && !trigger.includes('*'))
-              ? path.basename(f) === trigger
-              : picomatch.isMatch(relPath, trigger, { dot: true })
-          );
-        });
+        // Force full run if config/infra/setup files changed.
+        // Don't use vitest.config.forceRerunTriggers — its glob patterns (e.g.,
+        // **/package.json/**) are designed for watch mode and may not match
+        // absolute paths correctly in one-shot mode. setupFiles are technically
+        // in forceRerunTriggers too, but we check them explicitly for reliability.
+        const setupFileSet = new Set(project.config.setupFiles ?? []);
+        const hasForceRerun = changed.some(f =>
+          CONFIG_BASENAMES.has(path.basename(f)) || setupFileSet.has(f)
+        );
         if (hasForceRerun) {
           console.log('[vitest-affected] Config file changed — running full suite');
           return;
         }
 
-        const specs = await project.globTestSpecifications();
-        const testFileSet = new Set(specs.map(s => s.moduleId));
+        // DO NOT call project.globTestFiles() here — it populates Vitest's internal
+        // testFilesList cache. When Vitest later calls globTestFiles() during start(),
+        // it returns the cached FULL list, ignoring the mutated config.include.
+        // Instead, glob test files directly with tinyglobby (already a dependency).
+        const testFiles = await glob(project.config.include, {
+          cwd: rootDir,
+          absolute: true,
+          ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
+        });
+        const testFileSet = new Set(testFiles);
         const isTestFile = (f: string) => testFileSet.has(f);
         const affectedTests = bfsAffectedTests(changed, reverse, isTestFile);
 
         const ratio = testFileSet.size > 0 ? affectedTests.length / testFileSet.size : 0;
-        if (ratio > (options.threshold ?? 0.5)) {
+        if (ratio > (options.threshold ?? 1.0)) {
           if (verbose) console.log(`[vitest-affected] ${(ratio * 100).toFixed(0)}% of tests affected — running full suite`);
           return;
         }
 
         if (verbose) {
           for (const f of changed) {
-            if (!forward.has(f) && SOURCE_EXT.test(f)) {
+            if (!forward.has(f)) {
               console.warn(`[vitest-affected] Changed file not in graph (outside rootDir?): ${path.relative(rootDir, f)}`);
             }
           }
@@ -317,12 +365,22 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         });
 
         if (validTests.length > 0) {
-          vitest.config.include = validTests;
+          // NOTE: config.include is typed as glob patterns but accepts absolute paths.
+          // Empirically verified on Vitest 3.2.4. If a future Vitest version re-globs
+          // these paths, this will break — add integration test to catch regressions.
+          // WARNING: Absolute paths in config.include poison matchesTestGlob() for
+          // other plugins/internals. Phase 2b uses onFilterWatchedSpecification which
+          // bypasses this, but Phase 1 in watch mode (which falls back to full suite
+          // anyway) may cause issues if other plugins check matchesTestGlob.
+          // Mutate project config (not global). We built testFileSet via
+          // tinyglobby above (NOT project.globTestFiles()) to avoid populating
+          // Vitest's internal cache before this mutation takes effect.
+          project.config.include = validTests;
           console.log(`[vitest-affected] ${validTests.length} affected tests`);
           if (verbose) validTests.forEach(t => console.log(`  → ${path.relative(rootDir, t)}`));
         } else {
           console.log('[vitest-affected] No affected tests — skipping all tests');
-          vitest.config.include = [];
+          project.config.include = [];
         }
       } catch (err) {
         console.warn('[vitest-affected] Error — running full suite:', err);
@@ -389,6 +447,20 @@ return result.path;
 ### Git Diff Integration
 
 ```typescript
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFile = promisify(execFileCb);
+
+async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise<{ stdout: string }> {
+  try {
+    const { stdout } = await execFile(cmd, args, { ...opts, encoding: 'utf-8' });
+    return { stdout: stdout ?? '' };
+  } catch (err: any) {
+    // Include stderr in error message for diagnostics (e.g., "not a git repository")
+    throw new Error(`${cmd} ${args.join(' ')} failed: ${err.stderr ?? err.message}`);
+  }
+}
+
 async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed: string[]; deleted: string[] }> {
   if (ref) {
     const { stdout: isShallow } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
@@ -431,6 +503,9 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
 - **File renames:** Appear as deletion + addition, triggering conservative full-suite fallback.
 - **Temporal mismatch:** Graph reflects current disk state, diff reflects historical changes. Rare false-negative vector eliminated by Phase 3 coverage data.
 - **Nested tsconfigs:** Only root-level config filenames trigger full rerun.
+- **Monorepo root mismatch:** Plugin uses `vitest.config.root` for graph building and `git rev-parse --show-toplevel` for changed files. In monorepos where vitest root is a subdirectory of the git root, the `startsWith(rootDir)` filter silently drops changed files outside vitest root — causing full-suite run (safe but wasteful). Document: plugin works best when vitest root equals git root.
+- **`config.include` absolute paths:** Assigning absolute file paths to `config.include` (typed as glob patterns) works empirically on Vitest 3.2.4 but is undocumented behavior. Add integration test to catch regressions on Vitest upgrades.
+- **`configureVitest` async return:** The hook is typed as `() => void` but Vite's HookHandler supports async. Verify in integration test.
 
 ---
 
@@ -511,16 +586,17 @@ Check file mtime via `lstat`. If mtime changed, reparse. If unchanged, skip.
 
 #### Phase 1 Integration
 
-`buildFullGraph(rootDir)` returns `{ forward, reverse }` without mtimes. `loadOrBuildGraph` wraps this: on cache miss, calls `buildFullGraph`, then stats all files to collect mtimes.
+`buildFullGraph(rootDir)` returns `{ forward, reverse }` without mtimes. `loadOrBuildGraph` wraps this: on cache miss, calls `buildFullGraph`, then stats all files to collect mtimes. The file list comes from `forward.keys()` — every parsed file is a key in the forward map (including leaf files with empty dependency sets).
 
-**Required Phase 1 export:** `parseImports(file, source, rootDir, resolver)` and `createResolver(rootDir)`.
+**Required Phase 1 export:** `resolveFileImports(file, source, rootDir, resolver)` and `createResolver(rootDir)`.
 
 ### Implementation Steps (2a)
 
-1. **Export `parseImports` and `createResolver` from `builder.ts`**
+1. **Export `resolveFileImports` and `createResolver` from `builder.ts`**
 2. **Implement `cache.ts`** — `loadOrBuildGraph`, `updateGraphForFiles`, `saveGraph`. Atomic writes via write-then-rename.
 3. **Update `plugin.ts`** — Replace `buildFullGraph(rootDir)` with `loadOrBuildGraph(rootDir, verbose)`.
 4. **Tests** — Cache round-trip, incremental updates, corrupt cache recovery, mtime invalidation.
+5. **Smart deletion handling** — With a cached graph, deleted files' reverse edges are known. Instead of full-suite fallback (Phase 1 behavior), BFS from the deleted files' former dependents. Only fall back to full suite if the cached graph itself is missing (cold start). Update `plugin.ts` deleted-file branch to use `snapshot.reverse.get(deletedFile)` when cache is available.
 
 ---
 
@@ -573,8 +649,8 @@ async function handleWatcherEvent(
   } else {
     snapshot = await updateGraphForFiles(snapshot, [absPath], [], rootDir, resolver);
     if (kind === 'add') {
-      const newSpecs = await project.globTestSpecifications();
-      testFileSet = new Set(newSpecs.map(s => s.moduleId));
+      const { testFiles: newTestFiles } = await project.globTestFiles();
+      testFileSet = new Set(newTestFiles);
     }
     pendingAffectedFiles.push(absPath);
   }
@@ -612,16 +688,26 @@ async configureVitest({ vitest, project }) {
       return currentAffectedSet.has(spec.moduleId);
     });
 
-    const watcher = vitest.server?.watcher;
-    if (watcher) {
-      for (const event of ['change', 'add', 'unlink'] as const) {
-        watcher.on(event, (filePath: string) => {
-          const absPath = path.resolve(rootDir, filePath);
-          enqueue(() => handleWatcherEvent(event, absPath).then(scheduleFlush));
-        });
-      }
+    // Defer watcher access — vitest.server may not be initialized at configureVitest time.
+    // onAfterSetServer is @internal in Vitest 3.2.4 — runtime check with fallback.
+    if (typeof vitest.onAfterSetServer === 'function') {
+      vitest.onAfterSetServer(() => {
+        const watcher = vitest.server?.watcher;
+        if (watcher) {
+          for (const event of ['change', 'add', 'unlink'] as const) {
+            watcher.on(event, (filePath: string) => {
+              // Chokidar may emit relative or absolute paths depending on config.
+              // path.resolve handles both: absolute paths pass through unchanged.
+              const absPath = path.resolve(rootDir, filePath);
+              enqueue(() => handleWatcherEvent(event, absPath).then(scheduleFlush));
+            });
+          }
+        } else {
+          console.warn('[vitest-affected] No file watcher — watch filtering disabled');
+        }
+      });
     } else {
-      console.warn('[vitest-affected] No file watcher — watch filtering disabled');
+      console.warn('[vitest-affected] onAfterSetServer not available — watch filtering disabled');
     }
   }
 
@@ -645,7 +731,7 @@ async configureVitest({ vitest, project }) {
 
 - **`onFilterWatchedSpecification` AND semantics:** If another plugin registers a filter, results are AND-ed.
 - **`vitest.server?.watcher` availability:** May be undefined in `browser` mode. Watch filtering silently disables.
-- **`vitest.server` at `configureVitest` time:** May not be fully initialized. May need deferred registration.
+- **`vitest.server` at `configureVitest` time:** Not available. Watcher registration deferred to `vitest.onAfterSetServer()` callback.
 - **Async handler / filter timing:** Single-file parse+save is ~5ms (within ~100ms debounce). Stale set reads cause over-runs (safe).
 - **Event coalescing window:** 50ms. If Vitest debounce fires first, full suite runs (safe).
 - **Mtime-only invalidation:** `touch` without edit causes unnecessary reparse (~0.5ms per file).
@@ -853,8 +939,8 @@ const reportsDir = vitest.config.coverage?.reportsDirectory ?? 'coverage';
 const coverageTmpDir = path.resolve(rootDir, reportsDir, '.tmp');
 
 // Build testFileSet from ALL project test files (not just ran-this-run)
-const specs = await project.globTestSpecifications();
-const testFileSet = new Set(specs.map(s => s.moduleId));
+const { testFiles } = await project.globTestFiles();
+const testFileSet = new Set(testFiles);
 
 // Merge cached coverage edges
 const coverageEdges = snapshot.coverageEdges;
@@ -862,18 +948,23 @@ if (coverageEdges) {
   mergeIntoGraph(snapshot.reverse, coverageEdges);
 }
 
-// Register reporter AFTER reporters are initialized
-vitest.onAfterSetServer(() => {
-  vitest.reporters.push({
-    onTestRunEnd(testModules: ReadonlyArray<TestModule>,
-      unhandledErrors: ReadonlyArray<SerializedError>,
-      reason: TestRunEndReason) {
-      const newEdges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
-      mergeIntoGraph(snapshot.reverse, newEdges);
-      saveGraph(snapshot, cacheDir);
-    }
+// Register reporter AFTER reporters are initialized.
+// onAfterSetServer is @internal — runtime check with fallback.
+if (typeof vitest.onAfterSetServer === 'function') {
+  vitest.onAfterSetServer(() => {
+    vitest.reporters.push({
+      onTestRunEnd(testModules: ReadonlyArray<TestModule>,
+        unhandledErrors: ReadonlyArray<SerializedError>,
+        reason: TestRunEndReason) {
+        const newEdges = readCoverageEdges(coverageTmpDir, rootDir, testFileSet);
+        mergeIntoGraph(snapshot.reverse, newEdges);
+        saveGraph(snapshot, cacheDir);
+      }
+    });
   });
-});
+} else {
+  console.warn('[vitest-affected] onAfterSetServer not available — coverage collection disabled');
+}
 ```
 
 ### Auto-Enabling Coverage
@@ -902,7 +993,7 @@ config(config) {
 
 1. **Implement `coverage.ts`** — `readCoverageEdges`, `mergeIntoGraph`, `normalizeUrl`. Sync I/O.
 2. **Update cache format** — Bump version to 2. Add `coverageEdges` + `coverageCollectedAt`. Handle v1→v2 migration.
-3. **Update `plugin.ts`** — Auto-enable coverage in Vite `config` hook. Register reporter via `onAfterSetServer`. Build `testFileSet` from `globTestSpecifications()`. Merge cached edges.
+3. **Update `plugin.ts`** — Auto-enable coverage in Vite `config` hook. Register reporter via `onAfterSetServer`. Build `testFileSet` from `project.globTestFiles()`. Merge cached edges.
 4. **Tests** — Coverage file parsing, URL normalization, edge extraction, merge correctness, v1→v2 migration.
 
 ---
@@ -917,6 +1008,7 @@ config(config) {
 - **`transformMode` assumption:** SSR + web modes treated uniformly (union). May over-select.
 - **Per-worker union with `isolate: false`:** Over-selects but never under-selects.
 - **Auto-enable lifecycle:** If Vitest changes when coverage config is consumed, auto-enable may break. Users can always set `coverage.enabled: true` explicitly.
+- **`onAfterSetServer` is undocumented:** Exists in Vitest 3.2.4 runtime but absent from type definitions. Not a public API — may break on minor releases. Fallback: if unavailable, use `setTimeout(0)` to defer reporter push, or skip coverage collection with a warning. This is also why peer dep is `>=3.2.0`.
 - **Shard mode:** `vitest --shard=N/M` changes tmp dir to `.tmp-N-M`. Read `vitest.config.shard` at impl time.
 - **Version downgrade:** Phase 2 code reading v2 cache triggers full rebuild (safe).
 - **`TestModule.moduleId`:** May be virtual — silently excluded from coverage (safe).
@@ -939,7 +1031,7 @@ Coverage adds edges static missed. Static keeps edges coverage missed. Result: m
 | Phase 1 produces | Phase 2 consumes |
 |---|---|
 | `buildFullGraph(rootDir)` → `{ forward, reverse }` | `loadOrBuildGraph` wraps this, adds mtime layer |
-| `parseImports(file, source, rootDir, resolver)` | `updateGraphForFiles` calls this for incremental updates |
+| `resolveFileImports(file, source, rootDir, resolver)` | `updateGraphForFiles` calls this for incremental updates |
 | `createResolver(rootDir)` | Shared resolver instance across graph ops |
 | `bfsAffectedTests(changed, reverse, isTestFile)` | Reused in watch mode flush |
 
@@ -948,4 +1040,36 @@ Coverage adds edges static missed. Static keeps edges coverage missed. Result: m
 | `GraphSnapshot` with `forward`, `reverse`, `fileMtimes`, `builtAt` | Extended with `coverageEdges?`, `coverageCollectedAt?` |
 | `loadOrBuildGraph` / `saveGraph` | Handles v1→v2 migration, serializes coverage edges |
 | `cache.ts` disk format (version 1) | Bumped to version 2 with coverage fields |
-| `project.globTestSpecifications()` → `testFileSet` | Reused for coverage test-vs-source classification |
+| `project.globTestFiles()` → `testFileSet` | Reused for coverage test-vs-source classification |
+
+---
+
+## Refinement Log
+
+### Round 1 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 11 applied (2 Critical, 6 High, 3 Medium)
+- **Key fixes:** Added "Why Not --changed?" section clarifying speed (not accuracy) as primary value prop. Made Step 0 an explicit ordered sequence with build gate. Changed threshold default from 0.5 to 1.0 (disabled). Added CI cache documentation. Fixed Phase 2b watcher to use onAfterSetServer. Added monorepo root, config.include, and async hook limitations. Added smart deletion handling for Phase 2a cached graph. Bumped peer dep to >=3.2.0. Added onAfterSetServer API stability warning.
+- **Consensus:** 3/6 agents flagged Step 0 ordering + config.include abs paths + peer dep version. 2/6 on deleted-file conservatism + threshold + watcher timing + monorepo root. Devil's Advocate CRITICAL on value prop mischaracterization — verified against Vitest source.
+- **Trajectory:** Critical/High found → continue to Round 2
+
+### Round 2 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 8 applied (2 Critical, 6 High)
+- **Key fixes:** Replaced complex forceRerunTriggers logic with direct use of vitest.config.forceRerunTriggers + absolute path matching. Changed config.include mutation to project.config not vitest.config. Added exec helper spec for git.ts. Renamed parseImports → resolveFileImports to clarify it does both parse and resolve. Added npm install step in Step 0. Added runtime typeof check for onAfterSetServer in both Phase 2b and Phase 3. Added benchmark note for speed claim. Added globTestSpecifications API verification note.
+- **Consensus:** 3/6 agents flagged forceRerunTriggers path semantics. 3/6 on config.include mutation target. 2/6 on Step 0 build script gap. Devil's Advocate CRITICAL on speed claim needing benchmarks. Implementer CRITICAL on globTestSpecifications availability.
+- **Trajectory:** Critical/High found → continue to Round 3
+
+### Round 3 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 7 applied (3 Critical, 4 High) + 5 cascading fixes (globTestFiles references)
+- **Key fixes:** Replaced `project.globTestSpecifications()` with `project.globTestFiles()` (confirmed: globTestSpecifications is on Vitest, not TestProject). Fixed zero-tests branch to use `project.config.include` (was `vitest.config.include`). Reverted forceRerunTriggers to basename check + setupFiles (glob patterns designed for watch mode don't match absolute paths in one-shot). Removed SOURCE_EXT filter on deleted files (any deletion → full suite, catches .json/.css). Fixed resolveFileImports name in Phase 2a. Added .gitignore to Step 0. Added stderr capture to exec helper.
+- **Consensus:** 5/6 agents flagged zero-tests config mutation. 5/6 on forceRerunTriggers glob issues. 3/6 on globTestSpecifications. 2/6 on deleted non-source files.
+- **Trajectory:** Critical/High found but all are verified fixes of prior-round regressions. Round 4 needed for verification.
+
+### Round 4 (Heavy: Architect/Adversary/Devil's Advocate/Implementer/Spec Auditor/Simplifier)
+
+- **Changes:** 4 applied (1 Critical, 3 High)
+- **Key fixes:** Replaced `project.globTestFiles()` with direct `tinyglobby` glob to avoid populating Vitest's internal cache before `config.include` mutation. Changed `setupFiles` to read from `project.config` not `vitest.config`. Corrected comment about setupFiles in forceRerunTriggers. Removed `picomatch` from Phase 1 deps (deferred to Phase 2).
+- **Consensus:** 2/6 on globTestFiles caching (CRITICAL). 2/6 on setupFiles source. 3/6 agents (Implementer, Spec Auditor, Simplifier) declared plan ready to implement with only Medium issues remaining.
+- **Trajectory:** 1 Critical found (globTestFiles caching) but it's a clean, verified fix. 3/6 agents say ready. → finalize
