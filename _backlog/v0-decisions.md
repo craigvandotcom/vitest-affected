@@ -1,4 +1,4 @@
-# vitest-smart: Technical Decisions
+# vitest-affected: Technical Decisions
 
 Every decision scored on **Confidence** (how sure we are this is right) and **Impact** (how much it matters if we get it wrong). Scale: 1-5.
 
@@ -175,7 +175,7 @@ The base branch (`main`) is configurable. `--merge-base` is cleaner than the con
 | Approach | Can filter tests? | IDE compatible? | Complexity |
 |---|---|---|---|
 | **Vitest Plugin** (`configureVitest`) | **Yes** — mutate `config.include` | Native | Low |
-| Wrapper CLI (`vitest-smart` bin) | Yes — full control | Needs config | Medium |
+| Wrapper CLI (`vitest-affected` bin) | Yes — full control | Needs config | Medium |
 | Hybrid: CLI + Reporter plugin | Yes + data collection | Needs config | Medium-High |
 
 ### Decision: ~~Wrapper CLI~~ → **Vitest Plugin** (REVISED 2026-02-21)
@@ -200,9 +200,9 @@ The base branch (`main`) is configurable. `--merge-base` is cleaner than the con
 /// <reference types="vitest/config" />
 import type { Plugin } from 'vite'
 
-export function vitestSmart(options = {}): Plugin {
+export function vitestAffected(options = {}): Plugin {
   return {
-    name: 'vitest:smart',
+    name: 'vitest:affected',
     async configureVitest({ vitest }) {
       if (options.disabled) return
 
@@ -259,18 +259,18 @@ Start with tsup for reliability. Switch to tsdown when it hits 1.0.
 
 | Name | Available on npm | Clarity | Searchability |
 |---|---|---|---|
-| **vitest-smart** | Yes | Good — implies intelligence | High |
+| **vitest-affected** | Yes | Good — implies intelligence | High |
 | vitest-affected | Yes | Good — describes functionality | High |
 | vitest-tia | Yes | Niche — "TIA" not widely known | Low |
 
-### Decision: `vitest-smart`
+### Decision: `vitest-affected`
 
 **Confidence: 4/5 | Impact: 2/5**
 
 - Memorable and marketable
 - Implies intelligence without being jargony
 - Follows community convention (`vitest-{descriptor}`)
-- Works as both a brand and a CLI command: `npx vitest-smart`
+- Works as both a brand and a CLI command: `npx vitest-affected`
 - `vitest-affected` is a close second but sounds more like a flag than a product
 
 ---
@@ -337,7 +337,7 @@ oxc-parser returns dynamic imports via `result.module.dynamicImports`. We should
 | 5 | Git Diff Strategy | merge-base + untracked (two-mode) | 4/5 | 3/5 |
 | 6 | Integration | Vitest Plugin via configureVitest (REVISED — empirically verified) | 5/5 | 5/5 |
 | 7 | Build Tool | tsup (migrate to tsdown later) | 3/5 | 1/5 |
-| 8 | Package Name | vitest-smart | 4/5 | 2/5 |
+| 8 | Package Name | vitest-affected | 4/5 | 2/5 |
 | 9 | CJS Support | ESM-only | 4/5 | 2/5 |
 | 10 | Test Detection | Vitest's matchesTestGlob API | 5/5 | 3/5 |
 | 11 | Monorepo | Single-project first | 4/5 | 2/5 |
@@ -379,7 +379,7 @@ Total install footprint: ~4 MB (oxc-parser ~2MB + oxc-resolver ~2MB + xxhash-was
 | Codecov ATS | Coverage-based | Partial | No (Python only) | Yes |
 | Nx affected | Dependency graph | Yes | Partial | No (package-level) |
 | Bun test | None | Yes | No | No |
-| **vitest-smart** | **Import graph + cache** | **Yes** | **Yes** | **Yes** |
+| **vitest-affected** | **Import graph + cache** | **Yes** | **Yes** | **Yes** |
 
 **We are the only open-source, file-level, Vitest-native test impact analysis tool.**
 
@@ -388,7 +388,7 @@ Total install footprint: ~4 MB (oxc-parser ~2MB + oxc-resolver ~2MB + xxhash-was
 ## Revised Architecture
 
 ```
-vitest-smart/
+vitest-affected/
 ├── src/
 │   ├── plugin.ts            # Vitest configureVitest hook (entry point)
 │   ├── index.ts             # Public API exports
@@ -448,7 +448,7 @@ Every commercial player validates the market. None serve the open-source, standa
 
 - **Meta:** Predictive test selection catches >95% of failures running only 1/3 of tests. [Paper](https://arxiv.org/abs/1810.05286)
 - **Google TAP:** Tests that fail are "closer" to the code they test — proximity in the dependency graph is the strongest signal. [Paper](https://research.google.com/pubs/archive/45861.pdf)
-- **Martin Fowler:** Recommends storing test-to-file mappings as **text files in the same repo** — not in a database. This is exactly our JSON-in-.vitest-smart approach. [Article](https://martinfowler.com/articles/rise-test-impact-analysis.html)
+- **Martin Fowler:** Recommends storing test-to-file mappings as **text files in the same repo** — not in a database. This is exactly our JSON-in-.vitest-affected approach. [Article](https://martinfowler.com/articles/rise-test-impact-analysis.html)
 - **Symflower (2024):** Even basic TIA yields a **29% average reduction** in test execution time.
 - **Datadog (Ruby):** Per-test coverage collection with 25% median overhead, fully deterministic. [Blog](https://www.datadoghq.com/blog/engineering/ruby-test-impact-analysis/)
 - **Spotify:** ML-based TIA reduced test time by **67%** while maintaining 99.2% bug detection.
@@ -464,4 +464,4 @@ Our advantage: We start with **static import graph analysis** (cheap, fast, no o
 
 ### Future expansion: Bun test support
 
-Bun has zero test selection features and active demand for it. A future phase could add a Bun adapter alongside the Vitest adapter, making vitest-smart the universal TIA tool for the JS/TS ecosystem.
+Bun has zero test selection features and active demand for it. A future phase could add a Bun adapter alongside the Vitest adapter, making vitest-affected the universal TIA tool for the JS/TS ecosystem.

@@ -1,4 +1,4 @@
-# vitest-smart: Intelligent Test Selection for Vitest
+# vitest-affected: Intelligent Test Selection for Vitest
 
 ## Vision
 
@@ -66,10 +66,10 @@ Jest's `resolveInverseModuleMap` scans the *entire* haste-map filesystem at ever
 ## Technical Architecture
 
 ```
-vitest-smart/
+vitest-affected/
 ├── src/
 │   ├── plugin.ts            # Vitest configureVitest hook (entry point)
-│   ├── index.ts             # Public API: exports only vitestSmart()
+│   ├── index.ts             # Public API: exports only vitestAffected()
 │   ├── graph/
 │   │   └── builder.ts       # oxc-parser + oxc-resolver → forward + reverse graph
 │   ├── git.ts               # Git diff integration (3 commands)
@@ -86,7 +86,7 @@ vitest-smart/
 └── vitest.config.ts
 ```
 
-> **EMPIRICALLY VERIFIED (2026-02-21):** Mutating `vitest.config.include` inside the `configureVitest` hook DOES filter which test files run. Tested with absolute paths, glob patterns, and empty arrays on Vitest 3.2.4. This means vitest-smart is a **standard Vitest plugin** — no CLI wrapper needed. Users just add it to `vitest.config.ts` and run `npx vitest` as normal. IDE integrations, CI scripts, and the entire Vitest ecosystem work unchanged.
+> **EMPIRICALLY VERIFIED (2026-02-21):** Mutating `vitest.config.include` inside the `configureVitest` hook DOES filter which test files run. Tested with absolute paths, glob patterns, and empty arrays on Vitest 3.2.4. This means vitest-affected is a **standard Vitest plugin** — no CLI wrapper needed. Users just add it to `vitest.config.ts` and run `npx vitest` as normal. IDE integrations, CI scripts, and the entire Vitest ecosystem work unchanged.
 
 ### Core Dependencies
 
@@ -208,7 +208,7 @@ return result.path;              // Absolute resolved path
 /// <reference types="vitest/config" />
 import type { Plugin } from 'vite';
 
-export interface VitestSmartOptions {
+export interface VitestAffectedOptions {
   disabled?: boolean;
   ref?: string;  // git ref to diff against (default: none = staged/unstaged/untracked only)
   verbose?: boolean;  // log graph build time, changed files, and affected tests
@@ -222,29 +222,29 @@ const FORCE_RERUN_FILES = [
   'tsconfig.json', 'package.json',
 ];
 
-export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
+export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   return {
-    name: 'vitest:smart',
+    name: 'vitest:affected',
 
     async configureVitest({ vitest, project }) {
       if (options.disabled) return;
 
       // Guard: watch mode not supported in v0 (selection is computed once, becomes stale)
       if (vitest.config.watch) {
-        console.warn('[vitest-smart] Watch mode not supported in v0 — running full suite');
+        console.warn('[vitest-affected] Watch mode not supported in v0 — running full suite');
         return;
       }
 
       // Guard: workspace mode not supported in v0
       if (vitest.projects && vitest.projects.length > 1) {
-        console.warn('[vitest-smart] Vitest workspaces not yet supported — running full suite');
+        console.warn('[vitest-affected] Vitest workspaces not yet supported — running full suite');
         return;
       }
 
       try {
         // Runtime guard: detect Vitest API shape changes across major versions
         if (!vitest.config || !Array.isArray(vitest.config.include) || typeof vitest.config.root !== 'string') {
-          console.warn('[vitest-smart] Unexpected Vitest config shape — running full suite');
+          console.warn('[vitest-affected] Unexpected Vitest config shape — running full suite');
           return;
         }
 
@@ -255,13 +255,13 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
         const verbose = options.verbose ?? false;
         const t0 = performance.now();
         const { forward, reverse } = await buildFullGraph(rootDir);
-        if (verbose) console.log(`[vitest-smart] Graph: ${forward.size} files in ${(performance.now() - t0).toFixed(1)}ms`);
+        if (verbose) console.log(`[vitest-affected] Graph: ${forward.size} files in ${(performance.now() - t0).toFixed(1)}ms`);
 
         const { changed, deleted } = await getChangedFiles(rootDir, options.ref);
 
         // If nothing changed, do not filter (normal Vitest behavior = run full suite)
         if (changed.length === 0 && deleted.length === 0) {
-          if (verbose) console.log('[vitest-smart] No git changes detected — running full suite');
+          if (verbose) console.log('[vitest-affected] No git changes detected — running full suite');
           return;
         }
 
@@ -273,8 +273,8 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
         const SOURCE_EXT = /\.(ts|tsx|js|jsx|mts|mjs|cts|cjs)$/;
         const deletedSourceFiles = deleted.filter(f => SOURCE_EXT.test(f));
         if (deletedSourceFiles.length > 0) {
-          if (verbose) console.warn(`[vitest-smart] ${deletedSourceFiles.length} source file(s) deleted — running full suite`);
-          else console.warn('[vitest-smart] Deleted source file(s) detected — running full suite');
+          if (verbose) console.warn(`[vitest-affected] ${deletedSourceFiles.length} source file(s) deleted — running full suite`);
+          else console.warn('[vitest-affected] Deleted source file(s) detected — running full suite');
           return;
         }
 
@@ -299,7 +299,7 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
           );
         });
         if (hasForceRerun) {
-          console.log('[vitest-smart] Config file changed — running full suite');
+          console.log('[vitest-affected] Config file changed — running full suite');
           return;
         }
 
@@ -317,7 +317,7 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
         // Use testFileSet.size from Vitest's spec discovery (single source of truth)
         const ratio = testFileSet.size > 0 ? affectedTests.length / testFileSet.size : 0;
         if (ratio > (options.threshold ?? 0.5)) {
-          if (verbose) console.log(`[vitest-smart] ${(ratio * 100).toFixed(0)}% of tests affected — running full suite`);
+          if (verbose) console.log(`[vitest-affected] ${(ratio * 100).toFixed(0)}% of tests affected — running full suite`);
           return;
         }
 
@@ -325,7 +325,7 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
         if (verbose) {
           for (const f of changed) {
             if (!forward.has(f) && SOURCE_EXT.test(f)) {
-              console.warn(`[vitest-smart] Changed file not in graph (outside rootDir?): ${path.relative(rootDir, f)}`);
+              console.warn(`[vitest-affected] Changed file not in graph (outside rootDir?): ${path.relative(rootDir, f)}`);
             }
           }
         }
@@ -334,21 +334,21 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
         const { existsSync } = await import('node:fs');
         const validTests = affectedTests.filter(t => {
           if (existsSync(t)) return true;
-          console.warn(`[vitest-smart] Affected test no longer on disk: ${path.relative(rootDir, t)}`);
+          console.warn(`[vitest-affected] Affected test no longer on disk: ${path.relative(rootDir, t)}`);
           return false;
         });
 
         if (validTests.length > 0) {
           vitest.config.include = validTests;
-          console.log(`[vitest-smart] ${validTests.length} affected tests`);
+          console.log(`[vitest-affected] ${validTests.length} affected tests`);
           if (verbose) validTests.forEach(t => console.log(`  → ${path.relative(rootDir, t)}`));
         } else {
-          console.log('[vitest-smart] No affected tests — skipping all tests');
+          console.log('[vitest-affected] No affected tests — skipping all tests');
           vitest.config.include = [];
         }
       } catch (err) {
         // GRACEFUL FALLBACK: if anything fails, run all tests
-        console.warn('[vitest-smart] Error — running full suite:', err);
+        console.warn('[vitest-affected] Error — running full suite:', err);
       }
     }
   };
@@ -361,10 +361,10 @@ export function vitestSmart(options: VitestSmartOptions = {}): Plugin {
 ```typescript
 // vitest.config.ts — this is ALL the user needs to add
 import { defineConfig } from 'vitest/config'
-import { vitestSmart } from 'vitest-smart'
+import { vitestAffected } from 'vitest-affected'
 
 export default defineConfig({
-  plugins: [vitestSmart()],
+  plugins: [vitestAffected()],
 })
 ```
 
@@ -392,7 +392,7 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
     const { stdout: isShallow } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
     if (isShallow.trim() === 'true') {
       throw new Error(
-        '[vitest-smart] Shallow git clone detected. Smart selection requires commit history.\n' +
+        '[vitest-affected] Shallow git clone detected. Smart selection requires commit history.\n' +
         'Fix: Set fetch-depth: 0 (or >=50) in your CI checkout step:\n' +
         '  - uses: actions/checkout@v4\n' +
         '    with:\n' +
@@ -438,13 +438,13 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
 - **CI shallow clones:** `git diff --merge-base` requires commit history. GitHub Actions defaults to `fetch-depth: 1` which will fail. Document this requirement:
 
 ```yaml
-# GitHub Actions — required for vitest-smart in CI
+# GitHub Actions — required for vitest-affected in CI
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0  # Full history needed for merge-base diff
 ```
 
-If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually sufficient. vitest-smart should detect shallow clones and warn with a helpful message.
+If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually sufficient. vitest-affected should detect shallow clones and warn with a helpful message.
 
 ---
 
@@ -462,13 +462,13 @@ If `fetch-depth: 0` is too slow for large repos, `fetch-depth: 50` is usually su
    - **Delete:** `src/graph/inverter.ts` (inlined into builder.ts)
    - **Rewrite:** `src/graph/builder.ts` → export `buildFullGraph(rootDir)` returning `{ forward, reverse }` (see Step 2 for full spec). Delete `DependencyGraph` interface.
    - **Rewrite:** `src/selector.ts` → pure `bfsAffectedTests` function (remove `SelectionResult`, `getAffectedTests`)
-   - **Rewrite:** `src/index.ts` → single export `vitestSmart` (do this EARLY — current exports reference symbols that will be renamed/deleted in later steps, causing build failures if deferred)
+   - **Rewrite:** `src/index.ts` → single export `vitestAffected` (do this EARLY — current exports reference symbols that will be renamed/deleted in later steps, causing build failures if deferred)
    - **Rewrite:** `src/plugin.ts` → remove `verify` option and `onFilterWatchedSpecification` references; orchestration (build → BFS) lives here. Destructure `{ vitest, project }` (not just `vitest`) — `project.globTestSpecifications()` is needed.
    - **Rewrite:** `src/git.ts` → return `{ changed: string[]; deleted: string[] }` (not flat `string[]`). Stub comments say `ACMR` — plan requires `ACMRD` (includes deletions). Follow the pseudocode, not stub comments.
    - **Update:** `package.json` → peer dep `>=3.1.0`, remove `xxhash-wasm`, add `picomatch` to deps, add `tsup` to devDeps, update build script to `tsup`
    - **Create:** root `vitest.config.ts` and `tsup.config.ts` — tsup config: `{ entry: ['src/index.ts'], format: ['esm', 'cjs'], dts: true, clean: true }`
 1. **Fixture tests** — Create small projects with known dependency structures FIRST. These define the contract. Include: `simple/` (linear A→B→C), `diamond/` (A→B→C, A→D→C), `circular/` (A→B→A). Write failing tests that assert expected graph shapes and affected test sets.
-2. **`graph/builder.ts`** — Exports `buildFullGraph(rootDir)` returning `{ forward: Map<string, Set<string>>, reverse: Map<string, Set<string>> }`. The `invertGraph` function is internal to this file (inlined from the former `inverter.ts`). Glob all code files (including test files) using `**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` (exclude `node_modules/`, `dist/`, `.vitest-smart/`, `test/fixtures/`, `coverage/`, `.next/`). The glob MUST return absolute paths (`tinyglobby` with `absolute: true`). Parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`. When a parsed file imports a non-source file (e.g., `import data from './data.json'`), the resolved path is added as a forward-graph key with an empty dependency set — this ensures the inverter creates a reverse edge so BFS can trace dependents of that `.json`/`.css` file. **Skip `node_modules` paths** returned by the resolver — only include files under `rootDir`. Use `tinyglobby` for globbing. **Parse error handling:** If `oxc-parser` returns errors for a file, log a warning and add the file to the graph with an empty dependency set (graceful degradation). Do not crash the graph build for a single malformed file. **tsconfig discovery:** Search for `tsconfig.json` starting from `rootDir`. If not found, create the resolver without tsconfig config (path aliases will fail, but basic resolution works). Log a warning if tsconfig is missing.
+2. **`graph/builder.ts`** — Exports `buildFullGraph(rootDir)` returning `{ forward: Map<string, Set<string>>, reverse: Map<string, Set<string>> }`. The `invertGraph` function is internal to this file (inlined from the former `inverter.ts`). Glob all code files (including test files) using `**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` (exclude `node_modules/`, `dist/`, `.vitest-affected/`, `test/fixtures/`, `coverage/`, `.next/`). The glob MUST return absolute paths (`tinyglobby` with `absolute: true`). Parse each with `oxc-parser`, resolve specifiers with `oxc-resolver`, build forward graph `Map<string, Set<string>>`. When a parsed file imports a non-source file (e.g., `import data from './data.json'`), the resolved path is added as a forward-graph key with an empty dependency set — this ensures the inverter creates a reverse edge so BFS can trace dependents of that `.json`/`.css` file. **Skip `node_modules` paths** returned by the resolver — only include files under `rootDir`. Use `tinyglobby` for globbing. **Parse error handling:** If `oxc-parser` returns errors for a file, log a warning and add the file to the graph with an empty dependency set (graceful degradation). Do not crash the graph build for a single malformed file. **tsconfig discovery:** Search for `tsconfig.json` starting from `rootDir`. If not found, create the resolver without tsconfig config (path aliases will fail, but basic resolution works). Log a warning if tsconfig is missing.
 3. **Orchestration lives in `plugin.ts`** — Build graph (which includes inversion) → BFS is 2 lines of glue, inlined in the plugin's `configureVitest` hook. No separate orchestrator file in v0. Extract to `graph/loader.ts` when Phase 2 caching materializes.
 4. **`git.ts`** — Get changed files from git (3 commands: committed, staged, unstaged). Filter deleted files by existence check (see pseudocode above).
 5. **`selector.ts`** — Pure BFS function with no IO or orchestration:
@@ -505,9 +505,9 @@ export function bfsAffectedTests(
 ```
 
 6. **`plugin.ts`** — Wire everything together in `configureVitest` hook. One-shot mode only in v0: mutate `config.include` with affected test paths. Includes workspace guard and force-rerun check for config files. Graceful fallback: on error, don't modify config (runs full suite).
-7. **`index.ts`** — Export only the plugin function: `export { vitestSmart } from './plugin'`. Internal functions stay unexported — no public API surface to maintain until there are real consumers.
+7. **`index.ts`** — Export only the plugin function: `export { vitestAffected } from './plugin'`. Internal functions stay unexported — no public API surface to maintain until there are real consumers.
 
-**Safety invariant:** vitest-smart must NEVER silently skip tests. If any component fails (graph build, git diff, BFS), the fallback is to run the full test suite and log a warning. False positives (running too many tests) are acceptable; false negatives (missing failures) are not.
+**Safety invariant:** vitest-affected must NEVER silently skip tests. If any component fails (graph build, git diff, BFS), the fallback is to run the full test suite and log a warning. False positives (running too many tests) are acceptable; false negatives (missing failures) are not.
 
 **Force rerun triggers:** Changes to `vitest.config.*`, `tsconfig.json`, or `package.json` trigger a full test run regardless of graph analysis. Hardcoded as a const array in `plugin.ts` — no user-facing config option in v0. **Limitation:** Only root-level config filenames are matched. Nested tsconfigs (e.g., `src/tsconfig.app.json` via project references) do not trigger a full rerun — add `**/tsconfig*.json` patterns in Phase 2 when glob-based trigger matching is more robust.
 
@@ -531,7 +531,7 @@ export function bfsAffectedTests(
 
 - **Watch mode:** Hook into Vite's file watcher events, incrementally update the graph for changed files, recompute affected tests per trigger via `onFilterWatchedSpecification`
 - **`verify` mode:** Run affected tests first, then full suite, compare results to measure real accuracy. Requires post-run reporter hook to capture per-run results.
-- **Graph caching:** Persist graph to `.vitest-smart/graph.json` with mtime+hash hybrid invalidation (Decision 4). Only add caching if profiling shows startup latency matters on 2000+ file projects.
+- **Graph caching:** Persist graph to `.vitest-affected/graph.json` with mtime+hash hybrid invalidation (Decision 4). Only add caching if profiling shows startup latency matters on 2000+ file projects.
 - **Rename detection:** `git diff --name-status -M` to identify renames and avoid unnecessary full-suite fallbacks (v0 treats renames as delete+add, triggering conservative full suite)
 - **`xxhash-wasm`** dependency added here (not in v0) for fast content hashing
 
@@ -637,16 +637,16 @@ interface VitestPluginContext {
 
 ### Local Development Against Body Compass
 ```bash
-# In vitest-smart/
+# In vitest-affected/
 npm link
 
 # In body-compass-app/
-npm link vitest-smart
+npm link vitest-affected
 ```
 
 Or in body-compass-app's `package.json`:
 ```json
-"vitest-smart": "file:../vitest-smart"
+"vitest-affected": "file:../vitest-affected"
 ```
 
 Live-reload during development. Edit plugin, run tests in body-compass-app, see results.
@@ -659,7 +659,7 @@ Live-reload during development. Edit plugin, run tests in body-compass-app, see 
 
 ### CI Strategy
 - v0: graph rebuilds on every run (~166ms, negligible vs test execution time)
-- Phase 2: cached graph in `.vitest-smart/` (gitignored), cache key based on file content hashes
+- Phase 2: cached graph in `.vitest-affected/` (gitignored), cache key based on file content hashes
 - Requires `fetch-depth: 0` (or ≥50) in GitHub Actions for merge-base diff
 
 ---
@@ -691,7 +691,7 @@ Remove `es-module-lexer` — replaced by `oxc-parser`.
 
 Add new source file: `src/git.ts` (git diff with deleted file detection).
 
-**npm name:** `vitest-smart` (unclaimed, verified)
+**npm name:** `vitest-affected` (unclaimed, verified)
 
 ---
 

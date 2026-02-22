@@ -1,4 +1,4 @@
 node_modules/
 dist/
-.vitest-smart/
+.vitest-affected/
 *.tsbuildinfo

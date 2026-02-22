@@ -1,5 +1,5 @@
 // TODO: Phase 1 implementation
-// - Persist dependency graph to .vitest-smart/graph.json
+// - Persist dependency graph to .vitest-affected/graph.json
 // - Use file content hashes for incremental invalidation
 // - Only re-parse files whose hash changed since last build
 

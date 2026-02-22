@@ -1,5 +1,5 @@
 {
-  "name": "vitest-smart",
+  "name": "vitest-affected",
   "version": "0.1.0",
   "description": "Intelligent test selection for Vitest — run only the tests affected by your changes",
   "type": "module",

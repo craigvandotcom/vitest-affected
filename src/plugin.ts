@@ -17,7 +17,7 @@
 /// <reference types="vitest/config" />
 import type { Plugin } from "vite";
 
-export interface VitestSmartOptions {
+export interface VitestAffectedOptions {
   /** Disable smart filtering (run all tests) */
   disabled?: boolean;
   /** Git ref to diff against (default: auto-detect) */
@@ -26,9 +26,9 @@ export interface VitestSmartOptions {
   verify?: boolean;
 }
 
-export function vitestSmart(_options: VitestSmartOptions = {}): Plugin {
+export function vitestAffected(_options: VitestAffectedOptions = {}): Plugin {
   return {
-    name: "vitest:smart",
+    name: "vitest:affected",
 
     // configureVitest runs during _setServer(), before start()
     // Mutating vitest.config.include here DOES affect globTestSpecifications()
@@ -51,7 +51,7 @@ export function vitestSmart(_options: VitestSmartOptions = {}): Plugin {
       //   );
       // } catch (err) {
       //   // Graceful fallback — don't modify config, runs full suite
-      //   console.warn('[vitest-smart] Error — running full suite:', err);
+      //   console.warn('[vitest-affected] Error — running full suite:', err);
       // }
     },
   };

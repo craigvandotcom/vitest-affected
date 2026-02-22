@@ -4,7 +4,7 @@ import path from 'node:path'
 
 /**
  * Experiment 3: Set include to an array of absolute paths.
- * This is exactly what vitest-smart would do:
+ * This is exactly what vitest-affected would do:
  * - BFS finds affected test files as absolute paths
  * - Plugin sets config.include = [...affectedTestPaths]
  *
@@ -20,7 +20,7 @@ export function filterPluginMulti(): Plugin {
       console.log('\n=== FILTER PLUGIN MULTI ===')
       console.log('Setting config.include to single absolute path array')
 
-      // This is the exact pattern vitest-smart would use
+      // This is the exact pattern vitest-affected would use
       vitest.config.include = [alphaPath]
 
       console.log('config.include =', JSON.stringify(vitest.config.include))
