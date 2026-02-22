@@ -26,6 +26,8 @@ The primary value proposition is **speed**: a cached static graph resolves affec
 
 vitest-affected must NEVER silently skip tests. If any component fails (graph build, git diff, BFS), the fallback is to run the full test suite and log a warning. False positives (running too many tests) are acceptable; false negatives (missing failures) are not.
 
+**Path correctness:** All file paths used as graph keys or for set membership must be absolute and consistently normalized. Paths come from 4 sources (tinyglobby globs, git diff output, oxc-resolver results, Vitest module IDs) and can differ in case, separators (`\` vs `/`), or symlink resolution. Use `path.resolve()` everywhere; on case-insensitive filesystems, consider `fs.realpathSync()` for cache keys. If normalization fails for any path, fall back to full suite.
+
 ---
 
 ## Architecture Overview
@@ -120,14 +122,16 @@ Without cache restoration, Phase 1 still provides full benefit (graph build is f
 
 ### Options Interface
 
-Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true). Phase 3 adds `coverage?: boolean` (default: true). See each phase for details.
+Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true). Phase 3 adds `coverage?: boolean | 'autoEnable'` (default: true = read-only, 'autoEnable' = force-enable). See each phase for details.
 
 ```typescript
 export interface VitestAffectedOptions {
   disabled?: boolean;      // Skip plugin entirely
   ref?: string;            // Git ref to diff against (e.g., 'main', 'HEAD~3')
+  changedFiles?: string[]; // Bypass git diff — provide changed files directly (absolute or relative to rootDir)
   verbose?: boolean;       // Log graph build time, changed files, affected tests
   threshold?: number;      // Run full suite if affected ratio > threshold (0-1, default 1.0 = disabled)
+  allowNoTests?: boolean;  // If true, allow selecting 0 tests (default: false — runs full suite instead)
 }
 ```
 
@@ -178,6 +182,12 @@ Fixtures:
 - `circular/` — A→B→A (circular import handling)
 
 Write failing tests that assert expected graph shapes and affected test sets.
+
+**Integration tests (in addition to unit tests):** Add a minimal set of tests that spawn `vitest run` against fixtures via `execa` and assert:
+- The plugin actually filters which tests execute (parse `--reporter=json` output)
+- `config.include` mutation with absolute paths works (catches Vitest version regressions)
+- `configureVitest` async completion is honored
+- Run on linux + windows in CI to validate path normalization
 
 ### Step 2: `graph/builder.ts`
 
@@ -259,8 +269,10 @@ import type { Plugin } from 'vite';
 // designed for watch mode (e.g., **/package.json/**) which may not match one-shot paths.
 // setupFiles are handled separately by Vitest in watch mode, so we check them explicitly.
 const CONFIG_BASENAMES = new Set([
-  'package.json', 'tsconfig.json',
+  'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb',
+  'tsconfig.json',
   'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
+  'vitest.workspace.ts', 'vitest.workspace.js',
   'vite.config.ts', 'vite.config.js', 'vite.config.mts',
 ]);
 
@@ -272,6 +284,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
     // supports async hooks via callHookWithContext. Verify this works in the
     // integration test — if not, wrap body in a .then() chain or use top-level await.
     async configureVitest({ vitest, project }) {
+      // Environment variable override for CI flexibility
+      if (process.env.VITEST_AFFECTED_DISABLED === '1') {
+        options = { ...options, disabled: true };
+      }
       if (options.disabled) return;
 
       // Guard: watch mode not supported in Phase 1
@@ -299,7 +315,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const { forward, reverse } = await buildFullGraph(rootDir);
         if (verbose) console.log(`[vitest-affected] Graph: ${forward.size} files in ${(performance.now() - t0).toFixed(1)}ms`);
 
-        const { changed, deleted } = await getChangedFiles(rootDir, options.ref);
+        let changed: string[], deleted: string[];
+        if (options.changedFiles) {
+          // Bypass git — use provided file list (useful for non-git CI or testing)
+          const resolved = options.changedFiles.map(f => path.resolve(rootDir, f));
+          changed = resolved.filter(f => existsSync(f));
+          deleted = resolved.filter(f => !existsSync(f));
+        } else {
+          ({ changed, deleted } = await getChangedFiles(rootDir, options.ref));
+        }
 
         if (changed.length === 0 && deleted.length === 0) {
           if (verbose) console.log('[vitest-affected] No git changes detected — running full suite');
@@ -310,9 +334,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // so we can't trace their dependents. ANY deleted file triggers full suite —
         // including .json/.css that may have been in the graph as non-source imports.
         // Phase 2 improvement: use cached graph's reverse edges for smart tracing.
-        if (deleted.length > 0) {
-          if (verbose) console.warn(`[vitest-affected] ${deleted.length} file(s) deleted — running full suite`);
-          else console.warn('[vitest-affected] Deleted file(s) detected — running full suite');
+        // Only trigger full suite if deleted files were in the dependency graph.
+        // Files outside the graph (README, .gitkeep, etc.) are safe to ignore.
+        const deletedInGraph = deleted.filter(f => forward.has(f));
+        if (deletedInGraph.length > 0) {
+          if (verbose) console.warn(`[vitest-affected] ${deletedInGraph.length} graph file(s) deleted — running full suite`);
+          else console.warn('[vitest-affected] Deleted file(s) in dependency graph — running full suite');
           return;
         }
 
@@ -378,9 +405,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           project.config.include = validTests;
           console.log(`[vitest-affected] ${validTests.length} affected tests`);
           if (verbose) validTests.forEach(t => console.log(`  → ${path.relative(rootDir, t)}`));
-        } else {
-          console.log('[vitest-affected] No affected tests — skipping all tests');
+        } else if (options.allowNoTests) {
+          console.log('[vitest-affected] No affected tests — skipping all (allowNoTests=true)');
           project.config.include = [];
+          vitest.config.passWithNoTests = true; // Prevent Vitest "No test files found" exit code 1
+        } else {
+          // Safety default: don't skip all tests when graph may be incomplete
+          console.log('[vitest-affected] No affected tests — running full suite (set allowNoTests to skip)');
         }
       } catch (err) {
         console.warn('[vitest-affected] Error — running full suite:', err);
@@ -432,7 +463,7 @@ for (const exp of mod.staticExports) {
 import { ResolverFactory } from 'oxc-resolver';
 
 const resolver = new ResolverFactory({
-  extensions: ['.ts', '.tsx', '.js', '.jsx', '.json'],
+  extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.json'],
   conditionNames: ['node', 'import'],
   tsconfig: { configFile: path.join(projectRoot, 'tsconfig.json'), references: 'auto' },
   builtinModules: true,
@@ -462,6 +493,14 @@ async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise
 }
 
 async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed: string[]; deleted: string[] }> {
+  // Early non-git detection — common in some CI/sandbox setups
+  const { stdout: inWorkTree } = await exec('git', ['rev-parse', '--is-inside-work-tree'], { cwd: rootDir })
+    .catch(() => ({ stdout: 'false' }));
+  if (inWorkTree.trim() !== 'true') {
+    console.warn('[vitest-affected] Not inside a git work tree — running full suite');
+    return { changed: [], deleted: [] };
+  }
+
   if (ref) {
     const { stdout: isShallow } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
     if (isShallow.trim() === 'true') {
@@ -469,8 +508,12 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
     }
   }
 
+  // Resolve git root FIRST for consistent path resolution
+  const { stdout: gitRootRaw } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
+  const gitRoot = gitRootRaw.trim();
+
   const run = async (args: string[]) => {
-    const { stdout } = await exec('git', args, { cwd: rootDir });
+    const { stdout } = await exec('git', args, { cwd: gitRoot });
     return stdout.split('\n').filter(Boolean);
   };
 
@@ -480,9 +523,8 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
     run(['ls-files', '--others', '--modified', '--exclude-standard', '--full-name']),
   ]);
 
-  const { stdout: gitRoot } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
   const allFiles = [...new Set([...committed, ...staged, ...unstaged])]
-    .map(f => path.resolve(gitRoot.trim(), f));
+    .map(f => path.resolve(gitRoot, f));
 
   const { existsSync } = await import('node:fs');
   return {
@@ -545,6 +587,7 @@ Single file handling graph persistence, cache-aware loading, and incremental upd
   "files": {
     "/abs/path/src/utils/food.ts": {
       "mtime": 1708000000000,
+      "size": 1234,
       "imports": ["/abs/path/src/types.ts", "/abs/path/src/constants.ts"]
     }
   }
@@ -580,7 +623,7 @@ function saveGraph(snapshot: GraphSnapshot): Promise<void>;
 
 #### Invalidation: mtime-only
 
-Check file mtime via `lstat`. If mtime changed, reparse. If unchanged, skip.
+Check file mtime via `lstat`. If mtime changed, reparse. If unchanged, skip. Also compare `size` (from `lstat`) to catch edge cases where mtime granularity is coarse on some filesystems.
 
 **Why not content hashing:** Adding xxhash-wasm to catch "touch without edit" — a scenario where the cost of a false reparse is ~0.5ms. Not worth the complexity.
 
@@ -649,8 +692,13 @@ async function handleWatcherEvent(
   } else {
     snapshot = await updateGraphForFiles(snapshot, [absPath], [], rootDir, resolver);
     if (kind === 'add') {
-      const { testFiles: newTestFiles } = await project.globTestFiles();
-      testFileSet = new Set(newTestFiles);
+      // Avoid Vitest internal testFilesList caching — use tinyglobby like Phase 1
+      const testFiles = await glob(project.config.include, {
+        cwd: rootDir,
+        absolute: true,
+        ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
+      });
+      testFileSet = new Set(testFiles);
     }
     pendingAffectedFiles.push(absPath);
   }
@@ -973,7 +1021,9 @@ Must happen in the **Vite `config` hook** (before Vitest's `initCoverageProvider
 
 ```typescript
 config(config) {
-  if (options.coverage === false) return;
+  // Auto-enable is opt-in only — avoids surprising perf/output changes.
+  // Default (coverage: true) = read coverage if already enabled and provider is v8.
+  if (options.coverage !== 'autoEnable') return;
   const test = config.test ?? {};
   const cov = test.coverage ?? {};
   if (cov.enabled === undefined) {
