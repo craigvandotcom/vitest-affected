@@ -65,6 +65,17 @@ describe('resolveFileImports', () => {
     expect(results).toHaveLength(0);
   });
 
+  test('.js extension imports resolve to .ts files (ESM convention)', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    // ESM TypeScript convention: import with .js extension, resolver maps to .ts
+    const source = `import { b } from './b.js';\nexport const a = b + 1;\n`;
+    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith('b.ts')).toBe(true);
+  });
+
   test('backtick dynamic import (no expressions) is included in graph', () => {
     const simpleDir = fixtureDir('simple');
     const resolver = createResolver(simpleDir);

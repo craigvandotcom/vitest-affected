@@ -26,6 +26,11 @@ export function createResolver(rootDir: string): ResolverFactory {
   }
   return new ResolverFactory({
     extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.json'],
+    extensionAlias: {
+      '.js': ['.ts', '.tsx', '.js'],
+      '.mjs': ['.mts', '.mjs'],
+      '.cjs': ['.cts', '.cjs'],
+    },
     conditionNames: ['node', 'import'],
     ...(hasTsconfig ? { tsconfig: { configFile: tsconfigPath, references: 'auto' } } : {}),
     builtinModules: true,
