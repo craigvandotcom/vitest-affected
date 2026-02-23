@@ -2,9 +2,10 @@
 import type { Plugin } from 'vite';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { glob } from 'tinyglobby';
+import { glob, globSync } from 'tinyglobby';
 import { buildFullGraph } from './graph/builder.js';
-import { loadOrBuildGraph, saveGraph } from './graph/cache.js';
+import { loadOrBuildGraph, saveGraph, loadOrBuildGraphSync, saveGraphSyncInternal, loadCachedMtimes, statAllFiles, diffGraphMtimes } from './graph/cache.js';
+import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
 
@@ -59,14 +60,6 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // 3. Watch mode guard
-        if (vitest.config.watch) {
-          console.warn(
-            '[vitest-affected] Watch mode detected — skipping test selection, running full suite',
-          );
-          return;
-        }
-
         // 4. Workspace guard
         if (vitest.projects.length > 1) {
           console.warn(
@@ -91,12 +84,90 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const rootDir = vitest.config.root;
         const verbose = options.verbose ?? false;
 
+        // Capture BEFORE any mutation of project.config.include
+        const originalInclude = [...project.config.include];
+        const originalExclude = [...(project.config.exclude ?? [])];
+
         // 6. Build graph
         const cacheDir = path.join(rootDir, '.vitest-affected');
-        let { forward, reverse } = options.cache !== false
+
+        // Mutable state — shared between one-shot path and watch callback
+        let forward: Map<string, Set<string>>;
+        let reverse: Map<string, Set<string>>;
+        let currentAffectedSet: Set<string> | null = null;
+        let lastRunAt = Date.now();
+
+        ({ forward, reverse } = options.cache !== false
           ? await loadOrBuildGraph(rootDir, cacheDir, verbose)
-          : await buildFullGraph(rootDir);
+          : await buildFullGraph(rootDir));
         if (options.cache !== false) await saveGraph(forward, cacheDir);
+
+        // Register watch-mode filter (fires on subsequent reruns, not initial run)
+        if (vitest.config.watch) {
+          const PERF_CEILING_MS = 300;
+
+          vitest.onFilterWatchedSpecification((spec) => {
+            // CRITICAL: onFilterWatchedSpecification acts as a refinement FILTER, not a selector.
+            // Vitest's runtime module graph determines which tests are CANDIDATES.
+            // Our static graph removes FALSE POSITIVES (specs Vitest selected but we know aren't affected).
+            // Conservative: return true for specs not in our graph — we cannot add tests Vitest missed.
+
+            // Batch reset: if enough time passed since last computation, reset affected set
+            if (currentAffectedSet && Date.now() - lastRunAt > 500) {
+              currentAffectedSet = null;
+            }
+
+            if (!currentAffectedSet) {
+              // First filter call in this batch — rebuild and detect changes
+              const buildStart = Date.now();
+
+              const oldMtimes = loadCachedMtimes(cacheDir);
+              const { forward: newForward, reverse: newReverse } =
+                loadOrBuildGraphSync(rootDir, cacheDir);
+
+              const buildDuration = Date.now() - buildStart;
+              if (buildDuration > PERF_CEILING_MS) {
+                // Performance ceiling exceeded — fall back to pass-through
+                console.warn(
+                  `[vitest-affected] Graph build took ${buildDuration}ms (>${PERF_CEILING_MS}ms) — passing through all specs`,
+                );
+                currentAffectedSet = null;
+                lastRunAt = Date.now();
+                return true;
+              }
+
+              forward = newForward;
+              reverse = newReverse;
+
+              const currentMtimes = statAllFiles(forward.keys());
+              const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
+              const bfsSeeds = [...changed, ...added];
+
+              const testFiles = globSync(originalInclude, {
+                cwd: rootDir,
+                absolute: true,
+                ignore: [...originalExclude, '**/node_modules/**'],
+              });
+              const testFileSet = new Set(testFiles);
+              const affected = bfsAffectedTests(
+                bfsSeeds,
+                reverse,
+                (f) => testFileSet.has(f),
+              );
+              currentAffectedSet = new Set(affected);
+              lastRunAt = Date.now();
+
+              saveGraphSyncInternal(forward, cacheDir);
+            }
+
+            // CRITICAL: normalize before lookup
+            const moduleId = normalizeModuleId(spec.moduleId);
+
+            // Conservative: keep specs not in our graph
+            if (!forward.has(moduleId)) return true;
+            return currentAffectedSet.has(moduleId);
+          });
+        }
 
         // 7. Get changed files
         let changed: string[];
