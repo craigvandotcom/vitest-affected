@@ -52,6 +52,22 @@ ARTIFACTS_DIR=/tmp/plan-refine-internal-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+Create the cross-round tracking file for single-agent findings:
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | Summary | Section | -->
+EOF
+```
+
 ### Checkpoint Original Plan
 
 ```bash
@@ -70,7 +86,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>" || true
 PLAN_CONTENT = Read(PLAN_FILE)
 ```
 
-**Compaction recovery:** If PLAN_CONTENT contains a `## Refinement Log` section, parse the last `### Round N` entry to recover CURRENT_ROUND (set to N+1). Previous rounds' changes are already applied to the plan. Read any existing findings files in `ARTIFACTS_DIR` for context on the most recent round.
+**Compaction recovery:** If PLAN_CONTENT contains a `## Refinement Log` section, parse the last `### Round N` entry to recover CURRENT_ROUND (set to N+1). Previous rounds' changes are already applied to the plan. Read any existing findings files in `ARTIFACTS_DIR` for context on the most recent round. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 **Skill routing:** Scan plan content for domain keywords. Check `AGENTS.md` > "Available Skills" for relevant skills. Include a line in each subagent prompt: `"Domain skills relevant to this plan: <list>. Read the corresponding skill file when evaluating sections that touch those domains."`
 
@@ -273,36 +289,27 @@ Produce a numbered change list. For each item: target section, what to change, n
 
 ### Auto-Apply Rules (DO NOT ask about these)
 
-**Auto-apply a change if EITHER condition is met:**
+**Auto-apply a change if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-**Apply these immediately using the Edit tool. Log them in the round summary as "Auto-applied".**
+**Apply these immediately using the Edit tool. Log them in the round summary as "Auto-applied" with the consensus type.**
 
-### Ask Only About Remaining Items
+### Defer Remaining Findings (DO NOT ask user per-round)
 
-After auto-applying, if any changes remain (Medium/Low severity AND only flagged by a single agent), present them:
+After auto-applying, any remaining changes (Medium/Low severity AND only flagged by a single agent with no cross-round match) are added to the consensus registry — NOT presented to the user.
 
-```
-AskUserQuestion(
-  questions: [{
-    question: "Auto-applied {N} changes (Critical/High + consensus). {M} single-agent findings remain:",
-    header: "Remaining",
-    multiSelect: true,
-    options: [
-      { label: "Change X: <title>", description: "Medium — <agent name>: <one-line summary>" },
-      { label: "Change Y: <title>", description: "Low — <agent name>: <one-line summary>" }
-    ]
-  }]
-)
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {one-line summary} | {plan section} |
 ```
 
-**If no remaining items after auto-apply:** Skip the question entirely — just report what was applied.
-
-**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
-
-**Apply approved changes using the Edit tool. You already know the exact changes.**
+These deferred findings serve two purposes:
+- **Cross-round consensus detection:** If a later round's agent flags the same issue, it auto-applies
+- **Final presentation:** Any findings that never achieve consensus are presented to the user once in Phase 5
 
 **After applying edits, append a round summary to the plan file:**
 
@@ -331,6 +338,32 @@ IF CURRENT_ROUND >= MAX_ROUNDS -> force finalize (note unverified fixes in Refin
 ---
 
 ## Phase 5: Finalize
+
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Any deferred findings that never achieved cross-round consensus are presented to the user in a single batch:
+
+**If no remaining deferred findings:** Skip — just proceed to commit.
+
+**If deferred findings remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} single-agent findings never confirmed. Apply any of these?",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Change X: <title>", description: "Round {R}, {severity} — {agent}: {section} — <one-line summary>" },
+      { label: "Change Y: <title>", description: "Round {R}, {severity} — {agent}: {section} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved findings using the Edit tool.**
 
 ### Safety Check and Commit
 
@@ -385,10 +418,12 @@ AskUserQuestion(
 ## Remember
 
 - YOU synthesize and apply edits directly — never delegate synthesis or spawn subagents for edits
-- **Auto-apply Critical/High + consensus (2+ agents) — only ask about single-agent Medium/Low**
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus findings presented once in Phase 5, not per-round
 - Trimmer/Simplifier counterbalances other agents — don't let them pile on complexity
 - Evidence over opinion — findings need file citations, not speculation
-- Findings files in ARTIFACTS_DIR persist through compaction — always read from files, not memory
+- Findings files + consensus registry in ARTIFACTS_DIR persist through compaction — always read from files, not memory
 - Refinement Log in plan file is your compaction recovery — parse it to know where you left off
 
 ---

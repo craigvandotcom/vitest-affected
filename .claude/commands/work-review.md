@@ -98,9 +98,23 @@ TaskCreate(subject: "Phase 7: Present decisions", description: "NEEDS_DECISION i
 TaskCreate(subject: "Phase 8: Final report + hand-off", description: "Summary, next step choice, cleanup", activeForm: "Generating final report...")
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-reviewer findings across rounds. If a finding recurs in a verification round, it achieves cross-round consensus and is auto-fixed.
+
+## Deferred Findings
+
+<!-- Format: | Round | Reviewer | Severity | File | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If reviewer findings files exist, skip to Phase 3 (synthesis).
+If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If reviewer findings files exist, skip to Phase 3 (synthesis). If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 **TaskUpdate(task: "Phase 0", status: "completed")**
 
@@ -431,12 +445,25 @@ For each item: target file, what to change, severity, which reviewers flagged it
 
 ### Auto-Apply Rules
 
-**Auto-apply a fix if EITHER condition is met:**
+**Auto-apply a fix if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ reviewers independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ reviewers independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-reviewer finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-Tag these as `AUTO_FIX`. Everything else is `NEEDS_DECISION`.
+Tag these as `AUTO_FIX`.
+
+**Defer remaining findings (DO NOT present to user yet):**
+
+Single-reviewer Medium/Low findings with no cross-round match are added to the consensus registry — NOT tagged as NEEDS_DECISION yet. They may achieve cross-round consensus if a verification round runs.
+
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {round} | {reviewer} | {severity} | {file:line} | {one-line summary} |
+```
+
+**Non-auto-fixable items** (need judgment regardless of consensus) are tagged `NEEDS_DECISION` immediately — these skip the registry.
 
 Append to `$ARTIFACTS_DIR/progress.md`:
 
@@ -549,7 +576,7 @@ AskUserQuestion(
 )
 ```
 
-**If verification round:** Re-run Phase 2-5 with the updated diff. Include in reviewer prompts: "Previous round found and fixed: {list}. Check if fixes are correct and look for NEW issues only." Max 2 total rounds.
+**If verification round:** Re-run Phase 2-5 with the updated diff. Include in reviewer prompts: "Previous round found and fixed: {list}. Check if fixes are correct and look for NEW issues only." Max 2 total rounds. During Phase 3 of the verification round, check new findings against the consensus registry for cross-round matches — any match auto-applies.
 
 ---
 
@@ -645,23 +672,30 @@ git push
 
 **TaskUpdate(task: "Phase 7", status: "in_progress")**
 
-### If No NEEDS_DECISION Items
+### Collect All Remaining Items
+
+Combine two categories into a single presentation:
+
+1. **NEEDS_DECISION items:** Non-auto-fixable findings that need judgment
+2. **No-consensus findings:** Read the consensus registry — single-reviewer findings that never achieved cross-round consensus
+
+### If Nothing Remains
 
 Report auto-fix results and skip to Phase 8.
 
-### If NEEDS_DECISION Items Exist
+### If Items Remain
 
-Present via `AskUserQuestion`:
+Present via `AskUserQuestion` (once):
 
 ```
 AskUserQuestion(
   questions: [{
-    question: "Auto-applied {N} fixes. {M} items need your decision:",
+    question: "Auto-applied {N} fixes (severity + consensus). {M} items remain for your decision:",
     header: "Decisions",
     multiSelect: true,
     options: [
-      { label: "Fix A: <title>", description: "{severity} — {reviewer}: {file}: {one-line summary}" },
-      { label: "Fix B: <title>", description: "{severity} — {reviewer}: {file}: {one-line summary}" }
+      { label: "Fix A: <title>", description: "NEEDS_DECISION, {severity} — {reviewer}: {file}: {one-line summary}" },
+      { label: "Fix B: <title>", description: "No consensus, Round {R}, {severity} — {reviewer}: {file}: {one-line summary}" }
     ]
   }]
 )
@@ -799,8 +833,10 @@ Use both: `work-review` for pre-merge validation, `hygiene` for general health.
 ## Remember
 
 - **YOU synthesize, engineers fix** — reviewers analyze, you decide what's real, engineer applies
-- **Auto-apply Critical/High + consensus (2+ reviewers)** — only ask about single-reviewer Medium
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus** — defer the rest to registry
+- **Cross-round consensus:** single-reviewer findings that recur in verification rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus + NEEDS_DECISION items presented once in Phase 7, not per-round
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Progress file is compaction recovery** — parse it on restart for phase state
 - **Project commands come from AGENTS.md** — detect from config files only as fallback
 - **Skill routing is dynamic** — check AGENTS.md > Available Skills, don't hardcode paths

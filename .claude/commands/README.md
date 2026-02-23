@@ -22,6 +22,7 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 | `plan-refine-external` | Multi-model refinement via OpenRouter — 4 diverse external models |
 | `plan-review-genius` | Single-model deep forensic review |
 | `plan-transcender-alien` | Paradigm-breaking alternative perspectives |
+| `plan-clean` | Final correctness check — 3 Sonnets verify accuracy, structure, and polish with cross-round consensus |
 
 ### Beads (Implementation)
 
@@ -49,7 +50,7 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 ## Workflow
 
 ```
-plan-init → plan-refine-internal → beadify → bead-refine → bead-work → work-review → bead-land
+plan-init → plan-refine-internal → plan-team → beadify → bead-refine → bead-work → work-review → bead-land
 ```
 
 ## Dependencies

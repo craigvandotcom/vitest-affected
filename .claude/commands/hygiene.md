@@ -43,9 +43,23 @@ ARTIFACTS_DIR=/tmp/hygiene-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | File | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' fixes are already applied.
+If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' fixes are already applied. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 ### Gather Codebase Context
 
@@ -216,34 +230,13 @@ Produce a numbered change list. For each: target file, what to change, auto-fixa
 
 ### Phase 3: Apply Fixes
 
-**Auto-apply a fix if EITHER condition is met:**
+**Auto-apply a fix if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-**Apply these immediately. Log them as "Auto-applied" in the progress file.**
-
-**Ask only about remaining items (Medium/Low AND single-agent):**
-
-```
-AskUserQuestion(
-  questions: [{
-    question: "Auto-applied {N} fixes (Critical/High + consensus). {M} single-agent findings remain:",
-    header: "Remaining",
-    multiSelect: true,
-    options: [
-      { label: "Fix X: <title>", description: "Medium — <agent>: <file>: <one-line summary>" },
-      { label: "Fix Y: <title>", description: "Medium — <agent>: <file>: <one-line summary>" }
-    ]
-  }]
-)
-```
-
-**If no remaining items after auto-apply:** Skip the question entirely — just report what was applied.
-
-**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
-
-**Apply approved fixes** using Edit tool. You are the conductor — direct fixes are faster than spawning an engineer for hygiene work.
+**Apply these immediately. Log them as "Auto-applied" in the progress file with the consensus type.**
 
 After each batch of fixes:
 
@@ -253,9 +246,17 @@ Run project quality checks (see AGENTS.md > Project Commands > Quality gate)
 
 If checks fail, revert the breaking fix and note it as non-auto-fixable.
 
-**Non-auto-fixable items:**
+**Defer remaining findings (DO NOT ask user per-round):**
 
-Collect these for user presentation after the loop.
+After auto-applying, any remaining changes (Medium/Low severity AND only flagged by a single agent with no cross-round match) are added to the consensus registry — NOT presented to the user.
+
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {file:line} | {one-line summary} |
+```
+
+**Non-auto-fixable items** (need judgment, not just low consensus) are also tracked in the registry with a `NO-AUTOFIX` tag for presentation in Phase 5.
 
 ### Phase 4: Convergence Check + Progress
 
@@ -286,6 +287,35 @@ IF this round found same issues as last round -> force finalize (agents are circ
 
 ## Phase 5: Finalize
 
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Combine two categories into a single presentation:
+
+1. **No-consensus findings:** Single-agent findings that never recurred across rounds
+2. **Non-auto-fixable items:** Findings tagged `NO-AUTOFIX` that need judgment regardless of consensus
+
+**If nothing remains:** Skip — proceed to quality gate.
+
+**If items remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} items remain for your decision:",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Fix X: <title>", description: "Round {R}, {severity} — {agent}: {file} — <one-line summary>" },
+      { label: "Fix Y: <title>", description: "NO-AUTOFIX, {severity} — {agent}: {file} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved fixes** using Edit tool.
+
 ### Quality Gate
 
 ```bash
@@ -308,25 +338,6 @@ Scope: {SCOPE}
 Co-Authored-By: Claude <noreply@anthropic.com>"
 git push
 ```
-
-### Present Deferred Items
-
-If non-auto-fixable items exist, present them:
-
-```
-## Hygiene Review: Items Needing Your Decision
-
-### Item N: <title>
-**Severity:** Critical | High | Medium
-**File:** path/to/file:line
-**Found by:** {agent role(s)}
-**Issue:** {description}
-**Options:**
-- [A] {option} (Recommended)
-- [B] {option}
-```
-
-Use `AskUserQuestion` with `multiSelect: true` if there are actionable choices. Group by severity.
 
 ### Report
 
@@ -390,9 +401,11 @@ Use `/hygiene` for general codebase health between sessions or as a daily mainte
 
 - **Codebase-wide, not feature-scoped** — agents explore freely (unless user constrains)
 - **Fresh eyes each round** — direct agents to unexplored files in subsequent rounds
-- **Fix what's clear, defer what's not** — don't make architectural decisions without the user
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus + non-auto-fixable items presented once in Phase 5, not per-round
 - **Quality gate before commit** — type-check + lint + test + build must pass
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Don't invent issues** — if the codebase is clean, say so and finish early
 
 ---

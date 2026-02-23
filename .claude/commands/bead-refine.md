@@ -40,9 +40,23 @@ ARTIFACTS_DIR=/tmp/bead-refine-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | Bead | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' changes are already applied to beads. Read any existing findings files in `$ARTIFACTS_DIR` for context on the most recent round.
+If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' changes are already applied to beads. Read any existing findings files in `$ARTIFACTS_DIR` for context on the most recent round. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 ### Identify Plan File + Skills
 
@@ -232,13 +246,20 @@ Synthesis principles:
 
 Produce a numbered change list. For each item: target bead(s), what to change, the fix.
 
-**Auto-apply without asking. No user approval needed — the convergence loop self-corrects.**
+**Auto-apply without asking. No user approval needed per-round — the convergence loop self-corrects.**
 
 - **Critical/High:** Apply immediately — these are defects, regardless of how many agents flagged it
-- **Medium/Low + consensus (2+ agents):** Apply immediately — multi-agent agreement is high-signal
-- **Medium/Low + single-agent:** Skip — not enough confidence. Log as "Skipped (single-agent)" in round summary. If it's real, another agent will independently flag it next round.
+- **Same-round consensus (2+ agents):** Apply immediately — multi-agent agreement is high-signal
+- **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal. Apply immediately.
+- **Medium/Low + single-agent + no cross-round match:** Defer to consensus registry. Do NOT skip silently.
 
-**Log all applied and skipped changes in the round summary.**
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {bead ID} | {one-line summary} |
+```
+
+**Log all applied and deferred changes in the round summary.**
 
 **Apply approved changes using `br` commands:**
 
@@ -300,6 +321,32 @@ IF CURRENT_ROUND >= MAX_ROUNDS -> force finalize (note unverified fixes in progr
 
 **TaskUpdate(task: "Phase 1-4: Refinement loop", status: "completed")**
 **TaskUpdate(task: "Phase 5: Finalize", status: "in_progress")**
+
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Any deferred findings that never achieved cross-round consensus are presented to the user in a single batch:
+
+**If no remaining deferred findings:** Skip — proceed to verification.
+
+**If deferred findings remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} single-agent findings never confirmed. Apply any of these?",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Fix X: <title>", description: "Round {R}, {severity} — {agent}: Bead {id} — <one-line summary>" },
+      { label: "Fix Y: <title>", description: "Round {R}, {severity} — {agent}: Bead {id} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved findings using `br` commands.**
 
 ### Verify Final Structure
 
@@ -381,9 +428,12 @@ AskUserQuestion(
 ## Remember
 
 - **YOU synthesize and apply fixes** — agents find issues, you decide and fix
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus findings presented once in Phase 5, not per-round
 - **Competitive framing sharpens output** — agents know they compete for relevance
 - **Structure Optimizer counterbalances** — prevents completeness reviewer from piling on complexity
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Progress file is compaction recovery** — parse it to know where you left off
 - **3 agents per round > 1 pass repeated** — more perspectives, faster convergence
 - **Evidence over opinion** — bead IDs and content citations, not vague concerns
