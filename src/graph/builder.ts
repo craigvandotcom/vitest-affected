@@ -21,6 +21,9 @@ function isBinarySpecifier(specifier: string): boolean {
 export function createResolver(rootDir: string): ResolverFactory {
   const tsconfigPath = path.join(rootDir, 'tsconfig.json');
   const hasTsconfig = existsSync(tsconfigPath);
+  if (!hasTsconfig) {
+    console.warn('[vitest-affected] No tsconfig.json found — path aliases will not resolve');
+  }
   return new ResolverFactory({
     extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.json'],
     conditionNames: ['node', 'import'],
@@ -35,7 +38,10 @@ export function resolveFileImports(
   rootDir: string,
   resolver: ResolverFactory,
 ): string[] {
-  const { module: mod } = parseSync(file, source);
+  const { module: mod, errors } = parseSync(file, source);
+  if (errors.length > 0) {
+    console.warn(`[vitest-affected] Parse errors in ${file} — imports may be incomplete`);
+  }
   const specifiers: string[] = [];
 
   // Static imports — skip type-only
@@ -76,7 +82,9 @@ export function resolveFileImports(
     if (result.error) continue;
     if (!result.path) continue;
     if (result.path.includes('node_modules')) continue;
-    if (!result.path.startsWith(rootDir)) continue;
+    // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
+    const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+    if (!result.path.startsWith(rootPrefix) && result.path !== rootDir) continue;
     resolved.push(result.path);
   }
 
@@ -90,7 +98,7 @@ export async function buildFullGraph(rootDir: string): Promise<{
   const files = await glob('**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}', {
     cwd: rootDir,
     absolute: true,
-    ignore: ['**/node_modules/**', '**/dist/**', '**/.vitest-affected/**', '**/coverage/**', '**/.next/**'],
+    ignore: ['**/node_modules/**', '**/dist/**', '**/.vitest-affected/**', '**/coverage/**', '**/.next/**', '**/test/fixtures/**'],
   });
 
   const resolver = createResolver(rootDir);

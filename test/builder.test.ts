@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'vitest';
+import { describe, test, expect, vi } from 'vitest';
 import path from 'node:path';
 import { writeFileSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,16 @@ describe('createResolver', () => {
     expect(result.error).toBeUndefined();
     expect(result.path).toBeDefined();
     expect(result.path!.endsWith('a.ts')).toBe(true);
+  });
+
+  test('warns when tsconfig.json is absent', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const noTsconfigDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-no-tsconfig-'));
+    createResolver(noTsconfigDir);
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[vitest-affected] No tsconfig.json found — path aliases will not resolve'
+    );
+    warnSpy.mockRestore();
   });
 });
 
@@ -220,5 +230,76 @@ describe('buildFullGraph - circular fixture (A→B→A)', () => {
     const keys = Array.from(forward.keys());
     expect(keys.some(k => k.endsWith('src/a.ts'))).toBe(true);
     expect(keys.some(k => k.endsWith('src/b.ts'))).toBe(true);
+  });
+});
+
+describe('builder.ts bug fixes (bd-3me)', () => {
+  test('path boundary rejects sibling directories with shared prefix', () => {
+    // Create two sibling dirs: /tmp/foo and /tmp/foo-bar
+    const base = mkdtempSync(path.join(tmpdir(), 'vitest-affected-boundary-'));
+    const projectDir = path.join(base, 'myproject');
+    const siblingDir = path.join(base, 'myproject-other');
+    mkdirSync(projectDir, { recursive: true });
+    mkdirSync(path.join(projectDir, 'src'), { recursive: true });
+    mkdirSync(siblingDir, { recursive: true });
+    mkdirSync(path.join(siblingDir, 'src'), { recursive: true });
+
+    // Create source files
+    writeFileSync(path.join(projectDir, 'src', 'a.ts'), 'export const a = 1;\n');
+    writeFileSync(path.join(siblingDir, 'src', 'b.ts'), 'export const b = 1;\n');
+
+    // resolveFileImports should NOT include sibling dir file when rootDir is projectDir
+    const resolver = createResolver(projectDir);
+    const source = `import { b } from '${path.join(siblingDir, 'src', 'b')}';\n`;
+    const results = resolveFileImports(
+      path.join(projectDir, 'src', 'a.ts'),
+      source,
+      projectDir,
+      resolver,
+    );
+    // The sibling file should be excluded by the path boundary check
+    expect(results.every(r => r.startsWith(projectDir + path.sep))).toBe(true);
+  });
+
+  test('parse errors are logged with console.warn', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+
+    // Feed malformed source to trigger parse errors
+    const malformed = 'import { from;\nexport const x = {\n';
+    resolveFileImports(
+      path.join(simpleDir, 'src', 'a.ts'),
+      malformed,
+      simpleDir,
+      resolver,
+    );
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[vitest-affected] Parse errors in')
+    );
+    warnSpy.mockRestore();
+  });
+
+  test('buildFullGraph excludes test/fixtures directory', async () => {
+    // Create a project with a test/fixtures subdirectory
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-fixtures-ignore-'));
+    mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    mkdirSync(path.join(tmpDir, 'test', 'fixtures', 'simple', 'src'), { recursive: true });
+
+    writeFileSync(path.join(tmpDir, 'src', 'main.ts'), 'export const main = 1;\n');
+    writeFileSync(
+      path.join(tmpDir, 'test', 'fixtures', 'simple', 'src', 'a.ts'),
+      'export const a = 1;\n',
+    );
+    writeFileSync(path.join(tmpDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+
+    const { forward } = await buildFullGraph(tmpDir);
+    const keys = Array.from(forward.keys());
+
+    // Fixture files should NOT be in the graph
+    expect(keys.some(k => k.includes('test/fixtures'))).toBe(false);
+    // Source files SHOULD be in the graph
+    expect(keys.some(k => k.endsWith('src/main.ts'))).toBe(true);
   });
 });
