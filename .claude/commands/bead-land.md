@@ -213,6 +213,8 @@ Read `/tmp/bead-work/retrospective.md`. Verify findings against your own experie
 
 **Goal:** Turn learnings into system improvements. User decides what ships.
 
+**NO AUTO-APPLY.** Unlike review commands (`plan-clean`, `hygiene`, `work-review`, `bead-refine`) which auto-apply consensus findings, bead-land presents ALL upgrade proposals to the user. System compounding changes identity and workflow — every change needs explicit approval.
+
 ### Present Upgrades to User
 
 First, output each upgrade opportunity so the user can see the details:
@@ -339,7 +341,7 @@ br ready --json     # What's left
 
 - **Land is NON-NEGOTIABLE** — push before learning
 - **Learn from evidence, not speculation** — every finding needs a concrete example from this session
-- **Compound aggressively but user-gated** — propose bold changes, let user decide
+- **Compound aggressively but ALWAYS user-gated** — no auto-apply, every upgrade needs explicit approval (unlike review commands)
 - **Context bloat is the enemy** — refine existing content, don't just append
 - **Temp files are the source of truth** — read from `$ARTIFACTS_DIR`, not memory
 - **This is what makes the flywheel accelerate** — each session improves the next
