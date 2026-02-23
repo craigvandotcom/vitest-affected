@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-02-23
+
+### Fixed
+
+- Add `extensionAlias` to oxc-resolver config for ESM `.js` → `.ts` import resolution — without this, the dependency graph was empty for any project using ESM-style `.js` extensions in TypeScript imports
+- Fix unsafe type assertion in git exec helper — use `instanceof Error` narrowing instead of `as` cast
+- Remove dead `setupFileSet.has(path.basename(f))` fallback in setup file detection
+- Remove unused `allowNoTests` option from `VitestAffectedOptions` interface
+- Add `project.config.exclude` to test file glob for correct filtering
+- Skip template literal dynamic imports containing `${}` expressions (non-resolvable)
+
+### Changed
+
+- Reorder package.json exports: `types` before `import` for correct TypeScript resolution
+- Add `repository`, `homepage`, `bugs`, and `sideEffects` fields to package.json
+- Add warning when no test files match include patterns
+- Add verbose warning when no affected tests found
+
 ## [0.2.0] - 2026-02-23
 
 ### Added
