@@ -12,7 +12,7 @@
 - [Technical Decisions](#technical-decisions)
 - [Phase 1: Static Import Graph (MVP)](#phase-1-static-import-graph-mvp)
 - [Phase 2: Watch Mode + Caching](#phase-2-watch-mode--caching)
-- [Phase 3: Coverage-Enhanced Selection](#phase-3-coverage-enhanced-selection)
+- [Phase 3: Runtime-Enhanced Selection via importDurations](#phase-3-runtime-enhanced-selection-via-importdurations)
 - [Phase 4: Symbol-Level Tracking (Future)](#phase-4-symbol-level-tracking-future)
 - [Phase 5: Predictive Selection (Aspirational)](#phase-5-predictive-selection-aspirational)
 - [Cross-Phase Dependencies](#cross-phase-dependencies)
@@ -62,9 +62,9 @@ Vitest's built-in `--changed` flag does follow transitive dependencies via Vite'
 | Graph source | On-demand Vite transforms (slow cold start) | Pre-built static analysis (fast, cacheable) |
 | First run | Must transform every reachable module | oxc-parser is 8x faster, results cached |
 | CI friendliness | No persistence between runs | Cached graph persists across runs |
-| Dynamic deps | Catches all (runtime graph) | Static-only until Phase 3 coverage |
+| Dynamic deps | Catches all (runtime graph) | Static-only until Phase 3 runtime tracking |
 
-The primary value proposition is **speed**: a cached static graph resolves affected tests in milliseconds, vs Vite's on-demand module transformation which scales with project size. Phase 3 coverage data closes the accuracy gap for dynamic dependencies.
+The primary value proposition is **speed**: a cached static graph resolves affected tests in milliseconds, vs Vite's on-demand module transformation which scales with project size. Phase 3 runtime tracking via `importDurations` closes the accuracy gap for dynamic dependencies.
 
 **Note:** `--changed` uses Vite's in-memory module graph cache when warm (watch mode). The speed advantage is largest on cold CI runs where Vite must transform on demand. Benchmark against `vitest --changed` on a real 500+ file project before launch to quantify the actual speedup.
 
@@ -117,7 +117,7 @@ vitest-affected/
 │   │   └── cache.ts         # (Phase 2) Graph persistence + mtime invalidation
 │   ├── git.ts               # Git diff integration
 │   ├── selector.ts          # Pure BFS: (changedFiles, reverse, isTestFile) → affected tests
-│   └── coverage.ts          # (Phase 3) V8 coverage edge extraction + merge
+│   └── runtime.ts           # (Phase 3) importDurations reporter + runtime edge collection
 ├── test/
 │   ├── fixtures/            # Sample projects with known dependency structures
 │   │   ├── simple/          # Linear A→B→C chain
@@ -213,7 +213,7 @@ Without cache restoration, Phase 1 still provides full benefit (graph build is f
 
 ### Options Interface
 
-Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true) and `allowNoTests`. Phase 3 adds `coverage?: boolean` (default: false, opt-in).
+Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true) and `allowNoTests`. Phase 3 adds `extraDependencies` for non-import file tracking.
 
 ```typescript
 export interface VitestAffectedOptions {
@@ -224,6 +224,7 @@ export interface VitestAffectedOptions {
   threshold?: number;      // Run full suite if affected ratio > threshold (0-1, default 1.0 = disabled)
   allowNoTests?: boolean;  // If true, allow selecting 0 tests (default: false — runs full suite instead)
   cache?: boolean;         // (Phase 2) Persist graph to disk (default: true)
+  extraDependencies?: Record<string, string[]>;  // (Phase 3) Non-import deps: source globs → test globs
 }
 ```
 
@@ -350,7 +351,7 @@ Execute in this order:
 5. **Rewrite `src/selector.ts`** → pure `bfsAffectedTests` function (remove `SelectionResult`, `getAffectedTests`)
 6. **Rewrite `src/plugin.ts`** → remove `verify` option and `onFilterWatchedSpecification` references; orchestration (build → BFS) lives here. Destructure `{ vitest, project }` (not just `vitest`) — `project.config.include` patterns needed for test file identification via `tinyglobby`.
 7. **Rewrite `src/git.ts`** → return `{ changed: string[]; deleted: string[] }` (not flat `string[]`). Stub comments say `ACMR` — plan requires `ACMRD` (includes deletions). Follow the pseudocode, not stub comments.
-8. **Update `package.json`** → peer dep `>=3.2.0` (required for `onAfterSetServer` in Phase 2b/3), remove `xxhash-wasm`, add `tinyglobby` to deps (picomatch deferred to Phase 2), add `tsup` to devDeps, update `scripts.build` from `"tsc"` to `"tsup"`, remove or update `scripts.dev` to `"tsup --watch"`
+8. **Update `package.json`** → peer dep `>=3.2.0` (required for `onFilterWatchedSpecification` in Phase 2 and `importDurations` in Phase 3), remove `xxhash-wasm`, add `tinyglobby` to deps (picomatch deferred to Phase 2), add `tsup` to devDeps, update `scripts.build` from `"tsc"` to `"tsup"`, remove or update `scripts.dev` to `"tsup --watch"`
 9. **Run `npm install`** — install new deps before creating config files
 10. **Create** root `vitest.config.ts` and `tsup.config.ts` — tsup config: `{ entry: ['src/index.ts'], format: ['esm', 'cjs'], dts: true, clean: true }`
 11. **Create/update `.gitignore`** — add `dist/`, `.vitest-affected/`, `coverage/`, `node_modules/`
@@ -702,7 +703,7 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
 - **Watch mode:** Not supported. `configureVitest` runs once at startup — test set becomes stale. Deferred to Phase 2.
 - **Vitest workspaces:** Not supported. Plugin detects workspace mode and falls back to full suite.
 - **File renames:** Appear as deletion + addition, triggering conservative full-suite fallback.
-- **Temporal mismatch:** Graph reflects current disk state, diff reflects historical changes. Rare false-negative vector eliminated by Phase 3 coverage data.
+- **Temporal mismatch:** Graph reflects current disk state, diff reflects historical changes. Rare false-negative vector eliminated by Phase 3 runtime `importDurations` tracking.
 - **Nested tsconfigs:** Only root-level config filenames trigger full rerun.
 - **Monorepo root mismatch:** Plugin uses `vitest.config.root` for graph building and `git rev-parse --show-toplevel` for changed files. In monorepos where vitest root is a subdirectory of the git root, the `startsWith(rootDir)` filter silently drops changed files outside vitest root — causing full-suite run (safe but wasteful).
 - **`config.include` absolute paths:** Assigning absolute file paths to `config.include` (typed as glob patterns) works empirically on Vitest 3.2.4 but is undocumented behavior. Add integration test to catch regressions.
@@ -732,7 +733,7 @@ Persist the dependency graph across runs for fast startup, then make vitest-affe
 **Key simplification:** Full graph rebuild (166ms for 433 files) is fast enough for watch mode. No incremental graph updates (`updateGraphForFiles`) needed. Cache saves cold-start time; full rebuild handles all change types including deletions. Add incremental updates only when profiling on a 2000+ file project proves they're needed.
 
 **Deferred to Phase 3+:**
-- **Verify mode** — diagnostic for static-analysis misses, but the fix (coverage data) doesn't exist until Phase 3.
+- **Verify mode** — diagnostic for static-analysis misses. Phase 3's `importDurations` tracking catches most invisible dependencies automatically.
 - **Rename detection** — Phase 1's full-suite fallback on renames is correct and safe.
 - **Incremental graph updates** — premature optimization at current project sizes.
 
@@ -740,7 +741,7 @@ Persist the dependency graph across runs for fast startup, then make vitest-affe
 
 Before starting Phase 2 implementation:
 
-1. **Bump peerDep** from `>=3.1.0` to `>=3.2.0` in `package.json` (required for `onAfterSetServer` in watch mode).
+1. **Bump peerDep** from `>=3.1.0` to `>=3.2.0` in `package.json` (required for `onFilterWatchedSpecification` in watch mode and `importDurations` diagnostic in Phase 3).
 2. **Add `allowNoTests`** to `VitestAffectedOptions` and implement the zero-test branch in `plugin.ts`:
    ```typescript
    allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
@@ -1013,119 +1014,142 @@ Edge case: two saves within 500ms (auto-save) may reuse a stale affected set. Th
 
 ---
 
-# Phase 3: Coverage-Enhanced Selection
+# Phase 3: Runtime-Enhanced Selection via `importDurations`
 
 **Depends on:** Phase 2 (Watch Mode + Caching)
-**Effort:** Days (reduced from weeks after refinement)
-**New file:** `src/coverage.ts`
-**New deps:** None (uses Node.js built-in APIs + Vitest's existing coverage output)
-**Status: Optional / data-driven.** Ship Phases 1+2 first. Measure real-world false-negative rates. Phase 3 catches rare edge cases at the cost of depending on 2 undocumented Vitest internals (`onAfterSetServer`, `vitest.reporters`). Build only if static-analysis miss rate justifies the fragility.
+**Effort:** Days
+**New file:** `src/runtime.ts`
+**New deps:** None
+**Status: Ready.** Uses exclusively official, typed, documented Vitest APIs. Zero undocumented internals.
 
 ## Goal
 
-Augment the static import graph with runtime coverage data. After test runs, read which source files each test worker actually loaded at runtime. Union these edges into the static graph to catch dependencies invisible to static analysis.
+Augment the static import graph with runtime dependency data collected via Vitest's official Reporter API. After each test module executes, read which source files it actually loaded at runtime. Union these edges into the static graph to catch dependencies invisible to static analysis.
 
-## Why Coverage Data Matters
+## Why This Matters
 
-Phase 1's static graph misses:
+Phase 1's static graph misses dependencies that don't appear as import statements:
 
-| Invisible dependency | Why static misses it | Coverage catches it |
+| Invisible dependency | Why static misses it | `importDurations` catches it |
 |---|---|---|
-| `import(variable)` | Computed specifier | Runtime reveals actual path |
-| `require('./config')[env]` | Dynamic property access | Traces actual file |
-| `vi.mock('./foo', () => import('./bar'))` | Mock factory is opaque | Factory executes, bar.ts in coverage |
-| `fs.readFileSync('./data.json')` | Not an import | File appears in V8 coverage |
+| `import(variable)` | Computed specifier | Runtime resolves actual path → appears in `importDurations` |
+| `vi.mock('./foo', () => import('./bar'))` | Mock factory is opaque | Factory executes, `./bar` loaded by Vitest → in `importDurations` |
+| `vi.importActual('./baz')` | Inside mock scope | Vitest processes the import → in `importDurations` |
+| `vi.hoisted(() => import('./x'))` | Hoisted, not a static import | Vitest processes the import → in `importDurations` |
+| CSS/SCSS modules | Vitest transforms but not a TS import | Processed by Vite pipeline → in `importDurations` |
+| `fs.readFileSync('./data.json')` | Not an import at all | **NOT caught** — use `extraDependencies` option |
 
-**Safety invariant preserved:** Coverage only ADDS edges (union). False negatives can only decrease.
+**Safety invariant preserved:** Runtime edges only ADD to the graph (union). False negatives can only decrease.
 
-## Integration Strategy: Post-Run File Reader
+## Key Discovery: `TestModule.diagnostic().importDurations`
 
-**Not** a custom coverage provider. Vitest writes per-worker V8 coverage to `<reportsDirectory>/.tmp/coverage-<N>.json` when `coverage.enabled = true`. Phase 3 reads these files after the test run completes.
+**Empirically verified on Vitest 3.2.4.** The `TestModule` object (received by reporters in `onTestModuleEnd`) exposes `diagnostic().importDurations`:
 
-### Why Not Custom Provider?
+```typescript
+interface ModuleDiagnostic {
+  readonly importDurations: Record<string, ImportDuration>;
+  // ... other fields
+}
 
-- `coverage.provider: 'custom'` replaces the entire V8/Istanbul pipeline — can't "wrap" it
-- Requires a `customProviderModule` file path, not runtime registration
-- Breaks users' existing `provider: 'v8'` or `provider: 'istanbul'` configs
+interface ImportDuration {
+  selfTime: number;  // Time importing & executing the file itself
+  totalTime: number; // Time including all its transitive imports
+}
+```
+
+**The keys are absolute file paths** of every non-externalized module that Vitest processed for that test file. This includes the full transitive closure — verified empirically:
+
+```
+test/plugin.test.ts → importDurations keys:
+  /project/src/graph/builder.ts   (transitive dep)
+  /project/src/graph/cache.ts     (transitive dep)
+  /project/src/graph/normalize.ts (transitive dep)
+  /project/src/git.ts             (transitive dep)
+  /project/src/selector.ts        (transitive dep)
+  /project/src/plugin.ts          (direct dep)
+  /project/test/plugin.test.ts    (self)
+```
+
+This is strictly better than the previous V8 coverage approach because:
+- **Per-test-file granularity** (not per-worker — no `isolate: false` ambiguity)
+- **Official, typed API** (`ModuleDiagnostic` exported from `vitest/node`)
+- **Zero configuration** — Vitest already tracks this for its own UI
+- **Zero overhead** — no V8 coverage instrumentation needed
+
+## Integration Strategy: Auto-Injected Reporter
 
 ### How It Works
 
-1. User enables V8 coverage in their config (or we auto-enable via Vite `config` hook)
-2. Vitest runs tests, collecting V8 coverage per worker as normal
-3. Coverage files are written to `<reportsDirectory>/.tmp/`
-4. After run completes, our reporter's `onTestRunEnd` reads these files (sync, for atomicity)
-5. Extract file-level mappings: which source files each worker loaded
-6. Union into the static graph and persist
+1. Our Vite plugin's `config()` hook auto-injects a custom reporter into `config.test.reporters`
+2. Vitest runs tests as normal — `importDurations` is collected automatically
+3. In `onTestModuleEnd`, we read `testModule.diagnostic().importDurations`
+4. Build a reverse map: source file → set of test files that loaded it
+5. In `onTestRunEnd`, merge runtime edges into the static graph and persist
 
-## Architecture: `src/coverage.ts`
+### Why Auto-Inject via `config()` Hook?
+
+- The Vite `config()` hook fires before Vitest initializes reporters
+- Appending to `config.test.reporters` is the official way to add reporters
+- No `onAfterSetServer` (undocumented), no `(vitest as any).reporters` (internal)
+- Users don't need to configure anything — just add the plugin
+
+## Architecture: `src/runtime.ts`
 
 ```typescript
-import { readdirSync, readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import type { Reporter } from 'vitest/reporters';
+import type { TestModule } from 'vitest/node';
 
-export function readCoverageEdges(
-  coverageTmpDir: string,
+/**
+ * Collect runtime dependency edges from Vitest's importDurations diagnostic.
+ * Auto-injected by the plugin — users never interact with this directly.
+ */
+export function createRuntimeReporter(
   rootDir: string,
-  testFileSet: Set<string>
-): Map<string, Set<string>> {
-  const reverse = new Map<string, Set<string>>();
+  onEdgesCollected: (edges: Map<string, Set<string>>) => void,
+): Reporter {
+  // Accumulated reverse edges: source file → set of test files that loaded it
+  const runtimeReverse = new Map<string, Set<string>>();
 
-  let files: string[];
-  try { files = readdirSync(coverageTmpDir); }
-  catch { return reverse; }
+  return {
+    onTestModuleEnd(testModule: TestModule) {
+      const testPath = testModule.moduleId;
+      const durations = testModule.diagnostic().importDurations;
 
-  for (const f of files) {
-    if (!f.startsWith('coverage-') || !f.endsWith('.json')) continue;
+      for (const modulePath of Object.keys(durations)) {
+        // Skip non-absolute paths (/@vite/env, virtual modules)
+        if (!modulePath.startsWith('/')) continue;
+        // Skip node_modules
+        if (modulePath.includes('/node_modules/')) continue;
+        // Skip files outside rootDir
+        const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
+        if (!modulePath.startsWith(rootPrefix) && modulePath !== rootDir) continue;
+        // Skip self-reference
+        if (modulePath === testPath) continue;
 
-    let raw: string;
-    try { raw = readFileSync(path.join(coverageTmpDir, f), 'utf-8'); }
-    catch { continue; } // ENOENT — file cleaned mid-read
-
-    let parsed: any;
-    try { parsed = JSON.parse(raw); }
-    catch { continue; } // Malformed JSON — partial write
-    const scriptCoverages = parsed.result ?? [];
-
-    const testFilesInWorker: string[] = [];
-    const sourceFilesInWorker: string[] = [];
-
-    for (const sc of scriptCoverages) {
-      const filePath = normalizeUrl(sc.url);
-      if (!filePath) continue;
-      if (!filePath.startsWith(rootDir)) continue;
-      if (filePath.includes('node_modules')) continue;
-
-      if (testFileSet.has(filePath)) {
-        testFilesInWorker.push(filePath);
-      } else {
-        sourceFilesInWorker.push(filePath);
+        if (!runtimeReverse.has(modulePath)) {
+          runtimeReverse.set(modulePath, new Set());
+        }
+        runtimeReverse.get(modulePath)!.add(testPath);
       }
-    }
+    },
 
-    for (const testFile of testFilesInWorker) {
-      for (const sourceFile of sourceFilesInWorker) {
-        if (!reverse.has(sourceFile)) reverse.set(sourceFile, new Set());
-        reverse.get(sourceFile)!.add(testFile);
+    onTestRunEnd() {
+      if (runtimeReverse.size > 0) {
+        onEdgesCollected(runtimeReverse);
       }
-    }
-  }
-  return reverse;
+    },
+  };
 }
 
-function normalizeUrl(url: string | undefined): string | null {
-  if (!url) return null;
-  const bare = url.split('?')[0];
-  if (bare.startsWith('file://')) return fileURLToPath(bare);
-  if (bare.includes('/@fs/')) return bare.slice(bare.indexOf('/@fs/') + 4);
-  return null;
-}
-
-export function mergeIntoGraph(
+/**
+ * Merge runtime edges into the static reverse graph.
+ * Runtime edges only ADD — never remove static edges.
+ */
+export function mergeRuntimeEdges(
   staticReverse: Map<string, Set<string>>,
-  coverageReverse: Map<string, Set<string>>
+  runtimeReverse: Map<string, Set<string>>,
 ): void {
-  for (const [file, tests] of coverageReverse) {
+  for (const [file, tests] of runtimeReverse) {
     if (!staticReverse.has(file)) {
       staticReverse.set(file, new Set(tests));
     } else {
@@ -1135,10 +1159,77 @@ export function mergeIntoGraph(
 }
 ```
 
-### Per-Worker Union
+## Plugin Integration
 
-- **`isolate: true`:** 1 test file per worker → 1:1 mapping (precise)
-- **`isolate: false`:** N test files per worker → N:M mapping (over-selects, safe)
+### Auto-Injecting the Reporter
+
+In the Vite plugin's `config()` hook (fires before Vitest initializes):
+
+```typescript
+export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
+  // Shared state between config() and configureVitest()
+  let runtimeReporter: Reporter | null = null;
+
+  return {
+    name: 'vitest-affected',
+
+    config(config) {
+      if (options.disabled || process.env.VITEST_AFFECTED_DISABLED === '1') return;
+
+      // Auto-inject runtime reporter for dependency tracking
+      const test = (config.test ??= {});
+      const reporters = (test.reporters ??= ['default']);
+      // Ensure reporters is an array (can be string or array)
+      if (typeof reporters === 'string') {
+        test.reporters = [reporters];
+      }
+
+      runtimeReporter = createRuntimeReporter(
+        config.root ?? process.cwd(),
+        (edges) => {
+          // Called in onTestRunEnd — merge and persist
+          // Forward/reverse maps and cacheDir are captured in configureVitest closure
+        },
+      );
+
+      (test.reporters as unknown[]).push(runtimeReporter);
+    },
+
+    async configureVitest({ vitest, project }) {
+      // ... existing Phase 1+2 logic ...
+      // Wire runtimeReporter's callback to persist edges into cache
+    },
+  };
+}
+```
+
+### `extraDependencies` Option
+
+For non-import file access (`fs.readFileSync`, data files, etc.) that no import tracking can catch:
+
+```typescript
+export interface VitestAffectedOptions {
+  // ... existing options ...
+  extraDependencies?: Record<string, string[]>;
+  // Keys: glob patterns for source files (relative to rootDir)
+  // Values: glob patterns for test files that depend on them
+  // Example: { 'data/*.json': ['test/data-loader.test.ts'] }
+}
+```
+
+At graph build time, resolve the globs and add the resulting edges to the reverse map. This runs once per graph build — not per test.
+
+### Compression Ratio Logging
+
+Always-on (not gated behind `verbose`). Replace the current silent success with:
+
+```typescript
+console.log(
+  `[vitest-affected] ${validTests.length}/${testFileSet.size} tests affected (${
+    ((1 - validTests.length / testFileSet.size) * 100).toFixed(0)
+  }% skipped) in ${(performance.now() - t0).toFixed(0)}ms`
+);
+```
 
 ## Persistence: Fold Into `graph.json`
 
@@ -1147,87 +1238,50 @@ export function mergeIntoGraph(
   "version": 2,
   "builtAt": 1708000000000,
   "files": { ... },
-  "coverageEdges": {
-    "src/utils/food.ts": ["tests/food.test.tsx", "tests/utils.test.ts"]
+  "runtimeEdges": {
+    "/abs/path/src/utils/food.ts": ["/abs/path/tests/food.test.tsx", "/abs/path/tests/utils.test.ts"]
   },
-  "coverageCollectedAt": 1708000000000
+  "runtimeCollectedAt": 1708000000000
 }
 ```
 
-**Version migration:** Reading v1 cache → treat as valid with empty coverage edges. Bump to v2 on next write.
+**Version migration:** Reading v1 cache → treat as valid with empty runtime edges. Bump to v2 on next write. v2 reading v1 is a no-op (missing fields default to empty).
 
-## Plugin Integration
+## Implementation Steps
 
-### Reporter Registration
-
-**Verified against Vitest 3.2.4:** `configureVitest` hooks fire at line 9322, then `this.reporters = createReporters(...)` overwrites at line 9341. Must register reporter **after** initialization via `vitest.onAfterSetServer()`.
-
-```typescript
-// In plugin.ts — Phase 3 additions (inside same onAfterSetServer callback as Phase 2b)
-if (options.coverage) {
-  const reporters = (vitest as any).reporters;
-  if (Array.isArray(reporters)) {
-    reporters.push({
-      onTestRunEnd() {
-        const newEdges = readCoverageEdges(coverageTmpDir, rootDir, coverageTestFileSet);
-        mergeIntoGraph(snapshot.reverse, newEdges);
-        saveGraphSync(snapshot, cacheDir);
-      }
-    });
-  } else {
-    console.warn('[vitest-affected] Cannot register coverage reporter — vitest.reporters not accessible');
-  }
-}
-```
-
-### Auto-Enabling Coverage
-
-Must happen in the **Vite `config` hook** (before Vitest's `initCoverageProvider()`):
-
-```typescript
-config(config) {
-  if (!options.coverage) return;
-  const test = config.test ?? {};
-  const cov = test.coverage ?? {};
-  if (cov.enabled === undefined) {
-    test.coverage = {
-      ...cov,
-      enabled: true,
-      provider: 'v8',
-      reporter: ['json'],
-      all: false,
-    };
-    config.test = test;
-  }
-}
-```
-
-### Implementation Steps
-
-1. **Implement `coverage.ts`** — `readCoverageEdges`, `mergeIntoGraph`, `normalizeUrl`. Sync I/O.
-2. **Update cache format** — Bump version to 2. Add `coverageEdges` + `coverageCollectedAt`. Handle v1→v2 migration.
-3. **Update `plugin.ts`** — Auto-enable coverage in Vite `config` hook. Register reporter via `onAfterSetServer`. Merge cached edges.
-4. **Tests** — Coverage file parsing, URL normalization, edge extraction, merge correctness, v1→v2 migration.
+1. **Implement `runtime.ts`** — `createRuntimeReporter`, `mergeRuntimeEdges`. ~50 lines.
+2. **Add `extraDependencies` option** — Resolve globs at graph-build time, inject into reverse map. ~30 lines.
+3. **Add compression ratio logging** — Always-on one-liner in plugin.ts.
+4. **Update `plugin.ts`** — Add `config()` hook for reporter auto-injection. Wire `onEdgesCollected` callback to merge+persist.
+5. **Update cache format** — Bump version to 2. Add `runtimeEdges` + `runtimeCollectedAt`. Handle v1→v2 migration in `loadOrBuildGraph`.
+6. **Tests** — Reporter edge collection, merge correctness (runtime adds edges, doesn't remove), extraDependencies glob resolution, v1→v2 cache migration, compression ratio output.
 
 ## Merge Algorithm
 
 ```
-merged_graph = static_graph ∪ coverage_graph
+effective_graph = static_graph ∪ runtime_graph ∪ extra_dependencies
 ```
 
-Coverage adds edges static missed. Static keeps edges coverage missed. Result: more tests selected (possible), fewer missed (reduced).
+All three sources only ADD edges. The effective graph is always a superset of the static graph. Over-selection is possible; under-selection is reduced to near-zero.
 
 ## Known Limitations (Phase 3)
 
-- **Coverage must be enabled:** Falls back to static-only if user disables.
-- **First-run cold start:** No coverage data on first run. Static graph only.
-- **Coverage edges are one run behind:** Run N data benefits run N+1.
-- **Coverage file race:** `onTestRunEnd` fires between `generateCoverage()` and `reportCoverage()`. Sync I/O + ENOENT guards handle this.
-- **URL normalization:** Unknown URL schemes silently skipped. Add verbose logging.
-- **Per-worker union with `isolate: false`:** Over-selects but never under-selects.
-- **`onAfterSetServer` is undocumented:** Exists in Vitest 3.2.4 runtime but absent from type definitions. May break on minor releases.
-- **Shard mode:** `vitest --shard=N/M` changes tmp dir to `.tmp-N-M`. Read `vitest.config.shard` at impl time.
-- **Version downgrade:** Phase 2 code reading v2 cache triggers full rebuild (safe).
+- **Runtime edges are one run behind:** Run N's `importDurations` data benefits run N+1. First run after adding a new dynamic dependency will use static graph only (safe — falls back to full suite if the dependency isn't in the graph).
+- **`importDurations` only tracks Vitest-processed modules:** Files loaded via `fs.readFileSync`, `fetch`, or other non-import mechanisms do NOT appear. Use `extraDependencies` for these cases.
+- **`/@vite/env` and virtual modules:** Non-file-path keys in `importDurations` (e.g., `/@vite/env`) are filtered out by the `startsWith('/')` check.
+- **`isolate: false` is fine:** Unlike V8 coverage (which is per-worker), `importDurations` is per-test-module. Each `onTestModuleEnd` call receives only that module's dependencies, regardless of isolation settings.
+- **Reporter injection order:** Our reporter is appended to the end of the reporters array. If users configure `reporters: [...]` (replacing the default), our reporter is still appended. If users set `reporters: false` or similar, the injection may fail — but the plugin continues without runtime edges (static graph still works).
+- **Cache version downgrade:** Phase 2 code reading v2 cache treats unknown fields as ignored. v2 → v1 downgrade triggers full rebuild (safe — unknown version).
+- **`extraDependencies` globs are resolved at graph-build time:** If the glob matches new files between graph builds, those files won't be tracked until the next rebuild. In watch mode, this means new data files added between restarts may be missed. Restarting Vitest picks them up.
+
+### What's No Longer a Limitation (vs Old Phase 3)
+
+- ~~`onAfterSetServer` is undocumented~~ → Reporter API is fully official
+- ~~`vitest.reporters` hacking~~ → Auto-injected via `config()` hook
+- ~~V8 coverage must be enabled~~ → `importDurations` is always collected
+- ~~Per-worker union ambiguity~~ → Per-test-module granularity
+- ~~Coverage file race conditions~~ → No file I/O timing issues
+- ~~URL normalization of `file://` URLs~~ → Keys are already absolute paths
 
 ---
 
@@ -1258,11 +1312,11 @@ Note: `resolveFileImports` and `createResolver` are exported from `builder.ts` f
 
 | Phase 2 produces | Phase 3 consumes |
 |---|---|
-| `{ forward, reverse }` (same as Phase 1, no new types) | Extended cache format with `coverageEdges?`, `coverageCollectedAt?` |
-| `loadOrBuildGraph` / `saveGraph` | Handles v1→v2 migration, serializes coverage edges |
-| `cache.ts` disk format (version 1) | Bumped to version 2 with coverage fields |
-| `tinyglobby` glob → `testFileSet` | Reused for coverage test-vs-source classification |
-| `normalizeModuleId` | Phase 3 reuses for spec ID normalization |
+| `{ forward, reverse }` (same as Phase 1, no new types) | Extended cache format with `runtimeEdges?`, `runtimeCollectedAt?` |
+| `loadOrBuildGraph` / `saveGraph` | Handles v1→v2 migration, serializes runtime edges |
+| `cache.ts` disk format (version 1) | Bumped to version 2 with runtime edge fields |
+| `tinyglobby` glob → `testFileSet` | Reused for `extraDependencies` glob resolution |
+| Vite plugin structure (`config()` + `configureVitest()`) | Phase 3 adds `config()` hook for reporter auto-injection |
 
 ---
 
@@ -1278,7 +1332,7 @@ Note: `resolveFileImports` and `createResolver` are exported from `builder.ts` f
 | Codecov ATS | Coverage-based | Partial | No (Python only) | Yes |
 | Nx affected | Dependency graph | Yes | Partial | No (package-level) |
 | Bun test | None | Yes | No | No |
-| **vitest-affected** | **Import graph + cache** | **Yes** | **Yes** | **Yes** |
+| **vitest-affected** | **Static graph + runtime `importDurations` + cache** | **Yes** | **Yes** | **Yes** |
 
 **We are the only open-source, file-level, Vitest-native test impact analysis tool.**
 
@@ -1395,3 +1449,13 @@ Our advantage: Start with static import graph analysis (cheap, fast, no overhead
 - **Result:** All 3 agents returned CLEAN. Builder: "ready for implementation." Breaker: "no breaks found." Trimmer: "appropriately scoped."
 - **Remaining Medium observations:** Sync/async code duplication (acknowledged as future refactor target), Windows drive-letter normalization after /@fs/ (not in Phase 2 scope), cross-phase export clarification (trivial).
 - **Trajectory:** 0 Critical, 0 High → **finalize**
+
+### Phase 3 Rewrite: Transcendent Review + `importDurations` Discovery
+
+- **Changes:** Complete Phase 3 rewrite — replaced V8 coverage approach with `importDurations` reporter approach
+- **Key discovery:** `TestModule.diagnostic().importDurations` (official Reporter API, typed, documented) provides absolute file paths of every non-externalized module loaded per test file. Empirically verified on Vitest 3.2.4 — keys ARE absolute file paths, includes full transitive closure.
+- **What was removed:** `src/coverage.ts` (V8 coverage file reader), `onAfterSetServer` (undocumented), `(vitest as any).reporters` (internal API hacking), auto-enabling V8 coverage, URL normalization for `file://` URLs, per-worker union logic.
+- **What was added:** `src/runtime.ts` (~50 lines), auto-injected reporter via `config()` hook, `extraDependencies` option for non-import file tracking, always-on compression ratio logging.
+- **Fragility eliminated:** 0 undocumented APIs (was 2). Reporter API, `config()` hook, and `ModuleDiagnostic` are all official, typed exports from `vitest/node`.
+- **Accuracy improved:** Per-test-module granularity (was per-worker). No `isolate: false` ambiguity.
+- **Brainstorm process:** 33 approaches evaluated across 9 categories (Reporter API, static analysis extensions, user declarations, verification, NODE_V8_COVERAGE, custom pool, ESM loader hooks, Vite transform pipeline, external/hybrid). Narrowed to 9, then to 3. The `importDurations` approach dominated on all axes: resilience, simplicity, reliability.
