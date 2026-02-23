@@ -15,8 +15,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "test": "vitest",
     "lint": "tsc --noEmit"
   },
@@ -34,15 +34,17 @@
     "node": ">=18"
   },
   "peerDependencies": {
-    "vitest": ">=3.0.0"
+    "vitest": ">=3.1.0"
   },
   "dependencies": {
     "oxc-parser": "^0.114.0",
     "oxc-resolver": "^6.0.0",
-    "xxhash-wasm": "^1.1.0"
+    "tinyglobby": "^0.2.0"
   },
   "devDependencies": {
+    "execa": "^9.0.0",
+    "tsup": "^8.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.2.0"
   }
 }

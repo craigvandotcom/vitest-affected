@@ -1,4 +1,8 @@
 node_modules/
 dist/
 .vitest-affected/
+coverage/
 *.tsbuildinfo
+
+# bv (beads viewer) local config and caches
+.bv/
