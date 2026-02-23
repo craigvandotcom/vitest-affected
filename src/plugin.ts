@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'tinyglobby';
 import { buildFullGraph } from './graph/builder.js';
+import { loadOrBuildGraph, saveGraph } from './graph/cache.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
 
@@ -13,6 +14,8 @@ export interface VitestAffectedOptions {
   changedFiles?: string[];
   verbose?: boolean;
   threshold?: number;
+  allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
+  cache?: boolean; // Enable graph caching (default: true)
 }
 
 /**
@@ -86,9 +89,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         }
 
         const rootDir = vitest.config.root;
+        const verbose = options.verbose ?? false;
 
         // 6. Build graph
-        const { reverse } = await buildFullGraph(rootDir);
+        const cacheDir = path.join(rootDir, '.vitest-affected');
+        let { forward, reverse } = options.cache !== false
+          ? await loadOrBuildGraph(rootDir, cacheDir, verbose)
+          : await buildFullGraph(rootDir);
+        if (options.cache !== false) await saveGraph(forward, cacheDir);
 
         // 7. Get changed files
         let changed: string[];
@@ -176,6 +184,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 13. Threshold check
         if (affectedTests.length === 0) {
+          if (options.allowNoTests) {
+            project.config.include = [];
+            return;
+          }
           console.warn(
             '[vitest-affected] No affected tests found — running full suite',
           );
