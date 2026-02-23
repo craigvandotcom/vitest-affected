@@ -29,16 +29,20 @@ const CONFIG_BASENAMES = new Set([
   'vitest.config.ts',
   'vitest.config.js',
   'vitest.config.mts',
+  'vitest.config.mjs',
   'vitest.workspace.ts',
   'vitest.workspace.js',
+  'vitest.workspace.mts',
+  'vitest.workspace.mjs',
   'vite.config.ts',
   'vite.config.js',
   'vite.config.mts',
+  'vite.config.mjs',
 ]);
 
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   return {
-    name: 'vitest:affected',
+    name: 'vitest-affected',
     async configureVitest({ vitest, project }) {
       try {
         // 1. Env override
@@ -172,22 +176,18 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 13. Threshold check
         if (affectedTests.length === 0) {
-          if (options.verbose) {
-            console.warn(
-              '[vitest-affected] No affected tests found — running full suite',
-            );
-          }
+          console.warn(
+            '[vitest-affected] No affected tests found — running full suite',
+          );
           return;
         }
 
         const ratio = affectedTests.length / testFiles.length;
         const threshold = options.threshold ?? 1.0;
         if (ratio > threshold) {
-          if (options.verbose) {
-            console.warn(
-              `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
-            );
-          }
+          console.warn(
+            `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
+          );
           return;
         }
 

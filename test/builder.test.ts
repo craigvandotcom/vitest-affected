@@ -1,10 +1,19 @@
-import { describe, test, expect, vi } from 'vitest';
+import { describe, test, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
-import { writeFileSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { buildFullGraph, resolveFileImports, createResolver } from '../src/graph/builder.js';
 
 const fixtureDir = (name: string) => path.resolve(import.meta.dirname, 'fixtures', name);
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  tempDirs.length = 0;
+});
 
 describe('createResolver', () => {
   test('returns a working resolver instance', () => {
@@ -24,6 +33,7 @@ describe('createResolver', () => {
   test('warns when tsconfig.json is absent', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const noTsconfigDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-no-tsconfig-'));
+    tempDirs.push(noTsconfigDir);
     createResolver(noTsconfigDir);
     expect(warnSpy).toHaveBeenCalledWith(
       '[vitest-affected] No tsconfig.json found — path aliases will not resolve'
@@ -45,6 +55,7 @@ describe('resolveFileImports', () => {
 
   test('type-only imports are NOT in graph edges', () => {
     const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-test-'));
+    tempDirs.push(tmpDir);
     const fooFile = path.join(tmpDir, 'foo.ts');
     const barFile = path.join(tmpDir, 'bar.ts');
     writeFileSync(fooFile, 'export type Foo = { x: number };\n');
@@ -245,6 +256,7 @@ describe('builder.ts bug fixes (bd-3me)', () => {
   test('path boundary rejects sibling directories with shared prefix', () => {
     // Create two sibling dirs: /tmp/foo and /tmp/foo-bar
     const base = mkdtempSync(path.join(tmpdir(), 'vitest-affected-boundary-'));
+    tempDirs.push(base);
     const projectDir = path.join(base, 'myproject');
     const siblingDir = path.join(base, 'myproject-other');
     mkdirSync(projectDir, { recursive: true });
@@ -292,6 +304,7 @@ describe('builder.ts bug fixes (bd-3me)', () => {
   test('buildFullGraph excludes test/fixtures directory', async () => {
     // Create a project with a test/fixtures subdirectory
     const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-fixtures-ignore-'));
+    tempDirs.push(tmpDir);
     mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
     mkdirSync(path.join(tmpDir, 'test', 'fixtures', 'simple', 'src'), { recursive: true });
 

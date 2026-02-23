@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'vitest';
+import { describe, test, expect, afterEach } from 'vitest';
 import path from 'node:path';
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,9 +9,19 @@ import { getChangedFiles } from '../src/git.js';
 const execFile = promisify(execFileCb);
 const git = (args: string[], cwd: string) => execFile('git', args, { cwd });
 
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  tempDirs.length = 0;
+});
+
 /** Create a temp directory and init a fresh git repo. */
 async function makeTempRepo(): Promise<string> {
   const dir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-git-'));
+  tempDirs.push(dir);
   await git(['init'], dir);
   await git(['config', 'user.email', 'test@test.com'], dir);
   await git(['config', 'user.name', 'Test'], dir);

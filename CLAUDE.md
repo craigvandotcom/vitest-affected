@@ -17,7 +17,7 @@ Stack: TypeScript, Vitest plugin API, oxc-parser, oxc-resolver, tinyglobby
 | Test (single file) | `npx vitest run test/path/to/file.test.ts` |
 | Type-check | `tsc --noEmit` |
 | Lint | `tsc --noEmit` (TypeScript strict is the linter) |
-| Quality gate | `tsc --noEmit && npx vitest run && npm run build` |
+| Quality gate | `tsc --noEmit && npm run build && npx vitest run` |
 
 No separate eslint/prettier/biome — TypeScript strict mode is the only static analysis.
 

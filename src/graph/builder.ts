@@ -87,7 +87,7 @@ export function resolveFileImports(
     const result = resolver.sync(dir, specifier);
     if (result.error) continue;
     if (!result.path) continue;
-    if (result.path.includes('node_modules')) continue;
+    if (result.path.includes('/node_modules/')) continue;
     // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
     const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
     if (!result.path.startsWith(rootPrefix) && result.path !== rootDir) continue;
