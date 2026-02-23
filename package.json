@@ -7,8 +7,8 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
@@ -28,8 +28,17 @@
     "affected-tests",
     "vitest-plugin"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/craigvandotcom/vitest-affected.git"
+  },
+  "homepage": "https://github.com/craigvandotcom/vitest-affected#readme",
+  "bugs": {
+    "url": "https://github.com/craigvandotcom/vitest-affected/issues"
+  },
   "author": "CraigVan",
   "license": "MIT",
+  "sideEffects": false,
   "engines": {
     "node": ">=18"
   },

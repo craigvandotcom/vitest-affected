@@ -152,19 +152,20 @@ describe('integration: plugin orchestration', () => {
   /**
    * Test 2: Full suite on no changes
    * No git changes → all tests run (plugin returns early, config.include unchanged)
+   * Uses diamond fixture (2 test files) so full suite is distinguishable from filtered.
    */
   test(
     'full suite on no changes: clean git state → all tests run',
     async () => {
-      const tmp = setupFixture('simple');
+      const tmp = setupFixture('diamond');
       await gitInit(tmp);
 
       // No changes after initial commit — plugin should fall back to full suite
       const report = await runVitest(tmp);
       const testFiles = report.testResults.map((r) => r.name);
 
-      // Simple fixture has only 1 test file, and full suite means it runs
-      expect(testFiles.length).toBeGreaterThanOrEqual(1);
+      // Diamond fixture has 2 test files — both must run (full suite)
+      expect(testFiles).toHaveLength(2);
     },
     30_000,
   );
@@ -206,11 +207,12 @@ export default defineConfig({
   /**
    * Test 4: changedFiles with non-existing path (deletion)
    * Mix existing + non-existing → deletion triggers full suite
+   * Uses diamond fixture (2 test files) so full suite is distinguishable from filtered.
    */
   test(
     'changedFiles with non-existing path triggers full suite (deletion fallback)',
     async () => {
-      const tmp = setupFixture('simple');
+      const tmp = setupFixture('diamond');
       await gitInit(tmp);
 
       const existingFile = path.join(tmp, 'src', 'c.ts');
@@ -233,8 +235,8 @@ export default defineConfig({
       const testFiles = report.testResults.map((r) => r.name);
 
       // Full suite runs because deleted file triggers fallback:
-      // simple fixture has 1 test file
-      expect(testFiles.length).toBeGreaterThanOrEqual(1);
+      // diamond fixture has 2 test files — both must run
+      expect(testFiles).toHaveLength(2);
     },
     30_000,
   );

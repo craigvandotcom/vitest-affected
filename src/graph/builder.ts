@@ -56,11 +56,12 @@ export function resolveFileImports(
     const raw = source.slice(imp.moduleRequest.start, imp.moduleRequest.end);
     if (raw.startsWith("'") || raw.startsWith('"') || raw.startsWith('`')) {
       const specifier = raw.slice(1, -1);
+      // Skip template literals with expressions — non-resolvable
+      if (specifier.includes('${')) continue;
       if (!isBinarySpecifier(specifier)) {
         specifiers.push(specifier);
       }
     }
-    // Skip template literals with expressions — non-resolvable
   }
 
   // Re-exports — in staticExports, NOT staticImports

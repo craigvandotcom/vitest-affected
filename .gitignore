@@ -4,5 +4,8 @@ dist/
 coverage/
 *.tsbuildinfo
 
+# beads task management
+.beads/
+
 # bv (beads viewer) local config and caches
 .bv/

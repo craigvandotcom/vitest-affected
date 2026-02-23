@@ -44,9 +44,6 @@ describe('resolveFileImports', () => {
   });
 
   test('type-only imports are NOT in graph edges', () => {
-    const simpleDir = fixtureDir('simple');
-    const resolver = createResolver(simpleDir);
-
     const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-test-'));
     const fooFile = path.join(tmpDir, 'foo.ts');
     const barFile = path.join(tmpDir, 'bar.ts');
