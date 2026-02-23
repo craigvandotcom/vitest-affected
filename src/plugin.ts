@@ -105,67 +105,80 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // Register watch-mode filter (fires on subsequent reruns, not initial run)
         if (vitest.config.watch) {
           const PERF_CEILING_MS = 300;
+          let perfCeilingExceeded = false;
 
           vitest.onFilterWatchedSpecification((spec) => {
-            // CRITICAL: onFilterWatchedSpecification acts as a refinement FILTER, not a selector.
-            // Vitest's runtime module graph determines which tests are CANDIDATES.
-            // Our static graph removes FALSE POSITIVES (specs Vitest selected but we know aren't affected).
-            // Conservative: return true for specs not in our graph — we cannot add tests Vitest missed.
+            try {
+              // CRITICAL: onFilterWatchedSpecification acts as a refinement FILTER, not a selector.
+              // Vitest's runtime module graph determines which tests are CANDIDATES.
+              // Our static graph removes FALSE POSITIVES (specs Vitest selected but we know aren't affected).
+              // Conservative: return true for specs not in our graph — we cannot add tests Vitest missed.
 
-            // Batch reset: if enough time passed since last computation, reset affected set
-            if (currentAffectedSet && Date.now() - lastRunAt > 500) {
-              currentAffectedSet = null;
-            }
-
-            if (!currentAffectedSet) {
-              // First filter call in this batch — rebuild and detect changes
-              const buildStart = Date.now();
-
-              const oldMtimes = loadCachedMtimes(cacheDir);
-              const { forward: newForward, reverse: newReverse } =
-                loadOrBuildGraphSync(rootDir, cacheDir);
-
-              const buildDuration = Date.now() - buildStart;
-              if (buildDuration > PERF_CEILING_MS) {
-                // Performance ceiling exceeded — fall back to pass-through
-                console.warn(
-                  `[vitest-affected] Graph build took ${buildDuration}ms (>${PERF_CEILING_MS}ms) — passing through all specs`,
-                );
+              // Batch reset: if enough time passed since last computation, reset affected set
+              if ((currentAffectedSet || perfCeilingExceeded) && Date.now() - lastRunAt > 500) {
                 currentAffectedSet = null;
-                lastRunAt = Date.now();
-                return true;
+                perfCeilingExceeded = false;
               }
 
-              forward = newForward;
-              reverse = newReverse;
+              // Perf ceiling was hit earlier in this batch — skip rebuild, pass through
+              if (perfCeilingExceeded) return true;
 
-              const currentMtimes = statAllFiles(forward.keys());
-              const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
-              const bfsSeeds = [...changed, ...added];
+              if (!currentAffectedSet) {
+                // First filter call in this batch — rebuild and detect changes
+                const buildStart = Date.now();
 
-              const testFiles = globSync(originalInclude, {
-                cwd: rootDir,
-                absolute: true,
-                ignore: [...originalExclude, '**/node_modules/**'],
-              });
-              const testFileSet = new Set(testFiles);
-              const affected = bfsAffectedTests(
-                bfsSeeds,
-                reverse,
-                (f) => testFileSet.has(f),
+                const oldMtimes = loadCachedMtimes(cacheDir);
+                const { forward: newForward, reverse: newReverse } =
+                  loadOrBuildGraphSync(rootDir, cacheDir);
+
+                const buildDuration = Date.now() - buildStart;
+                if (buildDuration > PERF_CEILING_MS) {
+                  // Performance ceiling exceeded — fall back to pass-through for entire batch
+                  console.warn(
+                    `[vitest-affected] Graph build took ${buildDuration}ms (>${PERF_CEILING_MS}ms) — passing through all specs`,
+                  );
+                  perfCeilingExceeded = true;
+                  lastRunAt = Date.now();
+                  return true;
+                }
+
+                forward = newForward;
+                reverse = newReverse;
+
+                const currentMtimes = statAllFiles(forward.keys());
+                const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
+                const bfsSeeds = [...changed, ...added];
+
+                const testFiles = globSync(originalInclude, {
+                  cwd: rootDir,
+                  absolute: true,
+                  ignore: [...originalExclude, '**/node_modules/**'],
+                });
+                const testFileSet = new Set(testFiles);
+                const affected = bfsAffectedTests(
+                  bfsSeeds,
+                  reverse,
+                  (f) => testFileSet.has(f),
+                );
+                currentAffectedSet = new Set(affected);
+                lastRunAt = Date.now();
+
+                saveGraphSyncInternal(forward, cacheDir);
+              }
+
+              // CRITICAL: normalize before lookup
+              const moduleId = normalizeModuleId(spec.moduleId);
+
+              // Conservative: keep specs not in our graph
+              if (!forward.has(moduleId)) return true;
+              return currentAffectedSet.has(moduleId);
+            } catch (err) {
+              // Safety invariant: never crash Vitest — fall back to full suite
+              console.warn(
+                `[vitest-affected] Watch filter error — passing through all specs: ${err instanceof Error ? err.message : String(err)}`,
               );
-              currentAffectedSet = new Set(affected);
-              lastRunAt = Date.now();
-
-              saveGraphSyncInternal(forward, cacheDir);
+              return true;
             }
-
-            // CRITICAL: normalize before lookup
-            const moduleId = normalizeModuleId(spec.moduleId);
-
-            // Conservative: keep specs not in our graph
-            if (!forward.has(moduleId)) return true;
-            return currentAffectedSet.has(moduleId);
           });
         }
 
@@ -234,7 +247,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const testFiles = await glob(includePatterns, {
           cwd: rootDir,
           absolute: true,
-          ignore: project.config.exclude ?? [],
+          ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
         });
 
         if (testFiles.length === 0) {

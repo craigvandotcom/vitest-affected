@@ -58,7 +58,7 @@ function cleanupOrphanedTmp(cacheDir: string): void {
 /**
  * Build forward + reverse maps from a map of file entries (path → imports).
  */
-function entriestoMaps(
+function entriesToMaps(
   entries: Map<string, string[]>,
 ): { forward: Map<string, Set<string>>; reverse: Map<string, Set<string>> } {
   const forward = new Map<string, Set<string>>();
@@ -107,7 +107,7 @@ export async function loadOrBuildGraph(
   // --- Attempt cache read ---
   let disk: CacheDiskFormat | null = null;
   try {
-    const raw = readFileSync(cachePath, 'utf-8');
+    const raw = await readFile(cachePath, 'utf-8');
     const parsed: unknown = JSON.parse(raw);
     if (
       typeof parsed === 'object' &&
@@ -169,7 +169,7 @@ export async function loadOrBuildGraph(
     );
   }
 
-  return entriestoMaps(refreshed);
+  return entriesToMaps(refreshed);
 }
 
 /**
@@ -398,5 +398,5 @@ export function loadOrBuildGraphSync(
     entries.set(filePath, entry.imports);
   }
 
-  return entriestoMaps(entries);
+  return entriesToMaps(entries);
 }
