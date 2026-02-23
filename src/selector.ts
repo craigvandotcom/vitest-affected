@@ -1,31 +1,25 @@
-// TODO: Phase 1 implementation
-// - Get changed files from git (via git.ts)
-// - BFS through reverse graph to find all affected files
-// - Filter to test files only (*.test.*, *.spec.*)
-// - Also include directly-changed test files in result (fixes vitest --changed bug #1113)
-//
-// BFS algorithm (O(V + E) with pre-built reverse adjacency list):
-//   queue = [...changedFiles]
-//   visited = new Set(changedFiles)
-//   while queue.length > 0:
-//     file = queue.shift()
-//     for dependent of reverse.get(file):
-//       if not visited: add to queue and visited
-//   testsToRun = visited.filter(isTestFile)
+export function bfsAffectedTests(
+  changedFiles: string[],
+  reverse: Map<string, Set<string>>,
+  isTestFile: (path: string) => boolean
+): string[] {
+  const visited = new Set<string>();
+  const queue = [...changedFiles];
+  let i = 0;
+  const affectedTests: string[] = [];
 
-export interface SelectionResult {
-  /** Files that changed (from git diff) */
-  changedFiles: string[];
-  /** All affected files (transitive reverse deps) */
-  affectedFiles: string[];
-  /** Affected test files only */
-  testsToRun: string[];
-  /** Total test files in project (for comparison) */
-  totalTests: number;
-}
+  while (i < queue.length) {
+    const file = queue[i++]!;
+    if (visited.has(file)) continue;
+    visited.add(file);
+    if (isTestFile(file)) affectedTests.push(file);
+    const dependents = reverse.get(file);
+    if (dependents) {
+      for (const dep of dependents) {
+        if (!visited.has(dep)) queue.push(dep);
+      }
+    }
+  }
 
-export async function getAffectedTests(
-  _rootDir: string
-): Promise<SelectionResult> {
-  throw new Error("Not yet implemented");
+  return affectedTests.sort();
 }
