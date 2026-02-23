@@ -10,8 +10,9 @@ async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise
     const { stdout } = await execFile(cmd, args, { ...opts, encoding: 'utf-8' });
     return { stdout: stdout ?? '' };
   } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    throw new Error(`${cmd} ${args.join(' ')} failed: ${e.stderr ?? e.message ?? String(err)}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    const stderr = err && typeof err === 'object' && 'stderr' in err ? String(err.stderr) : undefined;
+    throw new Error(`${cmd} ${args.join(' ')} failed: ${stderr ?? msg}`);
   }
 }
 

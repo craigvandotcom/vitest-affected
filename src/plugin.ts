@@ -13,7 +13,6 @@ export interface VitestAffectedOptions {
   changedFiles?: string[];
   verbose?: boolean;
   threshold?: number;
-  allowNoTests?: boolean;
 }
 
 /**
@@ -132,9 +131,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const setupFileSet = new Set(
           Array.isArray(setupFiles) ? setupFiles : [setupFiles],
         );
-        const hasSetupFileChange = changed.some(
-          (f) => setupFileSet.has(f) || setupFileSet.has(path.basename(f)),
-        );
+        const hasSetupFileChange = changed.some((f) => setupFileSet.has(f));
         if (hasSetupFileChange) {
           console.warn(
             '[vitest-affected] Setup file change detected — running full suite',
@@ -154,9 +151,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const testFiles = await glob(includePatterns, {
           cwd: rootDir,
           absolute: true,
+          ignore: project.config.exclude ?? [],
         });
 
         if (testFiles.length === 0) {
+          console.warn(
+            '[vitest-affected] No test files matched include patterns — running full suite',
+          );
           return;
         }
 
@@ -171,6 +172,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 13. Threshold check
         if (affectedTests.length === 0) {
+          if (options.verbose) {
+            console.warn(
+              '[vitest-affected] No affected tests found — running full suite',
+            );
+          }
           return;
         }
 
@@ -211,7 +217,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (validTests.length > 0) {
           project.config.include = validTests;
         }
-        // else: return early → full suite (allowNoTests deferred to Phase 2)
+        // else: no valid affected tests — full suite runs as fallback
       } catch (err) {
         // 17. Catch-all: safety invariant — never crash, never skip silently
         console.warn(
