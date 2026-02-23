@@ -802,69 +802,48 @@ git status
 ### Present Final Summary
 
 ```markdown
-## Plan Refinement Complete
+## Plan Refinement Complete (External)
 
-**Rounds completed:** {CURRENT_ROUND}
-**Final plan:** {PLAN_FILE}
+**Plan:** {PLAN_FILE}
+**Models:** {MODELS list}
+**Rounds:** {CURRENT_ROUND}
 **Refinement log:** {WORK_DIR}/REFINEMENT-LOG.md
-**Artifacts committed:** ✅
 
----
+### Convergence
 
-### Summary
+Round  Struct  Signif  Increm  Total  Applied  Deferred
+  1      {n}     {n}     {n}    {n}     {n}       {n}
+  2      {n}     {n}     {n}    {n}     {n}       {n}
+  ...
 
-**Total improvements integrated:** [X]
+R1  {▓▓▓░░░░████}  {total}
+R2  {░░████}       {total}  {-N%}
+R3  {████}         {total}  {-N%}
 
-- Structural changes: [count]
-- Significant enhancements: [count]
-- Incremental refinements: [count]
+▓ Structural  ░ Significant  █ Incremental
 
----
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (scope):         {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Model Contributions
 
-**Most valuable insights:**
+- **{model}:** {key contribution pattern}
+- **{model}:** {key contribution pattern}
 
-- **[Model name]:** [Key contribution or pattern of contributions]
-- **[Model name]:** [Key contribution or pattern of contributions]
+**Stop reason:** {incremental convergence | MAX_ROUNDS | user decision}
 
-**Consensus improvements (3+ models agreed):**
+### Artifacts
 
-- [High-signal improvement 1]
-- [High-signal improvement 2]
-
----
-
-### Refinement Evolution
-
-**Round-by-round scope:**
-
-| Round | Scope                                | Key Changes     |
-| ----- | ------------------------------------ | --------------- |
-| 1     | [Structural/Significant/Incremental] | [Brief summary] |
-| 2     | [Structural/Significant/Incremental] | [Brief summary] |
-| ...   | ...                                  | ...             |
-
-**Convergence:** Stopped at round {CURRENT_ROUND} due to [incremental changes / MAX_ROUNDS reached / user decision]
-
----
-
-### Artifacts Location
-
-All refinement materials saved to: {WORK_DIR}
-
-**What's available:**
-
-- **Individual model responses:** `round-N-[model].md` - See what each AI suggested
-- **Plan evolution:** `plan-round-N.md` - Track how plan improved each round
-- **Change history:** `changelog-round-N.md` - Documented changes per round
-- **Complete log:** `REFINEMENT-LOG.md` - Full refinement narrative with analysis
-
----
-
-### Next Steps
-
-Your refined plan is ready at: {PLAN_FILE}
+- `round-N-[model].md` — raw model responses
+- `plan-round-N.md` — plan state after each round
+- `changelog-round-N.md` — changes per round
+- `REFINEMENT-LOG.md` — full refinement narrative
 ```
 
 **Present next step choice with `AskUserQuestion`:**

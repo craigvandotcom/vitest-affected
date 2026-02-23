@@ -332,17 +332,32 @@ find "$ARTIFACTS_DIR" -mindepth 1 -delete && rmdir "$ARTIFACTS_DIR" 2>/dev/null 
 ### Report
 
 ```markdown
-## Plan Team: Correctness Check Complete
+## Plan Clean: Correctness Check Complete
 
 **Plan:** {PLAN_FILE}
 **Rounds:** {CURRENT_ROUND}
 
-### Changes Applied
+### Convergence
 
-- **Same-round consensus:** {count} (2+ agents agreed within a round)
-- **Cross-round consensus:** {count} (finding recurred across rounds)
-- **User-approved:** {count} (single-agent, user confirmed)
-- **Discarded:** {count} (single-agent, not confirmed)
+Round  Verifier  Auditor  Editor  Total  Applied  Deferred
+  1      {n}       {n}     {n}     {n}     {n}       {n}
+  2      {n}       {n}     {n}     {n}     {n}       {n}
+  3      {n}       {n}     {n}     {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### What Was Checked
 

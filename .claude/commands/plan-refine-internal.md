@@ -393,7 +393,42 @@ find "$ARTIFACTS_DIR" -mindepth 1 -delete && rmdir "$ARTIFACTS_DIR" 2>/dev/null 
 
 ### Summary
 
-Report: rounds completed, tier used, total changes applied, top agent contributions (one line each), stop reason.
+```markdown
+## Plan Refinement Complete ({TIER})
+
+**Plan:** {PLAN_FILE}
+**Tier:** {TIER} ({AGENT_COUNT}x {AGENT_MODEL})
+**Rounds:** {CURRENT_ROUND}
+
+### Convergence
+
+Round  Crit  High  Med   Total  Applied  Deferred
+  1     {n}   {n}   {n}   {n}     {n}       {n}
+  2     {n}   {n}   {n}   {n}     {n}       {n}
+  ...
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
+
+### Top Agent Contributions
+
+- **{agent}:** {key finding pattern}
+- **{agent}:** {key finding pattern}
+
+**Stop reason:** {severity converged | MAX_ROUNDS | clean round}
+```
 
 **Present next step choice with `AskUserQuestion`:**
 

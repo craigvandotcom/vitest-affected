@@ -50,7 +50,7 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 ## Workflow
 
 ```
-plan-init → plan-refine-internal → plan-team → beadify → bead-refine → bead-work → work-review → bead-land
+plan-init → plan-refine-internal → plan-clean → beadify → bead-refine → bead-work → work-review → bead-land
 ```
 
 ## Dependencies

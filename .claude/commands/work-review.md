@@ -752,11 +752,25 @@ git push
 **Report:** `.claude/reviews/YYYY-MM-DD-HHMM-[feature].md`
 **Rounds:** {count}
 
-### Summary
+### Convergence
 
-- **Critical:** 0 remaining ({X} fixed)
-- **High:** 0 remaining ({Y} fixed)
-- **Medium:** {Z} addressed, {W} deferred
+Round  Security  Performance  Architecture  Correctness  Total  Applied  Deferred
+  1      {n}       {n}          {n}           {n}         {n}     {n}       {n}
+  2      {n}       {n}          {n}           {n}         {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {count} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Changes Made
 

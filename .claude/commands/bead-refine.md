@@ -375,15 +375,29 @@ Verify:
 ## Bead Refinement Complete
 
 **Rounds completed:** {CURRENT_ROUND}
-**Findings total:** {sum across rounds}
-**Changes applied:** {sum across rounds}
 **Stop reason:** {severity converged | MAX_ROUNDS | user decision}
 
-### Agent Contributions
+### Convergence
 
-- **Completeness:** {key findings pattern}
-- **Implementability:** {key findings pattern}
-- **Structure:** {key findings pattern}
+Round  Completeness  Implementability  Structure  Total  Applied  Deferred
+  1      {n}            {n}              {n}       {n}     {n}       {n}
+  2      {n}            {n}              {n}       {n}     {n}       {n}
+  3      {n}            {n}              {n}       {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Bead Status
 
