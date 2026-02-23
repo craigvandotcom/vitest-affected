@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { buildFullGraph, createResolver, resolveFileImports } from './builder.js';
+import { buildFullGraph, buildFullGraphSync, createResolver, resolveFileImports } from './builder.js';
 
 // ---------------------------------------------------------------------------
 // Disk format v1
@@ -213,4 +213,190 @@ export async function saveGraph(
   const tmpPath = path.join(cacheDir, `.tmp-${rand}`);
   writeFileSync(tmpPath, json, 'utf-8');
   renameSync(tmpPath, path.join(cacheDir, GRAPH_FILE));
+}
+
+// ---------------------------------------------------------------------------
+// Sync variants — required for onFilterWatchedSpecification (synchronous hook)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stat loop returning mtime map.
+ * Accepts any Iterable<string> (designed for `forward.keys()`).
+ * Skips files that throw ENOENT gracefully.
+ */
+export function statAllFiles(files: Iterable<string>): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const file of files) {
+    try {
+      result.set(file, lstatSync(file).mtimeMs);
+    } catch {
+      // ENOENT or other error — skip
+    }
+  }
+  return result;
+}
+
+/**
+ * Pure function comparing two mtime maps.
+ * - changed: files present in both maps with different mtimes
+ * - added:   files present in currentMtimes but not in cachedMtimes
+ * - deleted: files present in cachedMtimes but not in currentMtimes
+ */
+export function diffGraphMtimes(
+  cachedMtimes: Map<string, number>,
+  currentMtimes: Map<string, number>,
+): { changed: string[]; added: string[]; deleted: string[] } {
+  const changed: string[] = [];
+  const added: string[] = [];
+  const deleted: string[] = [];
+
+  for (const [file, currentMtime] of currentMtimes) {
+    if (!cachedMtimes.has(file)) {
+      added.push(file);
+    } else if (cachedMtimes.get(file) !== currentMtime) {
+      changed.push(file);
+    }
+  }
+
+  for (const file of cachedMtimes.keys()) {
+    if (!currentMtimes.has(file)) {
+      deleted.push(file);
+    }
+  }
+
+  return { changed, added, deleted };
+}
+
+/**
+ * Read mtime map from cached `graph.json` file.
+ * Returns empty Map on ENOENT (cache file missing) or JSON.parse error.
+ * Extracts `files[path].mtime` entries from the cache format.
+ */
+export function loadCachedMtimes(cacheDir: string): Map<string, number> {
+  const cachePath = path.join(cacheDir, GRAPH_FILE);
+  try {
+    const raw = readFileSync(cachePath, 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      (parsed as CacheDiskFormat).version !== CACHE_VERSION
+    ) {
+      return new Map();
+    }
+    const disk = parsed as CacheDiskFormat;
+    const result = new Map<string, number>();
+    for (const [filePath, entry] of Object.entries(disk.files)) {
+      result.set(filePath, entry.mtime);
+    }
+    return result;
+  } catch {
+    // ENOENT or JSON.parse error
+    return new Map();
+  }
+}
+
+/**
+ * Sync cache persistence.
+ * Uses same atomic write pattern (temp file → renameSync).
+ * If `mtimes` is provided, use it instead of stat-ing files again.
+ * If not provided, calls `statAllFiles` internally.
+ * Note: second stat pass per batch — accepted for simpler API surface.
+ */
+export function saveGraphSyncInternal(
+  forward: Map<string, Set<string>>,
+  cacheDir: string,
+  mtimes?: Map<string, number>,
+): void {
+  mkdirSync(cacheDir, { recursive: true });
+
+  const resolvedMtimes = mtimes ?? statAllFiles(forward.keys());
+
+  const files: Record<string, CacheFileEntry> = {};
+  for (const [filePath, imports] of forward) {
+    files[filePath] = {
+      mtime: resolvedMtimes.get(filePath) ?? 0,
+      imports: [...imports],
+    };
+  }
+
+  const payload: CacheDiskFormat = {
+    version: CACHE_VERSION,
+    builtAt: Date.now(),
+    files,
+  };
+
+  const json = JSON.stringify(payload);
+
+  // Atomic write: write to temp file in same directory, then rename
+  const rand = Math.random().toString(36).slice(2);
+  const tmpPath = path.join(cacheDir, `.tmp-${rand}`);
+  writeFileSync(tmpPath, json, 'utf-8');
+  renameSync(tmpPath, path.join(cacheDir, GRAPH_FILE));
+}
+
+/**
+ * Sync cache-aware graph loading.
+ * On cache miss/error: calls `buildFullGraphSync` for FULL REBUILD.
+ * On cache hit: checks if ANY file has changed mtime — if so, FULL REBUILD.
+ * On cache hit with NO stale files: rebuilds from cached entries.
+ *
+ * CRITICAL: The sync variant does FULL REBUILD on any staleness,
+ * NOT incremental per-file reparse like the async version.
+ * This is intentional — simpler, and ~166ms is acceptable for watch mode.
+ */
+export function loadOrBuildGraphSync(
+  rootDir: string,
+  cacheDir: string,
+): {
+  forward: Map<string, Set<string>>;
+  reverse: Map<string, Set<string>>;
+} {
+  // Clean up orphaned temp files
+  cleanupOrphanedTmp(cacheDir);
+
+  const cachePath = path.join(cacheDir, GRAPH_FILE);
+
+  // --- Attempt cache read ---
+  let disk: CacheDiskFormat | null = null;
+  try {
+    const raw = readFileSync(cachePath, 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      (parsed as CacheDiskFormat).version === CACHE_VERSION
+    ) {
+      disk = parsed as CacheDiskFormat;
+    }
+  } catch {
+    // ENOENT or JSON.parse error → fall through to full rebuild
+  }
+
+  if (disk === null) {
+    // Cache miss — full rebuild
+    return buildFullGraphSync(rootDir);
+  }
+
+  // --- Cache hit: check if any file is stale ---
+  const cachedMtimes = new Map<string, number>();
+  for (const [filePath, entry] of Object.entries(disk.files)) {
+    cachedMtimes.set(filePath, entry.mtime);
+  }
+
+  const currentMtimes = statAllFiles(cachedMtimes.keys());
+  const { changed, added, deleted } = diffGraphMtimes(cachedMtimes, currentMtimes);
+
+  if (changed.length > 0 || added.length > 0 || deleted.length > 0) {
+    // Any staleness → full rebuild
+    return buildFullGraphSync(rootDir);
+  }
+
+  // --- No changes — rebuild maps from cached entries ---
+  const entries = new Map<string, string[]>();
+  for (const [filePath, entry] of Object.entries(disk.files)) {
+    entries.set(filePath, entry.imports);
+  }
+
+  return entriestoMaps(entries);
 }

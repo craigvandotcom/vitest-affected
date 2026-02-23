@@ -1,5 +1,5 @@
 /// <reference types="vitest/config" />
-import { describe, test, expect, afterEach } from 'vitest';
+import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,7 +7,22 @@ import { vitestAffected } from '../src/plugin.js';
 
 const tempDirs: string[] = [];
 
+// The plugin checks VITEST_AFFECTED_DISABLED env var. When the outer test runner
+// uses VITEST_AFFECTED_DISABLED=1 to run the full suite, it leaks into the child
+// test process and disables the plugin under test. Save and restore it.
+let savedEnv: string | undefined;
+
+beforeEach(() => {
+  savedEnv = process.env.VITEST_AFFECTED_DISABLED;
+  delete process.env.VITEST_AFFECTED_DISABLED;
+});
+
 afterEach(() => {
+  if (savedEnv !== undefined) {
+    process.env.VITEST_AFFECTED_DISABLED = savedEnv;
+  } else {
+    delete process.env.VITEST_AFFECTED_DISABLED;
+  }
   for (const dir of tempDirs) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
@@ -67,7 +82,6 @@ describe('allowNoTests option', () => {
 
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
 
-    // The plugin's configureVitest hook is on the returned object
     const hook = (plugin as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
