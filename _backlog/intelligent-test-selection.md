@@ -213,7 +213,7 @@ Without cache restoration, Phase 1 still provides full benefit (graph build is f
 
 ### Options Interface
 
-Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true). Phase 3 adds `coverage?: boolean` (default: false, opt-in).
+Phase 1 options only. Phase 2 adds `cache?: boolean` (default: true) and `allowNoTests`. Phase 3 adds `coverage?: boolean` (default: false, opt-in).
 
 ```typescript
 export interface VitestAffectedOptions {
@@ -223,6 +223,7 @@ export interface VitestAffectedOptions {
   verbose?: boolean;       // Log graph build time, changed files, affected tests
   threshold?: number;      // Run full suite if affected ratio > threshold (0-1, default 1.0 = disabled)
   allowNoTests?: boolean;  // If true, allow selecting 0 tests (default: false — runs full suite instead)
+  cache?: boolean;         // (Phase 2) Persist graph to disk (default: true)
 }
 ```
 
@@ -720,27 +721,39 @@ async function getChangedFiles(rootDir: string, ref?: string): Promise<{ changed
 # Phase 2: Watch Mode + Caching
 
 **Depends on:** Phase 1 (Static Import Graph)
-**Effort:** Days-weeks
+**Effort:** Days
 **New file:** `src/graph/cache.ts`
 **New deps:** None (mtime-only invalidation)
 
-**Deliverable split:** Phase 2a (caching, one-shot) ships first. Phase 2b (watch mode) layers on top.
-
 ## Goal
 
-Persist the dependency graph across runs for fast startup (Phase 2a), then make vitest-affected work in watch mode (Phase 2b).
+Persist the dependency graph across runs for fast startup, then make vitest-affected work in watch mode. Ships as a single unit — caching alone saves ~100ms, not a shippable improvement; the real value is watch mode.
+
+**Key simplification:** Full graph rebuild (166ms for 433 files) is fast enough for watch mode. No incremental graph updates (`updateGraphForFiles`) needed. Cache saves cold-start time; full rebuild handles all change types including deletions. Add incremental updates only when profiling on a 2000+ file project proves they're needed.
 
 **Deferred to Phase 3+:**
 - **Verify mode** — diagnostic for static-analysis misses, but the fix (coverage data) doesn't exist until Phase 3.
 - **Rename detection** — Phase 1's full-suite fallback on renames is correct and safe.
+- **Incremental graph updates** — premature optimization at current project sizes.
 
-## Phase 2a: Graph Caching (One-Shot)
+## Prerequisites
+
+Before starting Phase 2 implementation:
+
+1. **Bump peerDep** from `>=3.1.0` to `>=3.2.0` in `package.json` (required for `onAfterSetServer` in watch mode).
+2. **Add `allowNoTests`** to `VitestAffectedOptions` and implement the zero-test branch in `plugin.ts`:
+   ```typescript
+   allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
+   ```
+3. **Retain `forward` map** in `plugin.ts` — currently destructured as `const { reverse } = await buildFullGraph(rootDir)`, but `forward` is needed for cache serialization. Change to `const { forward, reverse } = ...`.
+
+## Graph Caching
 
 ### New file: `src/graph/cache.ts`
 
-Single file handling graph persistence, cache-aware loading, and incremental updates.
+Single file handling graph persistence and cache-aware loading.
 
-#### Disk Format
+### Disk Format
 
 ```json
 {
@@ -757,61 +770,82 @@ Single file handling graph persistence, cache-aware loading, and incremental upd
 
 Stored at `.vitest-affected/graph.json` (gitignored). Auto-create directory on first write.
 
-#### Public API
+### Public API
 
 ```typescript
-import type { ResolverFactory } from 'oxc-resolver';
-
-export interface GraphSnapshot {
+function loadOrBuildGraph(rootDir: string, verbose: boolean): Promise<{
   forward: Map<string, Set<string>>;
   reverse: Map<string, Set<string>>;
-  fileMtimes: Map<string, number>;
-  builtAt: number;
-}
+}>;
 
-function loadOrBuildGraph(rootDir: string, verbose: boolean): Promise<GraphSnapshot>;
-function saveGraph(snapshot: GraphSnapshot, cacheDir: string): Promise<void>;
-function saveGraphSync(snapshot: GraphSnapshot, cacheDir: string): void;
+function saveGraph(
+  forward: Map<string, Set<string>>,
+  cacheDir: string,
+): Promise<void>;
 ```
 
-**Phase 2b adds `updateGraphForFiles`** (not needed for one-shot caching):
+No `GraphSnapshot` type — keep Phase 1's `{ forward, reverse }` return type. Mtime tracking is internal to cache load/save logic, not exposed in the in-memory API.
+
+**Sync variants for watch mode:**
 
 ```typescript
-function updateGraphForFiles(
-  snapshot: GraphSnapshot,
-  changedFiles: string[],
-  deletedFiles: string[],
-  rootDir: string,
-  resolver: ResolverFactory
-): GraphSnapshot;  // NOTE: synchronous — all I/O uses readFileSync + parseSync + resolver.sync()
+// Sync version for onFilterWatchedSpecification callback.
+// Same return type as async — changedFiles computed separately.
+function loadOrBuildGraphSync(rootDir: string, cacheDir: string): {
+  forward: Map<string, Set<string>>;
+  reverse: Map<string, Set<string>>;
+};
+
+// Pure function: diff old cached mtimes against freshly-statted files.
+// Returns files that changed, were added, or were deleted since last cache.
+function diffGraphMtimes(
+  cachedMtimes: Map<string, number>,   // from previous cache load
+  currentMtimes: Map<string, number>,  // from fresh stat pass
+): { changed: string[]; added: string[]; deleted: string[] };
+
+// Internal: persist cache synchronously after watch-mode rebuild.
+function saveGraphSyncInternal(forward: Map<string, Set<string>>, cacheDir: string): void;
 ```
 
-**Deletion logic for `updateGraphForFiles`:** For each file in `deletedFiles`: capture `reverse.get(file)` FIRST (these dependents become BFS seeds), then remove from `forward` map, remove from all `reverse` value sets, remove from `fileMtimes`. For each file in `changedFiles`: call `resolveFileImports` to get new imports, replace old forward edges, update reverse edges (remove stale, add new), update mtime. Return updated snapshot.
+**Design note:** `diffGraphMtimes` is a separate pure function (not bundled into `loadOrBuildGraphSync`) for testability and cohesion. The watch-mode pipeline is: load cache → stat files → `diffGraphMtimes` → rebuild graph → BFS from `changed + added` → save cache.
 
-#### Invalidation: mtime-only
+No `saveGraphSync` on shutdown — graph is saved after each rebuild, not on exit.
 
-Check file mtime via `lstat`. If mtime changed, reparse. If unchanged, skip. mtime-only is sufficient on modern filesystems (ext4, APFS, NTFS have sub-second granularity). The unlikely edge case of content change within the same mtime tick fails safe (causes one stale BFS result that over-selects, never under-selects).
+### Invalidation: mtime-only
 
-#### Phase 1 Integration
+On cache hit: stat each file in `files` via `lstat`. If mtime changed, reparse that file only. If unchanged, skip. Rebuild forward + reverse maps from the (partially refreshed) file entries. mtime-only is sufficient on modern filesystems (ext4, APFS, NTFS have sub-second granularity). Edge case: content change within the same mtime tick is undetected — the file appears unchanged, so its dependents are not selected (under-selects). This is extremely rare on modern filesystems and is addressed by Phase 3 coverage data. Operations that preserve original mtimes (e.g., `git stash pop`) are caught on initial run via git diff but may be missed in subsequent watch batches.
 
-`buildFullGraph(rootDir)` returns `{ forward, reverse }` without mtimes. `loadOrBuildGraph` wraps this: on cache miss, calls `buildFullGraph`, then stats all files to collect mtimes. The file list comes from `forward.keys()`.
+### Phase 1 Integration
 
-### Implementation Steps (2a)
+`buildFullGraph(rootDir)` returns `{ forward, reverse }` without mtimes. `loadOrBuildGraph` wraps this: on cache miss, calls `buildFullGraph`, then stats all files to collect mtimes (from `forward.keys()`). On cache hit, stats files and reparses only changed ones.
 
-1. **Export `resolveFileImports` and `createResolver` from `builder.ts`** (if not already done in Phase 1).
-2. **Implement `cache.ts`** — `loadOrBuildGraph`, `saveGraph`, `saveGraphSync`. Atomic writes via write-then-rename.
-3. **Update `plugin.ts`** — Replace `buildFullGraph(rootDir)` with `loadOrBuildGraph(rootDir, verbose)`.
-4. **Tests** — Cache round-trip, corrupt cache recovery, mtime invalidation, `saveGraphSync` atomicity.
+**Note:** `buildFullGraph` reads every file but discards mtimes. The additional stat pass on cache miss is ~500 syscalls for a 500-file project (~5ms). Not worth optimizing until profiling warrants it.
 
-## Phase 2b: Watch Mode
+### Atomic Writes
 
-### How It Works
+Write to a temp file in the same directory, then `renameSync` to `graph.json`. Same-directory rename is atomic on all major filesystems. Never write to `/tmp` then rename cross-filesystem.
 
-Vitest uses Vite's built-in file watcher (chokidar). On file change:
-1. Vite HMR detects the change
-2. Vitest calls `onFilterWatchedSpecification` for each test spec
-3. Specs returning `false` are excluded from the re-run
-4. Vitest re-runs remaining specs with a ~100ms debounce
+### Cache Recovery
+
+On any cache read failure — `ENOENT` (missing `graph.json`, e.g., process killed between `mkdirSync` and `renameSync`), `JSON.parse` error (truncated file), or unknown `version` — log a warning and fall back to full rebuild. Clean up orphaned `.tmp-*` files in the cache directory on startup. No crash, no data loss.
+
+## Watch Mode
+
+### Critical Design Constraint: `onFilterWatchedSpecification` is Subtractive-Only
+
+`onFilterWatchedSpecification` can **remove** specs from Vitest's rerun list but **cannot add** specs Vitest missed. This means:
+
+- **Vitest's runtime module graph** determines which tests are CANDIDATES for rerun (the "add" side)
+- **Our static graph** acts as a REFINEMENT filter — removing false positives from Vitest's selection (the "subtract" side)
+- After the initial run, Vite's runtime module graph is populated with all loaded modules, so it catches dynamic imports, HMR dependencies, etc.
+
+**Safety invariant in watch mode:** Return `true` (keep spec) when EITHER:
+1. Our BFS says the spec is affected, OR
+2. The spec's module is not in our graph (conservative: never filter unknown tests)
+
+Only return `false` when our graph CONFIRMS the test has no reverse-path to any changed file.
+
+**Limitation acknowledged:** If our static graph catches a dependency that Vitest's runtime module graph doesn't (rare — Vite's graph is runtime-complete after initial load), that test cannot be added to the rerun list. This is no worse than running without the plugin. Phase 3 coverage data partially addresses this.
 
 ### Key API: `vitest.onFilterWatchedSpecification`
 
@@ -820,110 +854,112 @@ Vitest uses Vite's built-in file watcher (chokidar). On file change:
 // Called ONLY during watch-triggered reruns, NOT on initial run
 // Multiple plugins: AND-ed (all must return true to keep a spec)
 vitest.onFilterWatchedSpecification((spec: TestSpecification) => {
-  return affectedTestSet.has(spec.moduleId);
+  // CRITICAL: spec.moduleId may include query strings (?v=123) or \0 prefixes
+  // from Vite's module graph. Strip these before graph lookup, otherwise the
+  // filter becomes a no-op (every spec falls through to conservative true).
+  const moduleId = normalizeModuleId(spec.moduleId);
+  // Conservative: keep specs not in our graph
+  if (!graph.has(moduleId)) return true;
+  return affectedTestSet.has(moduleId);
 });
-```
 
-### Architecture: Lazy Graph Update + Set Lookup
-
-Vitest's `VitestWatcher` already hooks chokidar, tracks changed files, and debounces at ~100ms before calling `onFilterWatchedSpecification` per spec. Do NOT duplicate this event machinery. Instead:
-
-1. **Watcher event fires** → record changed file path in a `dirtyFiles: Set<string>`
-2. **Vitest debounce expires** → calls `onFilterWatchedSpecification` per spec
-3. **First filter call per batch** → detect dirty set is non-empty, update graph synchronously, compute BFS, cache result in `currentAffectedSet`, clear dirty set
-4. **Subsequent filter calls** → `Set.has()` lookup
-
-Graph updates are fully synchronous: `readFileSync` + `parseSync` (oxc-parser) + `resolver.sync()` (oxc-resolver). Single-file update is ~0.5ms — well within Vitest's debounce window.
-
-### Watcher Registration
-
-```typescript
-// Capture ORIGINAL include patterns BEFORE Phase 1 mutates project.config.include.
-const originalInclude = [...project.config.include];
-const originalExclude = [...(project.config.exclude ?? [])];
-
-const dirtyFiles = new Set<string>();
-let currentAffectedSet: Set<string> | null = null;
-let testFilesDirty = false;
-
-let testFileSet = new Set(await glob(originalInclude, {
-  cwd: rootDir, absolute: true, ignore: [...originalExclude, '**/node_modules/**'],
-}));
-
-function updateGraphAndBFS(): void {
-  if (dirtyFiles.size === 0) return;
-
-  const changed = [...dirtyFiles];
-  dirtyFiles.clear();
-
-  const bfsSeeds: string[] = [];
-  for (const file of changed) {
-    const source = readFileSyncSafe(file);
-    if (source === null) {
-      // File deleted — capture reverse edges BEFORE removal
-      const dependents = snapshot.reverse.get(file);
-      if (dependents) bfsSeeds.push(...dependents);
-      snapshot = updateGraphForFiles(snapshot, [], [file], rootDir, resolver);
-      testFileSet.delete(file);
-      continue;
-    }
-    snapshot = updateGraphForFiles(snapshot, [file], [], rootDir, resolver);
-    bfsSeeds.push(file);
-  }
-
-  if (testFilesDirty) {
-    testFileSet = new Set(globSync(originalInclude, {
-      cwd: rootDir, absolute: true, ignore: [...originalExclude, '**/node_modules/**'],
-    }));
-    testFilesDirty = false;
-  }
-
-  const isTestFile = (f: string) => testFileSet.has(f);
-  const affected = bfsAffectedTests(bfsSeeds, snapshot.reverse, isTestFile);
-  currentAffectedSet = new Set(affected);
+// Normalize Vite module IDs to match graph keys (absolute file paths)
+function normalizeModuleId(id: string): string {
+  // Strip \0 prefix (Vite virtual module marker)
+  if (id.startsWith('\0')) id = id.slice(1);
+  // Strip Vite dev server prefixes (/@fs/ for files outside root, /@id/ for pre-bundled)
+  if (id.includes('/@fs/')) id = id.slice(id.indexOf('/@fs/') + 4);
+  else if (id.includes('/@id/')) return id; // pre-bundled dep — not in our graph, conservative true
+  // Strip query string (?v=123, ?import, etc.)
+  const qIdx = id.indexOf('?');
+  if (qIdx !== -1) id = id.slice(0, qIdx);
+  return id;
 }
 ```
+
+### Architecture: Full Rebuild + Set Lookup
+
+No custom watcher registration. No incremental graph updates. No parallel test file tracking. Vitest's own watcher handles all file system events; we only provide the BFS filter.
+
+On each watch-triggered rerun batch:
+1. **Vitest's watcher** detects changes, debounces (~100ms), builds `changedTests` list from runtime module graph
+2. **`onFilterWatchedSpecification`** fires per spec — on first call per batch:
+   - Rebuild full graph synchronously (166ms for 433 files)
+   - Determine changed files (compare mtimes against cached graph, or use git diff)
+   - BFS from changed files → `currentAffectedSet`
+3. **Filter each spec:** `return currentAffectedSet.has(spec.moduleId) || !graph.has(spec.moduleId)`
+
+### Detecting Changed Files in Watch Mode
+
+The filter callback receives specs but not which files triggered the rerun. Strategy: **diff the rebuilt graph against cached graph mtimes.**
+
+The cache stores `{ mtime, imports }` per file. On each watch-triggered rebuild:
+1. Load cached mtimes from the previous graph save
+2. Rebuild full graph (which stats all files for the new cache)
+3. **Changed files** = files whose current mtime differs from cached mtime
+4. **New files** = files present in the rebuilt graph but absent from the cached graph (catches newly created files)
+5. **Deleted files** = files present in the cached graph but absent from the rebuilt graph
+
+This reuses the cache's existing mtime data — no separate `detectChangedByMtime` function. The diff is a simple set comparison between old and new file entries during `loadOrBuildGraph`.
 
 ### Plugin Structure (Watch Mode)
 
 ```typescript
 async configureVitest({ vitest, project }) {
-  // ... load graph ...
+  // Capture ORIGINAL include patterns BEFORE one-shot logic mutates project.config.include.
+  const originalInclude = [...project.config.include];
+  const originalExclude = [...(project.config.exclude ?? [])];
+
+  // Load cached graph (or full rebuild on cache miss)
+  let { forward, reverse } = await loadOrBuildGraph(rootDir, verbose);
+  await saveGraph(forward, cacheDir);
 
   if (vitest.config.watch) {
+    let currentAffectedSet: Set<string> | null = null;
+    let lastRunAt = Date.now();
+
     vitest.onFilterWatchedSpecification((spec) => {
-      updateGraphAndBFS();  // No-op if dirtyFiles is empty
-      if (!currentAffectedSet) return true;  // null = run everything (safe)
-      return currentAffectedSet.has(spec.moduleId);
+      // Staleness check: reset affected set if enough time has passed
+      // since last computation (handles rapid-save batches correctly)
+      if (currentAffectedSet && Date.now() - lastRunAt > 500) {
+        currentAffectedSet = null;
+      }
+
+      if (!currentAffectedSet) {
+        // First filter call in this batch — rebuild and detect changes
+        const oldMtimes = loadCachedMtimes(cacheDir);  // from previous graph.json
+        const { forward: newForward, reverse: newReverse } =
+          loadOrBuildGraphSync(rootDir, cacheDir);
+        forward = newForward;
+        reverse = newReverse;
+
+        // Diff old vs new mtimes to find changed/added/deleted files
+        const currentMtimes = statAllFiles(forward.keys());
+        const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
+        const bfsSeeds = [...changed, ...added];  // deleted files: not in new graph, no BFS needed
+
+        // Glob test files using original patterns (not mutated config.include)
+        const testFiles = globSync(originalInclude, {
+          cwd: rootDir, absolute: true,
+          ignore: [...originalExclude, '**/node_modules/**'],
+        });
+        const testFileSet = new Set(testFiles);
+
+        const affected = bfsAffectedTests(bfsSeeds, reverse, f => testFileSet.has(f));
+        currentAffectedSet = new Set(affected);
+        lastRunAt = Date.now();
+
+        // Persist updated cache (with new mtimes) for next batch
+        saveGraphSyncInternal(forward, cacheDir);
+      }
+
+      // CRITICAL: normalize spec.moduleId before lookup (strip ?query, \0 prefix)
+      const moduleId = normalizeModuleId(spec.moduleId);
+
+      // Conservative: keep specs not in our graph (never filter unknown tests)
+      if (!forward.has(moduleId)) return true;
+      return currentAffectedSet.has(moduleId);
     });
-
-    // Defer watcher access — vitest.vite may not be initialized at configureVitest time.
-    if (typeof vitest.onAfterSetServer === 'function') {
-      vitest.onAfterSetServer(() => {
-        const watcher = vitest.vite?.watcher;
-        if (watcher) {
-          for (const event of ['change', 'add', 'unlink'] as const) {
-            watcher.on(event, (filePath: string) => {
-              const absPath = path.resolve(rootDir, filePath);
-              dirtyFiles.add(absPath);
-              currentAffectedSet = null;  // Invalidate
-              if (event === 'add' || event === 'unlink') testFilesDirty = true;
-            });
-          }
-        } else {
-          console.warn('[vitest-affected] No file watcher — watch filtering disabled');
-        }
-      });
-    } else {
-      console.warn('[vitest-affected] onAfterSetServer not available — watch filtering disabled');
-    }
-
-    // Graceful shutdown: persist graph on exit (sync to avoid teardownTimeout race)
-    if (typeof vitest.onClose === 'function') {
-      vitest.onClose(() => {
-        saveGraphSync(snapshot, cacheDir);
-      });
-    }
   }
 
   // One-shot logic runs UNCONDITIONALLY (handles initial run in both modes)
@@ -932,26 +968,48 @@ async configureVitest({ vitest, project }) {
 }
 ```
 
-### Implementation Steps (2b)
+### Synchronous Rebuild
 
-5. **Implement `updateGraphForFiles` in `cache.ts`** — Synchronous incremental graph update.
-6. **Smart deletion handling** — With cached graph, BFS from deleted files' former dependents instead of full-suite fallback.
-7. **Remove watch mode guard from `plugin.ts`** — Replace with `onFilterWatchedSpecification` + lazy graph update.
-8. **Add watcher registration** — Single `onAfterSetServer` callback.
-9. **Add `updateGraphAndBFS` function** — Synchronous graph update + BFS on first filter call per batch.
-10. **Add graceful shutdown** — `vitest.onClose()` → `saveGraphSync`.
-11. **Tests** — Mock watcher events + filter calls, graph update correctness, deleted-file propagation, cache persistence on close.
+`buildFullGraph` is currently async (uses `readFile` and `glob`). For the synchronous filter callback, either:
+1. **Add a `buildFullGraphSync` variant** using `readFileSync` + `globSync` (straightforward — parse/resolve core is already sync)
+2. **Make `buildFullGraph` accept a `sync: boolean` flag** to avoid two separate functions (one code path, internal branching)
+
+Choose at implementation time. The key constraint: `onFilterWatchedSpecification` is synchronous, so the graph build must complete synchronously within the callback.
+
+**Performance ceiling:** 166ms for 433 files. Scales linearly (~0.38ms/file). For 1500+ file projects, this exceeds 500ms — at that point, add a time limit (e.g., 300ms) and fall back to pass-through filter (return `true` for all specs) with a warning recommending incremental updates. This ensures IDE integrations (VS Code Vitest extension) don't freeze.
+
+### Batch Reset via Timestamp Heuristic
+
+`currentAffectedSet` resets to `null` when `Date.now() - lastRunAt > 500ms`. This is simpler than hooking into Vitest lifecycle events (which would require `onAfterSetServer`, an `@internal` API). The 500ms threshold is:
+- **Longer than Vitest's debounce** (~100ms) — won't reset mid-batch
+- **Shorter than typical edit cycles** — catches the next save
+
+Edge case: two saves within 500ms (auto-save) may reuse a stale affected set. This is conservative — it runs tests from the first save's computation, which over-selects rather than under-selects. The next batch (>500ms later) picks up the second save's changes.
+
+## Implementation Steps
+
+1. **Prerequisites** — Bump peerDep to `>=3.2.0`, add `allowNoTests` option, change `const { reverse }` to `const { forward, reverse }` in plugin.ts.
+2. **Implement `cache.ts`** — `loadOrBuildGraph` (async, for initial load), `loadOrBuildGraphSync` (sync, for watch mode), `saveGraph` (async), `saveGraphSyncInternal`, `diffGraphMtimes` (pure function: old mtimes vs new mtimes → `{ changed, added, deleted }`), `loadCachedMtimes` (read mtime map from cache file). Atomic writes via same-directory write-then-rename. Cache recovery: ENOENT → full rebuild, JSON.parse error → full rebuild, orphaned `.tmp-*` cleanup on startup.
+3. **Update `plugin.ts`** — Replace `buildFullGraph(rootDir)` with `loadOrBuildGraph(rootDir, verbose)`. Save graph after load.
+4. **Add sync graph builder** — Either `buildFullGraphSync` variant or sync flag on `buildFullGraph`. Uses `readFileSync` + `globSync`. Share `resolveFileImports` and `createResolver` with the async version.
+5. **Add `normalizeModuleId` helper** — Strip `\0` prefixes, `/@fs/` Vite dev server prefixes, and `?query` strings from `spec.moduleId` before graph lookup. Without this, watch-mode filtering is a no-op. Handle `/@id/` (pre-bundled deps) by returning the raw ID (will fall through to conservative `true`).
+6. **Remove watch mode guard from `plugin.ts`** — Replace the `if (vitest.config.watch) return` guard with `onFilterWatchedSpecification` registration + full-rebuild filter + timestamp-based batch reset.
+7. **Add performance ceiling** — Time the sync graph build; if it exceeds 300ms, fall back to pass-through filter (return `true` for all specs) with a warning.
+8. **Tests** — Cache round-trip, corrupt cache recovery (ENOENT + JSON.parse), mtime invalidation, cache diff (new files detected, changed files detected, deleted files detected), `normalizeModuleId` (query strings, `\0` prefix), filter callback behavior (affected specs filtered, unknown specs kept, conservative fallback, batch reset on staleness).
 
 ## Known Limitations (Phase 2)
 
-- **`onFilterWatchedSpecification` AND semantics:** If another plugin registers a filter, results are AND-ed.
-- **`vitest.vite?.watcher` availability:** May be undefined in `browser` mode. Watch filtering silently disables.
-- **`vitest.vite` at `configureVitest` time:** Not available. Watcher registration deferred to `onAfterSetServer()`.
-- **Synchronous graph update cost:** Single-file ~0.5ms. Batch of 20 = ~10ms. Well within debounce.
-- **`globSync` in filter callback:** Re-globs test files synchronously. ~5-10ms, runs once per batch, not per spec.
-- **Mtime-only invalidation:** `touch` without edit causes unnecessary reparse (~0.5ms per file).
-- **`onAfterSetServer` is `@internal`:** Runtime check with fallback.
-- **Cache version migration:** Unknown `version` triggers full rebuild.
+- **`onFilterWatchedSpecification` is subtractive-only:** Cannot add tests Vitest's runtime graph missed. If our static graph catches a dependency that Vitest's runtime module graph doesn't, that test is missed in watch mode. No worse than running without the plugin. Phase 3 coverage data partially addresses this.
+- **`spec.moduleId` normalization required:** Vite may append query strings (`?v=123`) or prefix with `\0` (virtual modules). Without `normalizeModuleId`, the filter becomes a no-op — every spec falls through to the conservative `return true`. This is safe but defeats the purpose.
+- **New test files in watch mode:** Detected as "new" by cache diff (present in rebuilt graph but absent from cached graph). `onFilterWatchedSpecification` conservatively returns `true` (spec not in graph → keep it), so new tests DO run on their first trigger. However, if Vitest's runtime graph hasn't loaded the test yet, it may not appear in the candidate list at all — this is Vitest's native behavior, not a regression.
+- **Full rebuild cost in watch mode:** 166ms per batch on 433 files (~0.38ms/file, scales linearly). For 1500+ file projects, exceeds 500ms. Performance ceiling (300ms) triggers pass-through fallback with a warning. Add incremental updates (`updateGraphForFiles`) at that point, backed by profiling data — not before.
+- **Batch reset via timestamp heuristic:** Two saves within 500ms may reuse a stale affected set. Over-selects (safe), never under-selects. Next batch (>500ms later) picks up missed changes.
+- **`onFilterWatchedSpecification` AND semantics:** If another plugin registers a filter, results are AND-ed. Our conservative `true` for unknown specs avoids conflicting with other filters.
+- **Mtime-only invalidation:** `touch` without edit causes unnecessary reparse (~0.5ms per file). Not worth hashing.
+- **Cache version migration:** Unknown `version` triggers full rebuild (safe).
+- **Stale resolver on tsconfig change:** Not an issue — full rebuild creates a fresh resolver each time via `createResolver(rootDir)`.
+- **Git diff vs mtime diff inconsistency:** Initial run uses git diff (catches all VCS changes); subsequent watch batches use mtime comparison (catches disk changes). Operations that preserve original mtimes (e.g., `git stash pop`) are caught on initial run but may be missed in watch mode. Restarting vitest picks them up.
+- **Sync code path duplication:** Watch mode requires sync I/O (`readFileSync`, `globSync`, `parseSync`) because `onFilterWatchedSpecification` is synchronous. This duplicates the async pipeline used for initial load. Investigate async pre-computation hooks at implementation time to potentially avoid the duplication. If unavoidable, document as the primary refactor target for a future release.
 
 ---
 
@@ -1193,18 +1251,18 @@ Coverage adds edges static missed. Static keeps edges coverage missed. Result: m
 
 | Phase 1 produces | Phase 2 consumes |
 |---|---|
-| `buildFullGraph(rootDir)` → `{ forward, reverse }` | `loadOrBuildGraph` wraps this, adds mtime layer |
-| `resolveFileImports(file, source, rootDir, resolver)` | `updateGraphForFiles` calls this for incremental updates |
-| `createResolver(rootDir)` | Shared resolver instance across graph ops |
-| `bfsAffectedTests(changed, reverse, isTestFile)` | Reused in watch mode `updateGraphAndBFS` |
+| `buildFullGraph(rootDir)` → `{ forward, reverse }` | `loadOrBuildGraph` wraps this, adds mtime caching layer |
+| `bfsAffectedTests(changed, reverse, isTestFile)` | Reused in watch mode filter callback |
+
+Note: `resolveFileImports` and `createResolver` are exported from `builder.ts` for unit testing but are not cross-phase architectural contracts. Phase 2 consumes only `buildFullGraph` (and its sync variant).
 
 | Phase 2 produces | Phase 3 consumes |
 |---|---|
-| `GraphSnapshot` with `forward`, `reverse`, `fileMtimes`, `builtAt` | Extended with `coverageEdges?`, `coverageCollectedAt?` |
+| `{ forward, reverse }` (same as Phase 1, no new types) | Extended cache format with `coverageEdges?`, `coverageCollectedAt?` |
 | `loadOrBuildGraph` / `saveGraph` | Handles v1→v2 migration, serializes coverage edges |
 | `cache.ts` disk format (version 1) | Bumped to version 2 with coverage fields |
 | `tinyglobby` glob → `testFileSet` | Reused for coverage test-vs-source classification |
-| `saveGraph` / `saveGraphSync` | Phase 3 uses `saveGraphSync` for coverage reporter |
+| `normalizeModuleId` | Phase 3 reuses for spec ID normalization |
 
 ---
 
@@ -1309,3 +1367,31 @@ Our advantage: Start with static import graph analysis (cheap, fast, no overhead
 - **Changes:** 7 applied (1 Critical, 6 High)
 - **Key fixes:** Fixed `updateGraphForFiles` async→sync signature mismatch. Cached test file set with incremental updates. Captured original include patterns before Phase 1 config mutation. Added `saveGraphSync` to cache.ts API. Merged Phase 2b and Phase 3 `onAfterSetServer` into single callback. Deferred `updateGraphForFiles` to Phase 2b scope.
 - **Trajectory:** 1 Critical (Round 1 regression, fixed). All remaining Medium. → finalize
+
+### Phase 2 Post-Implementation: Round 1 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 9 auto-applied (4 Critical, 5 High) — all changes met severity or consensus thresholds
+- **Key fixes:** Rewrote Phase 2 architecture: removed `updateGraphForFiles` incremental updates (full rebuild 166ms is fast enough), removed custom watcher registration (fights Vitest's own watcher), removed `GraphSnapshot` type and `saveGraphSync`/shutdown persistence, collapsed 2a/2b into single phase. Documented `onFilterWatchedSpecification` as subtractive-only with conservative fallback for unknown specs. Added prerequisites section (peerDep bump, `allowNoTests`, `forward` map retention). Updated cross-phase dependencies.
+- **Consensus:** All 3 agents agreed on removing incremental updates and custom watcher. Builder+Breaker agreed on peerDep bump. Breaker's critical finding (`onFilterWatchedSpecification` can't add tests) reshaped the entire watch mode architecture.
+- **Trajectory:** 4 Critical found → continue (fixes need verification)
+
+### Phase 2 Post-Implementation: Round 2 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 6 auto-applied (1 Critical, 5 High)
+- **Key fixes:** Added `spec.moduleId` normalization (`\0` prefix + query string stripping) — without it, watch filter is a no-op. Replaced `detectChangedByMtime` with cache-diff approach (diff rebuilt graph against cached mtimes, catches new files via set difference). Committed to timestamp heuristic (500ms) for batch reset, removed `onAfterSetServer` from Phase 2 (deferred to Phase 3). Added performance ceiling (300ms) with pass-through fallback for large projects. Added ENOENT + orphaned temp file handling to cache recovery. Updated cross-phase table.
+- **Consensus:** All 3 agents agreed `detectChangedByMtime` was flawed (under-specified/misses new files/duplicates git diff). All 3 agreed `onAfterSetServer` should be deferred. Breaker's critical `spec.moduleId` format mismatch was the most important finding.
+- **Trajectory:** 1 Critical found → continue (need Round 3 verification)
+
+### Phase 2 Post-Implementation: Round 3 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 5 applied (1 Critical, 2 High, 2 Medium factual fixes)
+- **Key fixes:** Added `/@fs/` and `/@id/` Vite prefix handling to `normalizeModuleId`. Separated `changedFiles` computation into pure `diffGraphMtimes` function (3/3 consensus on API asymmetry). Corrected false "over-selects" claim about same-mtime-tick edge case (actually under-selects). Specified `loadOrBuildGraphSync`, `saveGraphSyncInternal`, `loadCachedMtimes` in Public API. Added git-diff vs mtime-diff inconsistency and sync duplication as known limitations.
+- **Consensus:** Builder found zero Critical/High for first time. Breaker's `/@fs/` finding was the only Critical. All 3 flagged the `loadOrBuildGraphSync` spec gap. Trimmer confirmed all Round 1 cuts remain correct.
+- **Trajectory:** 1 Critical found (/@fs/ normalization) → fixed. Builder says "ready for beadification." Checking Round 4 for clean exit.
+
+### Phase 2 Post-Implementation: Round 4 (Medium: Builder/Breaker/Trimmer — 3x Opus) — FINAL
+
+- **Changes:** 0 (verification round)
+- **Result:** All 3 agents returned CLEAN. Builder: "ready for implementation." Breaker: "no breaks found." Trimmer: "appropriately scoped."
+- **Remaining Medium observations:** Sync/async code duplication (acknowledged as future refactor target), Windows drive-letter normalization after /@fs/ (not in Phase 2 scope), cross-phase export clarification (trivial).
+- **Trajectory:** 0 Critical, 0 High → **finalize**
