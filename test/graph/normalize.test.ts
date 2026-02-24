@@ -7,7 +7,12 @@ describe('normalizeModuleId', () => {
   });
 
   test('strips /@fs/ path prefix (Vite dev server prefix for files outside root)', () => {
-    expect(normalizeModuleId('/@fs/home/user/src/a.ts')).toBe('/home/user/src/a.ts');
+    // Vite encodes absolute paths as /@fs/<absolute-path> — so the real input has double-slash
+    expect(normalizeModuleId('/@fs//home/user/src/a.ts')).toBe('/home/user/src/a.ts');
+  });
+
+  test('strips /@fs/ without leaving double-slash (off-by-one regression)', () => {
+    expect(normalizeModuleId('/@fs//home/user/project/src/foo.ts')).toBe('/home/user/project/src/foo.ts');
   });
 
   test('returns /@id/ paths unchanged (pre-bundled dep — not in our graph)', () => {
@@ -19,7 +24,7 @@ describe('normalizeModuleId', () => {
   });
 
   test('handles combined prefixes: \\0 + /@fs/ + query string', () => {
-    expect(normalizeModuleId('\0/@fs/home/user/src/a.ts?query')).toBe('/home/user/src/a.ts');
+    expect(normalizeModuleId('\0/@fs//home/user/src/a.ts?query')).toBe('/home/user/src/a.ts');
   });
 
   test('passes through clean absolute paths unchanged', () => {

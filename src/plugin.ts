@@ -159,6 +159,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       const { reporter, setRootDir } = createRuntimeReporter((edges) => {
         if (!cacheDir) return;
         if (!reverse) return;
+        if (!forward) return;
         mergeRuntimeEdges(reverse, edges);
         // Accumulate runtime edges across watch batches
         if (!accumulatedRuntimeEdges) {

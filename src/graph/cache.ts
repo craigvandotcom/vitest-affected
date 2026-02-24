@@ -44,6 +44,17 @@ const GRAPH_FILE = 'graph.json';
 // ---------------------------------------------------------------------------
 
 /**
+ * JSON.parse reviver that rejects prototype-pollution keys.
+ * Applied to all cache file reads as a defense-in-depth measure.
+ */
+function safeJsonReviver(_key: string, value: unknown): unknown {
+  if (_key === '__proto__' || _key === 'constructor' || _key === 'prototype') {
+    return undefined;
+  }
+  return value;
+}
+
+/**
  * Clean up any orphaned `.tmp-*` files left by a previous interrupted write.
  */
 function cleanupOrphanedTmp(cacheDir: string): void {
@@ -169,7 +180,7 @@ export async function loadOrBuildGraph(
   let disk: CacheDiskFormat | null = null;
   try {
     const raw = await readFile(cachePath, 'utf-8');
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw, safeJsonReviver);
     if (
       typeof parsed === 'object' &&
       parsed !== null &&
@@ -220,16 +231,11 @@ export async function loadOrBuildGraph(
   let staleCount = 0;
 
   for (const [filePath, entry] of validFiles) {
-    // If file no longer exists, skip it (deleted between runs)
-    if (!existsSync(filePath)) {
-      continue;
-    }
-
     let currentMtime: number;
     try {
       currentMtime = lstatSync(filePath).mtimeMs;
     } catch {
-      // Can't stat → skip this file
+      // File no longer exists or can't stat → skip
       continue;
     }
 
@@ -353,13 +359,16 @@ export async function saveGraph(
   const cachePath = path.join(cacheDir, GRAPH_FILE);
   try {
     const raw = await readFile(cachePath, 'utf-8');
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw, safeJsonReviver);
     if (
       typeof parsed === 'object' &&
       parsed !== null &&
       (parsed as CacheDiskFormat).runtimeEdges !== undefined
     ) {
-      runtimeEdges = (parsed as CacheDiskFormat).runtimeEdges;
+      const existing = (parsed as CacheDiskFormat).runtimeEdges;
+      if (existing !== undefined && isValidRuntimeEdgesObject(existing)) {
+        runtimeEdges = pruneRuntimeEdges(existing, new Set(forward.keys()));
+      }
     }
   } catch {
     // ENOENT or JSON parse error — no existing runtime edges to preserve
@@ -442,7 +451,7 @@ export function loadCachedMtimes(cacheDir: string): Map<string, number> {
   const cachePath = path.join(cacheDir, GRAPH_FILE);
   try {
     const raw = readFileSync(cachePath, 'utf-8');
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw, safeJsonReviver);
     if (
       typeof parsed !== 'object' ||
       parsed === null ||
@@ -539,7 +548,7 @@ export function saveGraphSyncInternal(
     const cachePath = path.join(cacheDir, GRAPH_FILE);
     try {
       const rawFile = readFileSync(cachePath, 'utf-8');
-      const parsed: unknown = JSON.parse(rawFile);
+      const parsed: unknown = JSON.parse(rawFile, safeJsonReviver);
       if (
         typeof parsed === 'object' &&
         parsed !== null &&
@@ -607,7 +616,7 @@ export function loadOrBuildGraphSync(
   let disk: CacheDiskFormat | null = null;
   try {
     const raw = readFileSync(cachePath, 'utf-8');
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw, safeJsonReviver);
     if (
       typeof parsed === 'object' &&
       parsed !== null &&
