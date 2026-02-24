@@ -7,6 +7,9 @@ import {
   symlinkSync,
   writeFileSync,
   rmSync,
+  existsSync,
+  readFileSync,
+  mkdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -266,6 +269,133 @@ export default defineConfig({
       // Both a.test.ts and b.test.ts depend on c.ts transitively
       expect(testFiles.some((f) => f.includes('a.test.ts'))).toBe(true);
       expect(testFiles.some((f) => f.includes('b.test.ts'))).toBe(true);
+    },
+    30_000,
+  );
+
+  /**
+   * Test 6: Cache file created after first run
+   * Run vitest → verify .vitest-affected/graph.json is created with version: 1
+   * Run vitest again → second run succeeds using cached graph.
+   */
+  test(
+    'cache persistence: graph.json exists after first run and second run succeeds',
+    async () => {
+      const tmp = setupFixture('simple');
+      await gitInit(tmp);
+
+      // Modify src/c.ts (unstaged change) — triggers test selection
+      writeFileSync(
+        path.join(tmp, 'src', 'c.ts'),
+        'export const c = 42;\n',
+      );
+
+      // Explicitly enable the plugin — outer test runner may set VITEST_AFFECTED_DISABLED=1
+      const pluginEnv = { VITEST_AFFECTED_DISABLED: '0' };
+
+      // First run — builds and saves graph
+      const report1 = await runVitest(tmp, pluginEnv);
+      const testFiles1 = report1.testResults.map((r) => r.name);
+      expect(testFiles1.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles1).toHaveLength(1);
+
+      // Verify cache file was created with correct format
+      const cacheFile = path.join(tmp, '.vitest-affected', 'graph.json');
+      expect(existsSync(cacheFile)).toBe(true);
+      const cache = JSON.parse(readFileSync(cacheFile, 'utf-8')) as {
+        version: number;
+      };
+      expect(cache.version).toBe(1);
+
+      // Second run — reuses cached graph, same result
+      const report2 = await runVitest(tmp, pluginEnv);
+      const testFiles2 = report2.testResults.map((r) => r.name);
+      expect(testFiles2.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles2).toHaveLength(1);
+    },
+    30_000,
+  );
+
+  /**
+   * Test 7: Corrupt cache graceful recovery
+   * Write invalid JSON to graph.json → plugin falls back to full rebuild.
+   * Diamond fixture: both tests run because c.ts is a shared dep.
+   */
+  test(
+    'cache recovery: corrupt graph.json triggers full rebuild',
+    async () => {
+      const tmp = setupFixture('diamond');
+      await gitInit(tmp);
+
+      // Write corrupt JSON to the cache file before the first run
+      mkdirSync(path.join(tmp, '.vitest-affected'), { recursive: true });
+      writeFileSync(
+        path.join(tmp, '.vitest-affected', 'graph.json'),
+        '{{corrupt json',
+      );
+
+      // Modify src/c.ts (shared dep in diamond fixture)
+      writeFileSync(
+        path.join(tmp, 'src', 'c.ts'),
+        'export const c = 99;\n',
+      );
+
+      // Explicitly enable the plugin — outer test runner may set VITEST_AFFECTED_DISABLED=1
+      // Plugin must recover — rebuild from scratch and select both tests
+      const report = await runVitest(tmp, { VITEST_AFFECTED_DISABLED: '0' });
+      const testFiles = report.testResults.map((r) => r.name);
+
+      // Both a.test.ts and b.test.ts transitively depend on c.ts
+      expect(testFiles.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles.some((f) => f.includes('b.test.ts'))).toBe(true);
+    },
+    30_000,
+  );
+
+  /**
+   * Test 8: Cache with changedFiles option
+   * Use explicit changedFiles → first run selects tests and writes cache.
+   * Second run reuses cached graph and produces identical result.
+   */
+  test(
+    'cache with changedFiles: second run uses cached graph',
+    async () => {
+      const tmp = setupFixture('simple');
+      await gitInit(tmp);
+
+      const changedFile = path.join(tmp, 'src', 'c.ts');
+
+      // Write config with explicit changedFiles and cache: true
+      writeFileSync(
+        path.join(tmp, 'vitest.config.ts'),
+        `
+import { defineConfig } from 'vitest/config';
+import { vitestAffected } from '${distUrl}';
+export default defineConfig({
+  plugins: [vitestAffected({ verbose: true, cache: true, changedFiles: ['${changedFile}'] })],
+  test: { include: ['tests/**/*.test.ts'] },
+});
+`,
+      );
+
+      // Explicitly enable the plugin — outer test runner may set VITEST_AFFECTED_DISABLED=1
+      const pluginEnv = { VITEST_AFFECTED_DISABLED: '0' };
+
+      // First run — builds graph, selects tests/a.test.ts, writes cache
+      const report1 = await runVitest(tmp, pluginEnv);
+      const testFiles1 = report1.testResults.map((r) => r.name);
+      expect(testFiles1.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles1).toHaveLength(1);
+
+      // Verify cache file was created
+      const cacheFile = path.join(tmp, '.vitest-affected', 'graph.json');
+      expect(existsSync(cacheFile)).toBe(true);
+
+      // Second run — uses cached graph, same result
+      const report2 = await runVitest(tmp, pluginEnv);
+      const testFiles2 = report2.testResults.map((r) => r.name);
+      expect(testFiles2.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles2).toHaveLength(1);
     },
     30_000,
   );

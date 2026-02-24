@@ -98,9 +98,23 @@ TaskCreate(subject: "Phase 7: Present decisions", description: "NEEDS_DECISION i
 TaskCreate(subject: "Phase 8: Final report + hand-off", description: "Summary, next step choice, cleanup", activeForm: "Generating final report...")
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-reviewer findings across rounds. If a finding recurs in a verification round, it achieves cross-round consensus and is auto-fixed.
+
+## Deferred Findings
+
+<!-- Format: | Round | Reviewer | Severity | File | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If reviewer findings files exist, skip to Phase 3 (synthesis).
+If `$ARTIFACTS_DIR/progress.md` exists, parse its `### Phase N` entries to recover state. If reviewer findings files exist, skip to Phase 3 (synthesis). If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 **TaskUpdate(task: "Phase 0", status: "completed")**
 
@@ -227,7 +241,7 @@ Each agent writes findings to `$ARTIFACTS_DIR/round-1-{role}.md`.
 **Agent 1: Security Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has security skills: "Read .claude/skills/<security-skill>/SKILL.md for security patterns."}
 
@@ -238,7 +252,7 @@ You are a security reviewer. You compete with 3 other reviewers — only evidenc
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - OWASP Top 10 vulnerabilities (injection, XSS, CSRF, SSRF)
 - Auth/authz bypass opportunities
@@ -247,6 +261,8 @@ You are a security reviewer. You compete with 3 other reviewers — only evidenc
 - Input validation gaps at system boundaries
 - Insecure defaults (permissive CORS, missing rate limits)
 - Dependency vulnerabilities (known CVEs in new deps)
+
+Use your judgment — these are starting points, not a complete list. If you spot something security-relevant not listed here, report it.
 
 ## Output
 
@@ -268,7 +284,7 @@ If nothing found, say so — don't invent issues.
 **Agent 2: Performance Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has performance skills: "Read .claude/skills/<perf-skill>/SKILL.md for optimization patterns."}
 
@@ -279,7 +295,7 @@ You are a performance reviewer. You compete with 3 other reviewers — only evid
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - N+1 queries or sequential awaits (waterfalls)
 - Missing caching opportunities
@@ -289,6 +305,8 @@ You are a performance reviewer. You compete with 3 other reviewers — only evid
 - Inefficient algorithms (O(n^2) where O(n) suffices)
 - Bundle size impact (barrel imports, large deps)
 - Missing indexes on queried columns
+
+Use your judgment — these are starting points, not a complete list. If you spot something performance-relevant not listed here, report it.
 
 ## Output
 
@@ -310,7 +328,7 @@ If nothing found, say so — don't invent issues.
 **Agent 3: Architecture Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has architecture/coding skills: "Read .claude/skills/<arch-skill>/SKILL.md for patterns."}
 
@@ -321,7 +339,7 @@ You are an architecture reviewer. You compete with 3 other reviewers — only ev
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - Pattern misalignment with existing codebase
 - Single Responsibility Principle violations
@@ -331,6 +349,8 @@ You are an architecture reviewer. You compete with 3 other reviewers — only ev
 - Wrong abstraction level (under/over-abstraction)
 - Missing error handling at system boundaries
 - Naming inconsistencies
+
+Use your judgment — these are starting points, not a complete list. If you spot architectural issues not listed here, report them.
 
 ## Output
 
@@ -352,7 +372,7 @@ If nothing found, say so — don't invent issues.
 **Agent 4: Correctness Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has testing skills: "Read .claude/skills/<testing-skill>/SKILL.md for test patterns."}
 
@@ -363,7 +383,7 @@ You are a correctness reviewer. You compete with 3 other reviewers — only evid
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - Logic errors and off-by-one mistakes
 - Silent failures (wrong results without errors)
@@ -374,6 +394,8 @@ You are a correctness reviewer. You compete with 3 other reviewers — only evid
 - Edge cases not handled (empty arrays, zero values, unicode)
 - State management issues (stale closures, missing cleanup)
 - Missing test coverage for new functionality
+
+Use your judgment — these are starting points, not a complete list. If you spot correctness issues not listed here, report them.
 
 ## Output
 
@@ -431,12 +453,25 @@ For each item: target file, what to change, severity, which reviewers flagged it
 
 ### Auto-Apply Rules
 
-**Auto-apply a fix if EITHER condition is met:**
+**Auto-apply a fix if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ reviewers independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ reviewers independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-reviewer finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-Tag these as `AUTO_FIX`. Everything else is `NEEDS_DECISION`.
+Tag these as `AUTO_FIX`.
+
+**Defer remaining findings (DO NOT present to user yet):**
+
+Single-reviewer Medium/Low findings with no cross-round match are added to the consensus registry — NOT tagged as NEEDS_DECISION yet. They may achieve cross-round consensus if a verification round runs.
+
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {round} | {reviewer} | {severity} | {file:line} | {one-line summary} |
+```
+
+**Non-auto-fixable items** (need judgment regardless of consensus) are tagged `NEEDS_DECISION` immediately — these skip the registry.
 
 Append to `$ARTIFACTS_DIR/progress.md`:
 
@@ -495,12 +530,19 @@ Write results to {ARTIFACTS_DIR}/auto-fix-result.md:
 
 ### Verify Fixes
 
-Read the engineer's result file. Confirm:
+Read the engineer's result file. Then **run the quality gate yourself** — do not trust the engineer's report alone:
+
+```bash
+# MANDATORY: run project quality gate after auto-fixes (see AGENTS.md > Project Commands)
+{CMD_TYPECHECK} && {CMD_TEST}
+```
+
+Confirm:
 1. All AUTO_FIX items applied (or documented why not)
-2. Project checks pass
+2. Quality gate passes (you just ran it — not the engineer's claim)
 3. No unintended side effects (review diff)
 
-**If checks fail:** Revert the breaking fix and move that item to NEEDS_DECISION.
+**If checks fail:** Revert the breaking fix and move that item to NEEDS_DECISION. A prior session had the auto-fix engineer remove live imports as "dead code" — only the quality gate caught the regression.
 
 **TaskUpdate(task: "Phase 4", status: "completed")**
 
@@ -549,7 +591,7 @@ AskUserQuestion(
 )
 ```
 
-**If verification round:** Re-run Phase 2-5 with the updated diff. Include in reviewer prompts: "Previous round found and fixed: {list}. Check if fixes are correct and look for NEW issues only." Max 2 total rounds.
+**If verification round:** Re-run Phase 2-5 with the updated diff. Include in reviewer prompts: "Previous round found and fixed: {list}. Check if fixes are correct and look for NEW issues only." Max 2 total rounds. During Phase 3 of the verification round, check new findings against the consensus registry for cross-round matches — any match auto-applies.
 
 ---
 
@@ -645,23 +687,30 @@ git push
 
 **TaskUpdate(task: "Phase 7", status: "in_progress")**
 
-### If No NEEDS_DECISION Items
+### Collect All Remaining Items
+
+Combine two categories into a single presentation:
+
+1. **NEEDS_DECISION items:** Non-auto-fixable findings that need judgment
+2. **No-consensus findings:** Read the consensus registry — single-reviewer findings that never achieved cross-round consensus
+
+### If Nothing Remains
 
 Report auto-fix results and skip to Phase 8.
 
-### If NEEDS_DECISION Items Exist
+### If Items Remain
 
-Present via `AskUserQuestion`:
+Present via `AskUserQuestion` (once):
 
 ```
 AskUserQuestion(
   questions: [{
-    question: "Auto-applied {N} fixes. {M} items need your decision:",
+    question: "Auto-applied {N} fixes (severity + consensus). {M} items remain for your decision:",
     header: "Decisions",
     multiSelect: true,
     options: [
-      { label: "Fix A: <title>", description: "{severity} — {reviewer}: {file}: {one-line summary}" },
-      { label: "Fix B: <title>", description: "{severity} — {reviewer}: {file}: {one-line summary}" }
+      { label: "Fix A: <title>", description: "NEEDS_DECISION, {severity} — {reviewer}: {file}: {one-line summary}" },
+      { label: "Fix B: <title>", description: "No consensus, Round {R}, {severity} — {reviewer}: {file}: {one-line summary}" }
     ]
   }]
 )
@@ -718,11 +767,25 @@ git push
 **Report:** `.claude/reviews/YYYY-MM-DD-HHMM-[feature].md`
 **Rounds:** {count}
 
-### Summary
+### Convergence
 
-- **Critical:** 0 remaining ({X} fixed)
-- **High:** 0 remaining ({Y} fixed)
-- **Medium:** {Z} addressed, {W} deferred
+Round  Security  Performance  Architecture  Correctness  Total  Applied  Deferred
+  1      {n}       {n}          {n}           {n}         {n}     {n}       {n}
+  2      {n}       {n}          {n}           {n}         {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {count} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Changes Made
 
@@ -744,7 +807,7 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Merge (Recommended)", description: "Create PR and ship to main" },
+      { label: "Merge (Recommended)", description: "Run /wave-merge — create PR, triage CI/agent feedback, ship to main" },
       { label: "Another review pass", description: "Run /work-review again — fresh eyes on the updated code" },
       { label: "Manual review", description: "Done with automated review — you'll review manually" },
       { label: "Done for now", description: "Review saved — pick up later" }
@@ -788,7 +851,7 @@ rm -rf "$ARTIFACTS_DIR"
 | ---------- | ----------------------------------------- | -------------------------------------- |
 | **Scope**  | Feature branch diff                       | Whole codebase                         |
 | **When**   | After `/bead-work` or `/work`             | Between sessions, daily maintenance    |
-| **Agents** | 4 specialized Haiku reviewers, 1-2 rounds | 3 Opus explorers, multi-round          |
+| **Agents** | 4 specialized Sonnet reviewers, 1-2 rounds | 3 Opus explorers, multi-round          |
 | **Fixes**  | Engineer sub-agent                        | Conductor applies directly             |
 | **Focus**  | Security, perf, arch, correctness         | Bugs, dead code, drift, health         |
 
@@ -799,8 +862,10 @@ Use both: `work-review` for pre-merge validation, `hygiene` for general health.
 ## Remember
 
 - **YOU synthesize, engineers fix** — reviewers analyze, you decide what's real, engineer applies
-- **Auto-apply Critical/High + consensus (2+ reviewers)** — only ask about single-reviewer Medium
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus** — defer the rest to registry
+- **Cross-round consensus:** single-reviewer findings that recur in verification rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus + NEEDS_DECISION items presented once in Phase 7, not per-round
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Progress file is compaction recovery** — parse it on restart for phase state
 - **Project commands come from AGENTS.md** — detect from config files only as fallback
 - **Skill routing is dynamic** — check AGENTS.md > Available Skills, don't hardcode paths

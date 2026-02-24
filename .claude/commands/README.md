@@ -22,6 +22,7 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 | `plan-refine-external` | Multi-model refinement via OpenRouter — 4 diverse external models |
 | `plan-review-genius` | Single-model deep forensic review |
 | `plan-transcender-alien` | Paradigm-breaking alternative perspectives |
+| `plan-clean` | Final correctness check — 3 Sonnets verify accuracy, structure, and polish with cross-round consensus |
 
 ### Beads (Implementation)
 
@@ -32,12 +33,19 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 | `bead-work` | Sequential implementation — conductor + engineer sub-agents |
 | `bead-land` | Session closure — retrospective learning + system compounding |
 
-### Review & Maintenance
+### Review & Ship
 
 | Command | Purpose |
 | ------- | ------- |
-| `work-review` | Feature-branch code review — 4 parallel reviewers, severity-based auto-fix, user-escalated decisions |
-| `hygiene` | Iterative codebase review — 3 agents, multiple rounds until plateau |
+| `work-review` | Feature-branch code review — 4 parallel Sonnet reviewers, severity-based auto-fix, user-escalated decisions |
+| `wave-merge` | Merge wave branch to main — PR creation, CI/agent feedback triage, auto-fix, merge |
+| `hygiene` | Iterative codebase review — 3 Opus agents, multiple rounds until plateau |
+
+### Meta
+
+| Command | Purpose |
+| ------- | ------- |
+| `prompt-enhance` | Analyze and enhance subagent prompts — score against pattern rubric, diagnose gaps, rewrite |
 
 ### Ideas
 
@@ -49,7 +57,7 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 ## Workflow
 
 ```
-plan-init → plan-refine-internal → beadify → bead-refine → bead-work → work-review → bead-land
+plan-init → plan-refine-internal → plan-clean → beadify → bead-refine → bead-work → bead-land → work-review → wave-merge
 ```
 
 ## Dependencies
@@ -61,6 +69,7 @@ plan-init → plan-refine-internal → beadify → bead-refine → bead-work →
 
 ### Optional
 
+- **GitHub CLI** (`gh`) — required for `wave-merge` (PR creation, CI checks, merge)
 - **OpenRouter** (`openrouter` CLI) — required only for `plan-refine-external`
 - **Browser testing tool** (e.g., `agent-browser`) — optional UI validation in `bead-land`
 

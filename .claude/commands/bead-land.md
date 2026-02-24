@@ -200,6 +200,7 @@ For each opportunity, provide:
 
 Be aggressive — look for meaningful improvements. But every suggestion must have evidence from this session.
 Context bloat is the enemy. Prefer refining existing content over adding new content.
+If nothing noteworthy happened, say so — don't invent learnings to fill the report.
 """)
 ```
 
@@ -212,6 +213,8 @@ Read `/tmp/bead-work/retrospective.md`. Verify findings against your own experie
 ## Phase 3: Compound (System Upgrades)
 
 **Goal:** Turn learnings into system improvements. User decides what ships.
+
+**NO AUTO-APPLY.** Unlike review commands (`plan-clean`, `hygiene`, `work-review`, `bead-refine`) which auto-apply consensus findings, bead-land presents ALL upgrade proposals to the user. System compounding changes identity and workflow — every change needs explicit approval.
 
 ### Present Upgrades to User
 
@@ -305,9 +308,9 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
+      { label: "Review & merge (Recommended)", description: "Run /work-review then /wave-merge — review code, create PR, ship to main" },
       { label: "Continue bead-work", description: "Run /bead-work — {M} beads remaining" },
       { label: "Refine remaining beads", description: "Run /bead-refine — revise remaining beads before implementing" },
-      { label: "Feature complete", description: "All beads done — ready for final review or merge" },
       { label: "Done for now", description: "Close session — pick up later" }
     ]
   }]
@@ -321,8 +324,12 @@ Remove session artifacts (they've been consumed by retrospective). Run each sepa
 ```bash
 rm -rf /tmp/bead-work
 rm -rf /tmp/plan-refine-internal-*
+rm -rf /tmp/plan-refine-*
+rm -rf /tmp/plan-clean-*
 rm -rf /tmp/bead-refine-*
 rm -rf /tmp/beadify-*
+rm -rf /tmp/hygiene-*
+rm -rf /tmp/work-review-*
 ```
 
 ### Final Verification
@@ -339,7 +346,7 @@ br ready --json     # What's left
 
 - **Land is NON-NEGOTIABLE** — push before learning
 - **Learn from evidence, not speculation** — every finding needs a concrete example from this session
-- **Compound aggressively but user-gated** — propose bold changes, let user decide
+- **Compound aggressively but ALWAYS user-gated** — no auto-apply, every upgrade needs explicit approval (unlike review commands)
 - **Context bloat is the enemy** — refine existing content, don't just append
 - **Temp files are the source of truth** — read from `$ARTIFACTS_DIR`, not memory
 - **This is what makes the flywheel accelerate** — each session improves the next

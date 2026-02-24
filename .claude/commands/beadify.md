@@ -105,8 +105,10 @@ Epic: Dashboard
 **Validator 1: Completeness Checker**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
-You are validating a proposed bead structure against its source plan.
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating a proposed bead structure against its source plan. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 
@@ -145,8 +147,10 @@ Limit: top 5 issues. Under 400 words. If nothing missing, say so.
 **Validator 2: Dependency Checker**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
-You are validating the dependency structure of a proposed bead breakdown.
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating the dependency structure of a proposed bead breakdown. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 
@@ -159,14 +163,9 @@ Check the proposed dependency graph for correctness — missing links, wrong ord
 
 ## Check
 
-1. Trace each dependency: does bead A genuinely need bead B to be done first?
-2. Are there missing dependencies? (bead C needs code from bead D but no link)
-3. Are there unnecessary dependencies? (bead E depends on F but doesn't actually need it)
-4. Could reordering unblock more parallel work?
-5. Any potential cycles?
-6. Is the critical path reasonable?
+Trace the dependency graph for correctness: are links genuine? Are any missing or unnecessary? Could reordering unblock more parallel work? Any cycles? Is the critical path reasonable?
 
-You have codebase access. Read referenced files to verify what actually exists vs what needs to be created.
+You have codebase access. Read referenced files to verify what actually exists vs what needs to be created. Use your judgment on what matters most for a sound dependency structure.
 
 ## Output
 
@@ -186,8 +185,10 @@ Limit: top 5 issues. Under 400 words. If structure is sound, say so.
 **Validator 3: Granularity Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
-You are validating the granularity and sizing of a proposed bead breakdown.
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating the granularity and sizing of a proposed bead breakdown. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 

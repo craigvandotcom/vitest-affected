@@ -11,6 +11,15 @@ description: Multi-model iterative plan refinement - sends plan to 3-4 AI models
 - You need diverse AI insights on technical decisions
 - You're uncertain if your plan is optimal
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Plan file (from `/plan-init` or `/plan-refine-internal`)                                   |
+| **Output**       | Refined plan (in-place edit), `REFINEMENT-LOG.md` in `.claude/plans/research/`             |
+| **Artifacts**    | Model responses in `$WORK_DIR/`, consensus registry                                        |
+| **Verification** | Convergence trend, plan committed                                                          |
+
 **This is plan refinement through iteration.** Multiple AI models review in parallel, you (Claude Code orchestrator) synthesize improvements, repeat until convergence. Not for trivial plans - for important architectural decisions.
 
 **You are the conductor, not the musician.** You coordinate the process and do the synthesis work. You delegate model calls to the OpenRouter tool via bash.
@@ -53,6 +62,10 @@ else
 fi
 ```
 
+### Skill Routing
+
+Scan the plan for domain keywords. Check `AGENTS.md > Available Skills` for relevant skills. Include skill content in model prompts where applicable.
+
 ### Model Set
 
 **Models (4 total, as of Feb 2026):**
@@ -76,6 +89,22 @@ MODELS=(gemini-3.1 gpt kimi glm)
 WORK_DIR="/tmp/plan-refine-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK_DIR"
 echo "Working directory: $WORK_DIR"
+```
+
+### Initialize Consensus Registry
+
+Create the cross-round tracking file for single-model findings:
+
+```bash
+cat > "$WORK_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-model findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Model | Scope | Summary | Section | -->
+EOF
 ```
 
 ### Checkpoint Original Plan
@@ -360,34 +389,29 @@ Example format:
    What to change: ...
 ```
 
-#### Step 1b: Auto-Apply and Present Remaining
+#### Step 1b: Auto-Apply with Cross-Round Consensus
 
-**Auto-apply a change if EITHER condition is met:**
+**Auto-apply a change if ANY condition is met:**
 
-1. **Severity-based:** The change is Structural or Significant — these are substantive improvements, not preferences
-2. **Consensus-based:** 2+ models independently suggested the same improvement (regardless of severity) — multi-model agreement is high-signal
+1. **Scope-based:** The change is Structural or Significant — these are substantive improvements, not preferences
+2. **Same-round consensus:** 2+ models independently suggested the same improvement (regardless of scope) — multi-model agreement is high-signal
+3. **Cross-round consensus:** A single-model finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-**Apply these immediately. Log them in the changelog as "Auto-applied".**
+**Apply these immediately. Log them in the changelog as "Auto-applied" with the consensus type.**
 
-**Ask only about single-model Incremental changes:**
+#### Step 1c: Defer Remaining Findings (DO NOT ask user per-round)
 
-```
-AskUserQuestion(
-  questions: [{
-    question: "Auto-applied {N} changes (Structural/Significant + consensus). {M} single-model suggestions remain:",
-    header: "Remaining",
-    multiSelect: true,
-    options: [
-      { label: "Change X: <title>", description: "Incremental — <model name>: <one-line summary>" },
-      { label: "Change Y: <title>", description: "Incremental — <model name>: <one-line summary>" }
-    ]
-  }]
-)
+After auto-applying, any remaining changes (Incremental scope AND only suggested by a single model with no cross-round match) are added to the consensus registry — NOT presented to the user.
+
+For each deferred finding, append to `$WORK_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {model name} | {scope} | {one-line summary} | {plan section} |
 ```
 
-**If no remaining items after auto-apply:** Skip the question entirely — just report what was applied.
-
-**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+These deferred findings serve two purposes:
+- **Cross-round consensus detection:** If a later round's model suggests the same improvement, it auto-applies
+- **Final presentation:** Any findings that never achieve consensus are presented to the user once in Phase 5
 
 #### Step 2: Apply Approved Changes via Sequential Haiku Subagents
 
@@ -624,6 +648,32 @@ fi
 
 **TaskUpdate(subject: "Phase 5: Finalize", status: "in_progress")**
 
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Any deferred findings that never achieved cross-round consensus are presented to the user in a single batch:
+
+**If no remaining deferred findings:** Skip — just proceed to copy.
+
+**If deferred findings remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} single-model suggestions never confirmed. Apply any of these?",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Change X: <title>", description: "Round {R}, Incremental — {model}: {section} — <one-line summary>" },
+      { label: "Change Y: <title>", description: "Round {R}, Incremental — {model}: {section} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved findings via sequential Haiku subagents (same pattern as Step 2).**
+
 ### Copy Final Plan
 
 ```bash
@@ -765,69 +815,48 @@ git status
 ### Present Final Summary
 
 ```markdown
-## Plan Refinement Complete
+## Plan Refinement Complete (External)
 
-**Rounds completed:** {CURRENT_ROUND}
-**Final plan:** {PLAN_FILE}
+**Plan:** {PLAN_FILE}
+**Models:** {MODELS list}
+**Rounds:** {CURRENT_ROUND}
 **Refinement log:** {WORK_DIR}/REFINEMENT-LOG.md
-**Artifacts committed:** ✅
 
----
+### Convergence
 
-### Summary
+Round  Struct  Signif  Increm  Total  Applied  Deferred
+  1      {n}     {n}     {n}    {n}     {n}       {n}
+  2      {n}     {n}     {n}    {n}     {n}       {n}
+  ...
 
-**Total improvements integrated:** [X]
+R1  {▓▓▓░░░░████}  {total}
+R2  {░░████}       {total}  {-N%}
+R3  {████}         {total}  {-N%}
 
-- Structural changes: [count]
-- Significant enhancements: [count]
-- Incremental refinements: [count]
+▓ Structural  ░ Significant  █ Incremental
 
----
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (scope):         {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Model Contributions
 
-**Most valuable insights:**
+- **{model}:** {key contribution pattern}
+- **{model}:** {key contribution pattern}
 
-- **[Model name]:** [Key contribution or pattern of contributions]
-- **[Model name]:** [Key contribution or pattern of contributions]
+**Stop reason:** {incremental convergence | MAX_ROUNDS | user decision}
 
-**Consensus improvements (3+ models agreed):**
+### Artifacts
 
-- [High-signal improvement 1]
-- [High-signal improvement 2]
-
----
-
-### Refinement Evolution
-
-**Round-by-round scope:**
-
-| Round | Scope                                | Key Changes     |
-| ----- | ------------------------------------ | --------------- |
-| 1     | [Structural/Significant/Incremental] | [Brief summary] |
-| 2     | [Structural/Significant/Incremental] | [Brief summary] |
-| ...   | ...                                  | ...             |
-
-**Convergence:** Stopped at round {CURRENT_ROUND} due to [incremental changes / MAX_ROUNDS reached / user decision]
-
----
-
-### Artifacts Location
-
-All refinement materials saved to: {WORK_DIR}
-
-**What's available:**
-
-- **Individual model responses:** `round-N-[model].md` - See what each AI suggested
-- **Plan evolution:** `plan-round-N.md` - Track how plan improved each round
-- **Change history:** `changelog-round-N.md` - Documented changes per round
-- **Complete log:** `REFINEMENT-LOG.md` - Full refinement narrative with analysis
-
----
-
-### Next Steps
-
-Your refined plan is ready at: {PLAN_FILE}
+- `round-N-[model].md` — raw model responses
+- `plan-round-N.md` — plan state after each round
+- `changelog-round-N.md` — changes per round
+- `REFINEMENT-LOG.md` — full refinement narrative
 ```
 
 **Present next step choice with `AskUserQuestion`:**
@@ -839,10 +868,10 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Beadify (Recommended)", description: "Run /beadify — convert refined plan to beads with parallel validation" },
+      { label: "Plan clean (Recommended)", description: "Run /plan-clean — final correctness check before beadification" },
+      { label: "Beadify directly", description: "Run /beadify — skip correctness check, convert to beads now" },
       { label: "Enhance further", description: "Run /plan-transcender-alien — paradigm-breaking alternative perspectives" },
-      { label: "Implement directly", description: "Start building from refined plan" },
-      { label: "Review artifacts", description: "Inspect model responses and refinement log before deciding" }
+      { label: "Done for now", description: "Plan saved — pick up later" }
     ]
   }]
 )
@@ -1083,10 +1112,13 @@ openrouter --model MODEL_ID --file /path/to/prompt.md --no-stream 2>/dev/null > 
 
 ✅ Parallel execution is fast and cost-effective (4x speedup)
 ✅ Convergence detection prevents over-refinement
-✅ Consensus across models is high-signal (trust it)
+✅ Same-round consensus across models is high-signal (trust it)
+✅ Cross-round consensus — single-model findings that recur in later rounds are high-signal, auto-apply on match
+✅ One human touchpoint — remaining no-consensus items presented once in Phase 5, not per-round
 ✅ Synthesis step is where value comes from (your reasoning work)
 ✅ Full audit trail shows evolution (useful for future reference)
 ✅ Iterative refinement catches blind spots no single model would see
+✅ Consensus registry in WORK_DIR persists through compaction — always read from files, not memory
 
 **Common mistakes to avoid:**
 

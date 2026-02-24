@@ -40,9 +40,23 @@ ARTIFACTS_DIR=/tmp/bead-refine-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | Bead | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' changes are already applied to beads. Read any existing findings files in `$ARTIFACTS_DIR` for context on the most recent round.
+If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' changes are already applied to beads. Read any existing findings files in `$ARTIFACTS_DIR` for context on the most recent round. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 ### Identify Plan File + Skills
 
@@ -106,16 +120,7 @@ Cross-reference every bead against the original plan to ensure NOTHING was lost 
 
 ## Method
 
-1. Read the original plan file: {PLAN_FILE}
-2. Read ALL beads: {paste ARTIFACTS_DIR/beads-full-dump.txt or inline}
-3. For each plan section/feature:
-   - Is it fully represented in at least one bead?
-   - Were any details lost, simplified, or omitted?
-   - Are test requirements from the plan captured in bead acceptance criteria?
-4. For each bead:
-   - Is it self-contained? Could an engineer implement without reading the plan?
-   - Are acceptance criteria specific and verifiable (not vague)?
-   - Does it include test requirements?
+Read the original plan ({PLAN_FILE}) and ALL beads ({paste ARTIFACTS_DIR/beads-full-dump.txt or inline}). Cross-reference every plan section against the beads — check that nothing was lost, oversimplified, or omitted during beadification. Also check each bead for self-containment: could an engineer implement it without ever reading the plan? Are acceptance criteria specific and verifiable? Use your judgment on what matters most.
 
 ## Output
 
@@ -129,6 +134,7 @@ For each issue:
 **Fix:** Specific change — new bead, updated description, added acceptance criteria
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -147,17 +153,7 @@ Can an engineer cold-start on each bead tomorrow and implement it mechanically? 
 
 ## Method
 
-1. Read ALL beads: {paste ARTIFACTS_DIR/beads-full-dump.txt or inline}
-2. For each bead, check:
-   - Is the scope clear and bounded? (no ambiguous "handle all edge cases")
-   - Are dependencies correct? Does this bead actually need what it depends on?
-   - Is granularity right? (Too big = needs splitting. Too small = merge candidate.)
-   - Are there blocking ambiguities where you'd have to guess?
-   - Could you write RED tests from just the acceptance criteria?
-3. You have codebase access. Read referenced files to verify:
-   - Functions/types mentioned in beads actually exist
-   - File paths referenced are correct
-   - Patterns described match actual codebase patterns
+Read ALL beads ({paste ARTIFACTS_DIR/beads-full-dump.txt or inline}) and put yourself in the implementer's seat. For each bead: could you cold-start on it tomorrow and build it mechanically? If you'd need to ask a question, that's a finding. Check scope clarity, dependency correctness, granularity, and whether you could write RED tests from just the acceptance criteria. You have codebase access — read referenced files to verify functions, types, and patterns actually exist as described. Use your judgment on what blocks implementation.
 
 ## Output
 
@@ -171,6 +167,7 @@ For each issue:
 **Fix:** Specific change — clearer spec, split proposal, dependency fix
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -214,6 +211,7 @@ For each issue:
 **Fix:** Specific structural change — split into X+Y, merge A+B, add/remove dep
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -232,13 +230,20 @@ Synthesis principles:
 
 Produce a numbered change list. For each item: target bead(s), what to change, the fix.
 
-**Auto-apply without asking. No user approval needed — the convergence loop self-corrects.**
+**Auto-apply without asking. No user approval needed per-round — the convergence loop self-corrects.**
 
 - **Critical/High:** Apply immediately — these are defects, regardless of how many agents flagged it
-- **Medium/Low + consensus (2+ agents):** Apply immediately — multi-agent agreement is high-signal
-- **Medium/Low + single-agent:** Skip — not enough confidence. Log as "Skipped (single-agent)" in round summary. If it's real, another agent will independently flag it next round.
+- **Same-round consensus (2+ agents):** Apply immediately — multi-agent agreement is high-signal
+- **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal. Apply immediately.
+- **Medium/Low + single-agent + no cross-round match:** Defer to consensus registry. Do NOT skip silently.
 
-**Log all applied and skipped changes in the round summary.**
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {bead ID} | {one-line summary} |
+```
+
+**Log all applied and deferred changes in the round summary.**
 
 **Apply approved changes using `br` commands:**
 
@@ -301,6 +306,32 @@ IF CURRENT_ROUND >= MAX_ROUNDS -> force finalize (note unverified fixes in progr
 **TaskUpdate(task: "Phase 1-4: Refinement loop", status: "completed")**
 **TaskUpdate(task: "Phase 5: Finalize", status: "in_progress")**
 
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Any deferred findings that never achieved cross-round consensus are presented to the user in a single batch:
+
+**If no remaining deferred findings:** Skip — proceed to verification.
+
+**If deferred findings remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} single-agent findings never confirmed. Apply any of these?",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Fix X: <title>", description: "Round {R}, {severity} — {agent}: Bead {id} — <one-line summary>" },
+      { label: "Fix Y: <title>", description: "Round {R}, {severity} — {agent}: Bead {id} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved findings using `br` commands.**
+
 ### Verify Final Structure
 
 ```bash
@@ -328,15 +359,29 @@ Verify:
 ## Bead Refinement Complete
 
 **Rounds completed:** {CURRENT_ROUND}
-**Findings total:** {sum across rounds}
-**Changes applied:** {sum across rounds}
 **Stop reason:** {severity converged | MAX_ROUNDS | user decision}
 
-### Agent Contributions
+### Convergence
 
-- **Completeness:** {key findings pattern}
-- **Implementability:** {key findings pattern}
-- **Structure:** {key findings pattern}
+Round  Completeness  Implementability  Structure  Total  Applied  Deferred
+  1      {n}            {n}              {n}       {n}     {n}       {n}
+  2      {n}            {n}              {n}       {n}     {n}       {n}
+  3      {n}            {n}              {n}       {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
 
 ### Bead Status
 
@@ -381,9 +426,12 @@ AskUserQuestion(
 ## Remember
 
 - **YOU synthesize and apply fixes** — agents find issues, you decide and fix
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus findings presented once in Phase 5, not per-round
 - **Competitive framing sharpens output** — agents know they compete for relevance
 - **Structure Optimizer counterbalances** — prevents completeness reviewer from piling on complexity
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Progress file is compaction recovery** — parse it to know where you left off
 - **3 agents per round > 1 pass repeated** — more perspectives, faster convergence
 - **Evidence over opinion** — bead IDs and content citations, not vague concerns

@@ -1,9 +1,23 @@
 import { ResolverFactory } from 'oxc-resolver';
 import { parseSync } from 'oxc-parser';
-import { glob } from 'tinyglobby';
+import { glob, globSync } from 'tinyglobby';
+import { readFileSync, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import path from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Shared glob constants — used by both async buildFullGraph and sync variant
+// ---------------------------------------------------------------------------
+
+export const GRAPH_GLOB_PATTERN = '**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}';
+export const GRAPH_GLOB_IGNORE = [
+  '**/node_modules/**',
+  '**/dist/**',
+  '**/.vitest-affected/**',
+  '**/coverage/**',
+  '**/.next/**',
+  '**/test/fixtures/**',
+];
 
 const BINARY_EXTENSIONS = new Set([
   '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.tiff',
@@ -101,10 +115,10 @@ export async function buildFullGraph(rootDir: string): Promise<{
   forward: Map<string, Set<string>>;
   reverse: Map<string, Set<string>>;
 }> {
-  const files = await glob('**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}', {
+  const files = await glob(GRAPH_GLOB_PATTERN, {
     cwd: rootDir,
     absolute: true,
-    ignore: ['**/node_modules/**', '**/dist/**', '**/.vitest-affected/**', '**/coverage/**', '**/.next/**', '**/test/fixtures/**'],
+    ignore: GRAPH_GLOB_IGNORE,
   });
 
   const resolver = createResolver(rootDir);
@@ -118,6 +132,58 @@ export async function buildFullGraph(rootDir: string): Promise<{
     let source: string;
     try {
       source = await readFile(file, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const deps = resolveFileImports(file, source, rootDir, resolver);
+    for (const dep of deps) {
+      forward.get(file)!.add(dep);
+      // Ensure dependency also has an entry
+      if (!forward.has(dep)) {
+        forward.set(dep, new Set());
+      }
+    }
+  }
+
+  // Build reverse graph by inverting forward
+  const reverse = new Map<string, Set<string>>();
+  for (const [file, deps] of forward) {
+    if (!reverse.has(file)) {
+      reverse.set(file, new Set());
+    }
+    for (const dep of deps) {
+      if (!reverse.has(dep)) {
+        reverse.set(dep, new Set());
+      }
+      reverse.get(dep)!.add(file);
+    }
+  }
+
+  return { forward, reverse };
+}
+
+export function buildFullGraphSync(rootDir: string): {
+  forward: Map<string, Set<string>>;
+  reverse: Map<string, Set<string>>;
+} {
+  const files = globSync(GRAPH_GLOB_PATTERN, {
+    cwd: rootDir,
+    absolute: true,
+    ignore: GRAPH_GLOB_IGNORE,
+  });
+
+  const resolver = createResolver(rootDir);
+  const forward = new Map<string, Set<string>>();
+
+  for (const file of files) {
+    if (!forward.has(file)) {
+      forward.set(file, new Set());
+    }
+
+    let source: string;
+    try {
+      source = readFileSync(file, 'utf-8');
     } catch {
       continue;
     }

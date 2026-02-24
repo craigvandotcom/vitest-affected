@@ -8,6 +8,15 @@ Run this after a few bead-work sessions, or daily for maintenance. For feature-s
 
 ---
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Full codebase, recent commits, or specific directory (user-selected scope)                 |
+| **Output**       | Fixed issues committed, health assessment report                                           |
+| **Artifacts**    | Round findings in `$ARTIFACTS_DIR/round-{N}-{role}.md`, consensus registry                 |
+| **Verification** | Quality gate (test, lint, type-check, build) all passing                                   |
+
 ## Phase 0: Initialize
 
 ### Select Scope
@@ -43,9 +52,23 @@ ARTIFACTS_DIR=/tmp/hygiene-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | File | Summary | -->
+EOF
+```
+
 ### Compaction Recovery
 
-If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' fixes are already applied.
+If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). Previous rounds' fixes are already applied. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 ### Gather Codebase Context
 
@@ -66,6 +89,20 @@ ls -d */ | head -20
 
 Save this as `CODEBASE_CONTEXT` for agent prompts.
 
+### Skill Routing
+
+Scan codebase for domain keywords. Check `AGENTS.md > Available Skills` for relevant skills. Include skill paths in reviewer prompts where applicable.
+
+### Create Workflow Tasks
+
+```
+TaskCreate(subject: "Phase 0: Initialize hygiene review", description: "Select scope, gather context, create consensus registry", activeForm: "Initializing hygiene review...")
+TaskCreate(subject: "Phases 1-4: Review loop", description: "3 Opus agents per round, synthesize, apply fixes, convergence check. Up to MAX_ROUNDS.", activeForm: "Running hygiene review...")
+TaskCreate(subject: "Phase 5: Finalize", description: "Present no-consensus findings, quality gate, commit, report", activeForm: "Finalizing hygiene review...")
+```
+
+**TaskUpdate(task: "Phase 0", status: "completed")**
+
 ---
 
 ## REVIEW LOOP: Phases 1-4
@@ -82,23 +119,16 @@ Each agent writes findings to `$ARTIFACTS_DIR/round-{CURRENT_ROUND}-{role}.md`.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a bug hunter doing a "fresh eyes" review of this codebase.
+You are a bug hunter doing a "fresh eyes" review of this codebase. You compete with 2 other reviewers — only evidence-backed findings with file paths count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — you choose where to look."}
 
 ## Your Method
 
-1. Start with recent git activity: `git log --oneline -15` and `git diff HEAD~5..HEAD --stat`
-2. Pick 3-5 files that look interesting (recently changed, complex, critical path)
-3. For each file: read it completely, trace its imports, understand the data flow
-4. Look super carefully with fresh eyes for:
-   - Obvious bugs, logic errors, off-by-one mistakes
-   - Silent failures (wrong results, no error thrown)
-   - Race conditions on shared state
-   - Null/undefined hazards
-   - Error paths that swallow exceptions
-   - Type assertions hiding real issues (`as any`, `!` operator abuse)
+Explore the codebase with completely fresh eyes. Start wherever interests you — recent git activity, hot paths, complex modules, or random exploration. Read files deeply, trace imports, and follow data flows across the full chain.
+
+Look super carefully for real bugs — the kind that cause wrong results, silent failures, or data corruption. Trust your judgment on where to dig and what matters. Some areas worth considering: logic errors, race conditions, null hazards, swallowed exceptions, type assertion abuse — but follow your instincts, not a checklist.
 
 ## Output
 
@@ -123,24 +153,16 @@ If nothing found, say so — don't invent issues.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a codebase explorer doing deep random investigation.
+You are a codebase explorer doing deep random investigation. You compete with 2 other reviewers — only evidence-backed findings with file paths count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — explore freely."}
 
 ## Your Method
 
-1. Pick a random starting point — a feature directory, a utility file, a hook
-2. Read it deeply, then trace its functionality through related files
-3. Follow imports, check callers, understand the full data path
-4. Do this for 3-4 different entry points across the codebase
-5. Look super carefully with fresh eyes for:
-   - Dead code (unused exports, unreachable branches)
-   - Inconsistent patterns (same thing done 3 different ways)
-   - Missing error handling at system boundaries
-   - Stale comments that no longer match the code
-   - Copy-paste code that drifted apart
-   - Dependencies that could be removed
+Pick random starting points across the codebase and go deep. Read files thoroughly, follow import chains, trace data flows end-to-end, check callers and callees. Do this for 3-4 different entry points — let curiosity guide you.
+
+You're looking for anything a fresh pair of eyes would catch — dead code, inconsistent patterns, missing error handling, stale comments, copy-paste drift, unnecessary dependencies. But don't limit yourself to these categories. If something feels off, investigate it. Trust your instincts.
 
 ## Output
 
@@ -165,24 +187,16 @@ If nothing found, say so — don't invent issues.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a structural reviewer checking architecture health.
+You are a structural reviewer checking architecture health. You compete with 2 other reviewers — only structural improvements backed by evidence count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — assess overall health."}
 
 ## Your Method
 
-1. Read the project structure from AGENTS.md > Architecture, then explore source directories
-2. Check dependency health: are imports clean? Any circular deps?
-3. Check test coverage: find test directories/files — are critical paths tested?
-4. Check for:
-   - Modules/classes doing too much (SRP violations >150 lines)
-   - Functions/modules with mixed concerns
-   - API routes missing validation
-   - Shared state that should be local (or vice versa)
-   - Over-abstraction (wrappers that add nothing)
-   - Under-abstraction (copy-paste that should be shared)
-   - Security: hardcoded values, missing auth checks, exposed secrets
+Read the project structure, then explore source directories with fresh eyes. Assess the overall health of the architecture — dependency cleanliness, test coverage, module boundaries, abstraction levels.
+
+Think about structural integrity: are modules well-bounded? Are dependencies flowing in the right direction? Is there over-abstraction or under-abstraction? Are critical paths tested? But explore broadly — structural issues often hide in unexpected places. Trust your architectural intuition.
 
 ## Output
 
@@ -216,34 +230,13 @@ Produce a numbered change list. For each: target file, what to change, auto-fixa
 
 ### Phase 3: Apply Fixes
 
-**Auto-apply a fix if EITHER condition is met:**
+**Auto-apply a fix if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-**Apply these immediately. Log them as "Auto-applied" in the progress file.**
-
-**Ask only about remaining items (Medium/Low AND single-agent):**
-
-```
-AskUserQuestion(
-  questions: [{
-    question: "Auto-applied {N} fixes (Critical/High + consensus). {M} single-agent findings remain:",
-    header: "Remaining",
-    multiSelect: true,
-    options: [
-      { label: "Fix X: <title>", description: "Medium — <agent>: <file>: <one-line summary>" },
-      { label: "Fix Y: <title>", description: "Medium — <agent>: <file>: <one-line summary>" }
-    ]
-  }]
-)
-```
-
-**If no remaining items after auto-apply:** Skip the question entirely — just report what was applied.
-
-**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
-
-**Apply approved fixes** using Edit tool. You are the conductor — direct fixes are faster than spawning an engineer for hygiene work.
+**Apply these immediately. Log them as "Auto-applied" in the progress file with the consensus type.**
 
 After each batch of fixes:
 
@@ -253,9 +246,17 @@ Run project quality checks (see AGENTS.md > Project Commands > Quality gate)
 
 If checks fail, revert the breaking fix and note it as non-auto-fixable.
 
-**Non-auto-fixable items:**
+**Defer remaining findings (DO NOT ask user per-round):**
 
-Collect these for user presentation after the loop.
+After auto-applying, any remaining changes (Medium/Low severity AND only flagged by a single agent with no cross-round match) are added to the consensus registry — NOT presented to the user.
+
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {file:line} | {one-line summary} |
+```
+
+**Non-auto-fixable items** (need judgment, not just low consensus) are also tracked in the registry with a `NO-AUTOFIX` tag for presentation in Phase 5.
 
 ### Phase 4: Convergence Check + Progress
 
@@ -286,6 +287,35 @@ IF this round found same issues as last round -> force finalize (agents are circ
 
 ## Phase 5: Finalize
 
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Combine two categories into a single presentation:
+
+1. **No-consensus findings:** Single-agent findings that never recurred across rounds
+2. **Non-auto-fixable items:** Findings tagged `NO-AUTOFIX` that need judgment regardless of consensus
+
+**If nothing remains:** Skip — proceed to quality gate.
+
+**If items remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} items remain for your decision:",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Fix X: <title>", description: "Round {R}, {severity} — {agent}: {file} — <one-line summary>" },
+      { label: "Fix Y: <title>", description: "NO-AUTOFIX, {severity} — {agent}: {file} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved fixes** using Edit tool.
+
 ### Quality Gate
 
 ```bash
@@ -309,41 +339,41 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 git push
 ```
 
-### Present Deferred Items
-
-If non-auto-fixable items exist, present them:
-
-```
-## Hygiene Review: Items Needing Your Decision
-
-### Item N: <title>
-**Severity:** Critical | High | Medium
-**File:** path/to/file:line
-**Found by:** {agent role(s)}
-**Issue:** {description}
-**Options:**
-- [A] {option} (Recommended)
-- [B] {option}
-```
-
-Use `AskUserQuestion` with `multiSelect: true` if there are actionable choices. Group by severity.
-
 ### Report
 
 ```markdown
 ## Hygiene Review Summary
 
 **Scope:** {full codebase | recent N commits | directory}
-**Rounds:** {count}
-**Findings:** {total} ({by severity})
-**Fixed:** {count} auto-fixed
-**Deferred:** {count} for user decision
+**Rounds:** {CURRENT_ROUND}
 
-**Areas Reviewed:**
+### Convergence
+
+Round  Bug Hunter  Explorer  Structural  Total  Applied  Deferred
+  1      {n}         {n}       {n}        {n}     {n}       {n}
+  2      {n}         {n}       {n}        {n}     {n}       {n}
+  3      {n}         {n}       {n}        {n}     {n}       {n}
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
+
+### Areas Reviewed
 
 - {list key files/directories agents explored}
 
-**Health Assessment:**
+### Health Assessment
 
 - Tests: {PASS/FAIL}
 - Type-check: {PASS/FAIL}
@@ -390,9 +420,11 @@ Use `/hygiene` for general codebase health between sessions or as a daily mainte
 
 - **Codebase-wide, not feature-scoped** — agents explore freely (unless user constrains)
 - **Fresh eyes each round** — direct agents to unexplored files in subsequent rounds
-- **Fix what's clear, defer what's not** — don't make architectural decisions without the user
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus + non-auto-fixable items presented once in Phase 5, not per-round
 - **Quality gate before commit** — type-check + lint + test + build must pass
-- **Findings files survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
+- **Findings files + consensus registry survive compaction** — always read from `$ARTIFACTS_DIR`, not memory
 - **Don't invent issues** — if the codebase is clean, say so and finish early
 
 ---

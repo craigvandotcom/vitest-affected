@@ -8,6 +8,15 @@ Competitive framing: agents compete — only evidence-backed findings count. Cod
 
 ---
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Approved plan file (from `/plan-init`)                                                     |
+| **Output**       | Refined plan (in-place edit), Refinement Log appended                                      |
+| **Artifacts**    | Round findings in `$ARTIFACTS_DIR/round-{N}-{role}.md`, consensus registry                 |
+| **Verification** | Convergence trend (fewer findings each round), plan committed                              |
+
 ## Phase 0: Initialize
 
 ```bash
@@ -52,6 +61,22 @@ ARTIFACTS_DIR=/tmp/plan-refine-internal-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ARTIFACTS_DIR"
 ```
 
+### Initialize Consensus Registry
+
+Create the cross-round tracking file for single-agent findings:
+
+```bash
+cat > "$ARTIFACTS_DIR/consensus-registry.md" <<'EOF'
+# Consensus Registry
+
+Tracks single-agent findings across rounds. If a finding recurs in a later round, it achieves cross-round consensus and is auto-applied.
+
+## Deferred Findings
+
+<!-- Format: | Round | Agent | Severity | Summary | Section | -->
+EOF
+```
+
 ### Checkpoint Original Plan
 
 ```bash
@@ -59,6 +84,16 @@ git add "$PLAN_FILE" && git commit -m "docs(plan): checkpoint before plan-refine
 
 Co-Authored-By: Claude <noreply@anthropic.com>" || true
 ```
+
+### Create Workflow Tasks
+
+```
+TaskCreate(subject: "Phase 0: Initialize plan-refine", description: "Identify plan, select tier, checkpoint, create consensus registry", activeForm: "Initializing plan-refine...")
+TaskCreate(subject: "Phases 1-4: Refinement loop", description: "Parallel agents per round, synthesize, apply, convergence check. Repeat up to MAX_ROUNDS.", activeForm: "Refining plan...")
+TaskCreate(subject: "Phase 5: Finalize", description: "Present no-consensus findings, commit, report", activeForm: "Finalizing refinement...")
+```
+
+**TaskUpdate(task: "Phase 0", status: "completed")**
 
 ---
 
@@ -70,7 +105,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>" || true
 PLAN_CONTENT = Read(PLAN_FILE)
 ```
 
-**Compaction recovery:** If PLAN_CONTENT contains a `## Refinement Log` section, parse the last `### Round N` entry to recover CURRENT_ROUND (set to N+1). Previous rounds' changes are already applied to the plan. Read any existing findings files in `ARTIFACTS_DIR` for context on the most recent round.
+**Compaction recovery:** If PLAN_CONTENT contains a `## Refinement Log` section, parse the last `### Round N` entry to recover CURRENT_ROUND (set to N+1). Previous rounds' changes are already applied to the plan. Read any existing findings files in `ARTIFACTS_DIR` for context on the most recent round. If `$ARTIFACTS_DIR/consensus-registry.md` exists, read it to recover the deferred findings pool for cross-round consensus detection.
 
 **Skill routing:** Scan plan content for domain keywords. Check `AGENTS.md` > "Available Skills" for relevant skills. Include a line in each subagent prompt: `"Domain skills relevant to this plan: <list>. Read the corresponding skill file when evaluating sections that touch those domains."`
 
@@ -93,13 +128,14 @@ For each issue: ## Issue N: Title | Severity: Critical/High/Medium | Section: X 
 ```
 First: read AGENTS.md for project context.
 
-You are a practical implementer and spec auditor. Can I build this tomorrow?
+You are a practical implementer and spec auditor. You compete with 2 other reviewers — only evidence-backed findings count. Can I build this tomorrow?
 
 Check: steps complete and unambiguous, dependencies correctly ordered, every deliverable owned by exactly one phase, no gaps between what one phase produces and the next requires. Trace what each phase produces vs what the next phase consumes.
 
 You have codebase access. Read referenced files to confirm functions/types exist with claimed signatures. For each issue: quote the plan, show what code actually has, state what's needed.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-builder.md using the Write tool.
 ```
@@ -111,13 +147,14 @@ Task(subagent_type: "general-purpose", model: "{AGENT_MODEL}", description: "Bui
 ```
 First: read AGENTS.md for project context.
 
-You are an adversary and architect critic. What breaks?
+You are an adversary and architect critic. You compete with 2 other reviewers — only evidence-backed findings count. What breaks?
 
 Check: silent failures (wrong results, no error), race conditions on shared state, missing error paths, wrong abstractions, tight coupling. Show the scenario: given [precondition], when [action], then [bad outcome]. Check: do new fields survive existing read-modify-write cycles?
 
 You have codebase access. Read write paths for shared data structures. Cite specific files and functions. Skip theoretical risks — every finding needs a concrete scenario.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-breaker.md using the Write tool.
 ```
@@ -129,13 +166,14 @@ Task(subagent_type: "general-purpose", model: "{AGENT_MODEL}", description: "Bre
 ```
 First: read AGENTS.md for project context.
 
-You are a simplifier and devil's advocate. What to cut, and is this the right approach?
+You are a simplifier and devil's advocate. You compete with 2 other reviewers — only evidence-backed findings count. What to cut, and is this the right approach?
 
 Check: what can be deleted without losing core value, what's built for v3 but not needed now, where abstraction adds overhead without reuse, whether a fundamentally simpler approach achieves 90% of the value at 30% of the cost. If a fundamentally simpler approach exists, that's your highest-priority finding.
 
 You have codebase access. Verify claimed constraints are real, not assumed. Your only verbs: remove, defer, inline, collapse. Challenge the approach itself — not just the details.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-trimmer.md using the Write tool.
 ```
@@ -151,11 +189,12 @@ First: read AGENTS.md for project context.
 
 You are a systems architect. You compete with 5 other reviewers -- only evidence-grounded findings matter.
 
-Check: structural flaws (wrong abstractions, misplaced responsibilities, tight coupling), data flow integrity (trace 2-3 key flows end-to-end through source files), dependency direction (cycles, upward deps), integration boundaries (clean and minimal?), scale at 10x.
+Explore the plan's architecture with fresh eyes. Trace 2-3 key data flows end-to-end through actual source files. Look for structural flaws — wrong abstractions, misplaced responsibilities, tight coupling, dependency direction issues, integration boundaries. But trust your architectural intuition and follow whatever threads interest you.
 
-You have codebase access. Read actual source files to verify client/server context, data shapes, import chains. If the plan says "X calls Y", open both files and confirm. For each finding: what you checked, what you found, why it's a problem.
+You have codebase access. Read actual source files to verify the plan's claims. If the plan says "X calls Y", open both files and confirm. For each finding: what you checked, what you found, why it's a problem.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-architect.md using the Write tool.
 ```
@@ -169,11 +208,12 @@ First: read AGENTS.md for project context.
 
 You are an adversarial reviewer. Your job is to BREAK this plan. You compete with 5 other reviewers -- only real, demonstrable breaks count.
 
-Check: unstated assumptions (flip each one -- does the plan survive?), silent failures (wrong results, no error), data integrity (all write paths to shared state -- do new fields survive read-modify-write?), race conditions, security (verify auth patterns actually exist).
+Your job is to break this plan. Flip every assumption and see if the plan survives. Explore write paths to shared data structures, trace auth flows, look for silent failures and race conditions. But don't limit yourself — if you find a way to break it that isn't in any checklist, that's your best finding.
 
-You have codebase access. Read ALL existing write paths for shared data structures. Verify auth middleware/factories exist. Cite specific files and functions. Show the scenario: given [precondition], when [action], then [bad outcome].
+You have codebase access. Read the actual code to verify claims. Cite specific files and functions. Show the scenario: given [precondition], when [action], then [bad outcome].
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-adversary.md using the Write tool.
 ```
@@ -192,6 +232,7 @@ Check: inversion test (for each major decision, argue the opposite), hidden cons
 You have codebase access. Read referenced plans and actual code to verify claimed constraints are real, not assumed. Be intellectually honest -- if the approach is genuinely best, say so, then find the ONE thing it got wrong.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-devils-advocate.md using the Write tool.
 ```
@@ -210,6 +251,7 @@ Check: blocking ambiguity (steps where you'd guess), hidden complexity (looks li
 You have codebase access. Read EVERY file the plan references. Verify functions, types, utilities exist with claimed signatures. For each issue: quote the plan's claim, show what the code actually has, state what's needed.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-implementer.md using the Write tool.
 ```
@@ -228,6 +270,7 @@ Check: gaps (trace each phase's inputs -- does a prior phase produce them?), con
 You have codebase access. For each referenced function, type, or factory -- read the source. Verify it exists, is exported, has the claimed signature.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-spec-auditor.md using the Write tool.
 ```
@@ -246,6 +289,7 @@ Check: remove (delete without losing core value?), defer (built for v3 but not n
 DO NOT suggest adding anything. Your only verbs: remove, simplify, defer, inline.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-simplifier.md using the Write tool.
 ```
@@ -273,36 +317,27 @@ Produce a numbered change list. For each item: target section, what to change, n
 
 ### Auto-Apply Rules (DO NOT ask about these)
 
-**Auto-apply a change if EITHER condition is met:**
+**Auto-apply a change if ANY condition is met:**
 
 1. **Severity-based:** The issue is Critical or High severity — these are defects, not preferences
-2. **Consensus-based:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+2. **Same-round consensus:** 2+ agents independently flagged the same issue (regardless of severity) — multi-agent agreement is high-signal
+3. **Cross-round consensus:** A single-agent finding from THIS round matches a deferred finding in the consensus registry from a PREVIOUS round — recurrence across rounds is high-signal
 
-**Apply these immediately using the Edit tool. Log them in the round summary as "Auto-applied".**
+**Apply these immediately using the Edit tool. Log them in the round summary as "Auto-applied" with the consensus type.**
 
-### Ask Only About Remaining Items
+### Defer Remaining Findings (DO NOT ask user per-round)
 
-After auto-applying, if any changes remain (Medium/Low severity AND only flagged by a single agent), present them:
+After auto-applying, any remaining changes (Medium/Low severity AND only flagged by a single agent with no cross-round match) are added to the consensus registry — NOT presented to the user.
 
-```
-AskUserQuestion(
-  questions: [{
-    question: "Auto-applied {N} changes (Critical/High + consensus). {M} single-agent findings remain:",
-    header: "Remaining",
-    multiSelect: true,
-    options: [
-      { label: "Change X: <title>", description: "Medium — <agent name>: <one-line summary>" },
-      { label: "Change Y: <title>", description: "Low — <agent name>: <one-line summary>" }
-    ]
-  }]
-)
+For each deferred finding, append to `$ARTIFACTS_DIR/consensus-registry.md`:
+
+```markdown
+| {CURRENT_ROUND} | {agent role} | {severity} | {one-line summary} | {plan section} |
 ```
 
-**If no remaining items after auto-apply:** Skip the question entirely — just report what was applied.
-
-**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
-
-**Apply approved changes using the Edit tool. You already know the exact changes.**
+These deferred findings serve two purposes:
+- **Cross-round consensus detection:** If a later round's agent flags the same issue, it auto-applies
+- **Final presentation:** Any findings that never achieve consensus are presented to the user once in Phase 5
 
 **After applying edits, append a round summary to the plan file:**
 
@@ -332,6 +367,32 @@ IF CURRENT_ROUND >= MAX_ROUNDS -> force finalize (note unverified fixes in Refin
 
 ## Phase 5: Finalize
 
+### Present Remaining No-Consensus Findings (once)
+
+Read the consensus registry. Any deferred findings that never achieved cross-round consensus are presented to the user in a single batch:
+
+**If no remaining deferred findings:** Skip — just proceed to commit.
+
+**If deferred findings remain:**
+
+```
+AskUserQuestion(
+  questions: [{
+    question: "All consensus findings applied across {CURRENT_ROUND} rounds. {N} single-agent findings never confirmed. Apply any of these?",
+    header: "Remaining",
+    multiSelect: true,
+    options: [
+      { label: "Change X: <title>", description: "Round {R}, {severity} — {agent}: {section} — <one-line summary>" },
+      { label: "Change Y: <title>", description: "Round {R}, {severity} — {agent}: {section} — <one-line summary>" }
+    ]
+  }]
+)
+```
+
+**If more than 4 remaining items:** Split across multiple `AskUserQuestion` calls.
+
+**Apply any user-approved findings using the Edit tool.**
+
 ### Safety Check and Commit
 
 ```bash
@@ -360,7 +421,42 @@ find "$ARTIFACTS_DIR" -mindepth 1 -delete && rmdir "$ARTIFACTS_DIR" 2>/dev/null 
 
 ### Summary
 
-Report: rounds completed, tier used, total changes applied, top agent contributions (one line each), stop reason.
+```markdown
+## Plan Refinement Complete ({TIER})
+
+**Plan:** {PLAN_FILE}
+**Tier:** {TIER} ({AGENT_COUNT}x {AGENT_MODEL})
+**Rounds:** {CURRENT_ROUND}
+
+### Convergence
+
+Round  Crit  High  Med   Total  Applied  Deferred
+  1     {n}   {n}   {n}   {n}     {n}       {n}
+  2     {n}   {n}   {n}   {n}     {n}       {n}
+  ...
+
+R1  {▓▓░░░████}  {total}
+R2  {░████}      {total}  {-N%}
+R3  {██}         {total}  {-N%}
+
+▓ Critical  ░ High  █ Medium
+
+### Resolution
+
+Found: {total} across {CURRENT_ROUND} rounds
+  ├─ Auto-applied (severity):      {n}  {bars}
+  ├─ Auto-applied (same-round):    {n}  {bars}
+  ├─ Auto-applied (cross-round):   {n}  {bars}
+  ├─ User-approved:                {n}  {bars}
+  └─ Discarded (no consensus):     {n}  {bars}
+
+### Top Agent Contributions
+
+- **{agent}:** {key finding pattern}
+- **{agent}:** {key finding pattern}
+
+**Stop reason:** {severity converged | MAX_ROUNDS | clean round}
+```
 
 **Present next step choice with `AskUserQuestion`:**
 
@@ -371,9 +467,9 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Beadify (Recommended)", description: "Run /beadify — convert refined plan to beads with parallel validation" },
+      { label: "Plan clean (Recommended)", description: "Run /plan-clean — final correctness check before beadification" },
+      { label: "Beadify directly", description: "Run /beadify — skip correctness check, convert to beads now" },
       { label: "External multi-model refine", description: "Run /plan-refine-external — multiple diverse AI models for deeper review" },
-      { label: "Implement directly", description: "Skip beadification — implement from plan directly" },
       { label: "Done for now", description: "Plan saved and committed — pick up later" }
     ]
   }]
@@ -385,10 +481,12 @@ AskUserQuestion(
 ## Remember
 
 - YOU synthesize and apply edits directly — never delegate synthesis or spawn subagents for edits
-- **Auto-apply Critical/High + consensus (2+ agents) — only ask about single-agent Medium/Low**
+- **Auto-apply Critical/High + same-round consensus + cross-round consensus — defer the rest**
+- **Cross-round consensus:** single-agent findings that recur in later rounds are high-signal — auto-apply on match
+- **One human touchpoint:** remaining no-consensus findings presented once in Phase 5, not per-round
 - Trimmer/Simplifier counterbalances other agents — don't let them pile on complexity
 - Evidence over opinion — findings need file citations, not speculation
-- Findings files in ARTIFACTS_DIR persist through compaction — always read from files, not memory
+- Findings files + consensus registry in ARTIFACTS_DIR persist through compaction — always read from files, not memory
 - Refinement Log in plan file is your compaction recovery — parse it to know where you left off
 
 ---
