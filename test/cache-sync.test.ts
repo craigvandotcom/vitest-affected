@@ -336,6 +336,109 @@ describe('loadOrBuildGraphSync', () => {
 });
 
 // ---------------------------------------------------------------------------
+// bd-3hg: runtimeEdges persistence
+// ---------------------------------------------------------------------------
+
+describe('runtimeEdges persistence', () => {
+  test('round-trip: saveGraphSyncInternal with runtimeEdges, loadOrBuildGraphSync returns them in reverse', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    // Use an empty forward map so diffGraphMtimes produces no changes (cache hit guaranteed)
+    const forward = new Map<string, Set<string>>();
+    const mtimes = new Map<string, number>();
+
+    // Define runtime edges: source file -> set of test files that loaded it
+    const srcFile = '/abs/src/utils.ts';
+    const testFile = '/abs/tests/utils.test.ts';
+    const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
+
+    saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
+
+    const { reverse } = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    // Runtime edge should be in the reverse map
+    expect(reverse.has(srcFile)).toBe(true);
+    expect(reverse.get(srcFile)?.has(testFile)).toBe(true);
+  });
+
+  test('save without runtimeEdges preserves existing runtimeEdges (read-merge-write)', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const forward = new Map<string, Set<string>>();
+    const mtimes = new Map<string, number>();
+
+    const srcFile = '/abs/src/lib.ts';
+    const testFile = '/abs/tests/lib.test.ts';
+    const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
+
+    // First save WITH runtime edges
+    saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
+
+    // Second save WITHOUT runtime edges (simulating watch filter save)
+    saveGraphSyncInternal(forward, cacheDir, mtimes);
+
+    // Read cache file directly and verify runtimeEdges field is preserved
+    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as {
+      version: number;
+      files: Record<string, unknown>;
+      runtimeEdges?: Record<string, string[]>;
+    };
+
+    expect(parsed.runtimeEdges).toBeDefined();
+    expect(parsed.runtimeEdges![srcFile]).toEqual([testFile]);
+  });
+
+  test('ENOENT on fresh install: saveGraphSyncInternal without runtimeEdges does not throw', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    // No cache file exists yet (fresh install)
+    const forward = new Map<string, Set<string>>();
+
+    expect(() => saveGraphSyncInternal(forward, cacheDir)).not.toThrow();
+
+    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { runtimeEdges?: unknown };
+    expect(parsed.runtimeEdges).toBeUndefined();
+  });
+
+  test('full rebuild discards runtimeEdges: loadOrBuildGraphSync on stale cache does not include them', () => {
+    const rootDir = fixtureDir('simple');
+    const cacheDir = makeTmpDir();
+    tempDirs.push(cacheDir);
+
+    // Write a cache with a real fixture file at stale mtime=0 and runtimeEdges
+    // diffGraphMtimes detects the mtime mismatch → full rebuild is triggered
+    const realFile = path.join(rootDir, 'src', 'a.ts');
+    const srcFile = '/abs/src/runtime-src.ts';
+    const testFile = '/abs/tests/runtime.test.ts';
+    const cacheData = {
+      version: 1,
+      builtAt: Date.now(),
+      files: {
+        [realFile]: { mtime: 0, imports: [] }, // stale mtime → triggers rebuild
+      },
+      runtimeEdges: { [srcFile]: [testFile] },
+    };
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(path.join(cacheDir, 'graph.json'), JSON.stringify(cacheData), 'utf-8');
+
+    // loadOrBuildGraphSync detects the stale mtime and calls buildFullGraphSync
+    // buildFullGraphSync starts fresh — runtime edges from old cache are NOT merged
+    const { reverse } = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    // The previously persisted runtime edges must NOT appear
+    expect(reverse.has(srcFile)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // saveGraphSyncInternal
 // ---------------------------------------------------------------------------
 

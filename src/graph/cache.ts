@@ -25,6 +25,7 @@ interface CacheDiskFormat {
   version: 1;
   builtAt: number;
   files: Record<string, CacheFileEntry>;
+  runtimeEdges?: Record<string, string[]>;
 }
 
 const CACHE_VERSION = 1;
@@ -169,12 +170,24 @@ export async function loadOrBuildGraph(
     );
   }
 
-  return entriesToMaps(refreshed);
+  const { forward, reverse } = entriesToMaps(refreshed);
+
+  // Merge persisted runtime edges into the reverse map
+  if (disk.runtimeEdges) {
+    for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
+      if (!reverse.has(file)) reverse.set(file, new Set(tests));
+      else for (const t of tests) reverse.get(file)!.add(t);
+    }
+  }
+
+  return { forward, reverse };
 }
 
 /**
  * Serialize the forward graph to disk in JSON v1 format.
  * Uses an atomic temp-then-rename write strategy.
+ *
+ * Phase 3: async path is startup-only; runtime edges persisted via saveGraphSyncInternal
  *
  * @param forward   Forward dependency map (file → Set of imported files)
  * @param cacheDir  Directory where `graph.json` should be written
@@ -302,11 +315,17 @@ export function loadCachedMtimes(cacheDir: string): Map<string, number> {
  * If `mtimes` is provided, use it instead of stat-ing files again.
  * If not provided, calls `statAllFiles` internally.
  * Note: second stat pass per batch — accepted for simpler API surface.
+ *
+ * When `runtimeEdges` is PROVIDED: serializes and includes in the JSON payload.
+ * When `runtimeEdges` is OMITTED (e.g., watch filter save): reads the existing
+ * cache file and preserves its `runtimeEdges` field (read-merge-write pattern).
+ * This prevents the watch filter from erasing previously persisted runtime edges.
  */
 export function saveGraphSyncInternal(
   forward: Map<string, Set<string>>,
   cacheDir: string,
   mtimes?: Map<string, number>,
+  runtimeEdges?: Map<string, Set<string>>,
 ): void {
   mkdirSync(cacheDir, { recursive: true });
 
@@ -320,10 +339,37 @@ export function saveGraphSyncInternal(
     };
   }
 
+  let serializedRuntimeEdges: Record<string, string[]> | undefined;
+
+  if (runtimeEdges !== undefined) {
+    // Caller provided runtime edges — serialize them
+    serializedRuntimeEdges = {};
+    for (const [file, tests] of runtimeEdges) {
+      serializedRuntimeEdges[file] = [...tests];
+    }
+  } else {
+    // runtimeEdges omitted — read-merge-write: preserve existing from disk
+    const cachePath = path.join(cacheDir, GRAPH_FILE);
+    try {
+      const raw = readFileSync(cachePath, 'utf-8');
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as CacheDiskFormat).runtimeEdges !== undefined
+      ) {
+        serializedRuntimeEdges = (parsed as CacheDiskFormat).runtimeEdges;
+      }
+    } catch {
+      // ENOENT or JSON parse error — no existing runtime edges to preserve
+    }
+  }
+
   const payload: CacheDiskFormat = {
     version: CACHE_VERSION,
     builtAt: Date.now(),
     files,
+    ...(serializedRuntimeEdges !== undefined ? { runtimeEdges: serializedRuntimeEdges } : {}),
   };
 
   const json = JSON.stringify(payload);
@@ -398,5 +444,15 @@ export function loadOrBuildGraphSync(
     entries.set(filePath, entry.imports);
   }
 
-  return entriesToMaps(entries);
+  const { forward, reverse } = entriesToMaps(entries);
+
+  // Merge persisted runtime edges into the reverse map
+  if (disk.runtimeEdges) {
+    for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
+      if (!reverse.has(file)) reverse.set(file, new Set(tests));
+      else for (const t of tests) reverse.get(file)!.add(t);
+    }
+  }
+
+  return { forward, reverse };
 }
