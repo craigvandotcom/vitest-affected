@@ -10,7 +10,15 @@ import {
 } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { buildFullGraph, buildFullGraphSync, createResolver, resolveFileImports } from './builder.js';
+import { glob } from 'tinyglobby';
+import {
+  buildFullGraph,
+  buildFullGraphSync,
+  createResolver,
+  resolveFileImports,
+  GRAPH_GLOB_PATTERN,
+  GRAPH_GLOB_IGNORE,
+} from './builder.js';
 
 // ---------------------------------------------------------------------------
 // Disk format v1
@@ -246,6 +254,36 @@ export async function loadOrBuildGraph(
   if (verbose && staleCount > 0) {
     console.warn(
       `[vitest-affected] cache hit, ${staleCount} stale file(s) reparsed`,
+    );
+  }
+
+  // --- Glob-based discovery: find new files not present in the refreshed map ---
+  // Files added to the project after the cache was written are invisible to the
+  // stale-refresh loop above (which only iterates disk.files). We glob for source
+  // files using the same patterns as buildFullGraph and parse any that are new.
+  const allSourceFiles = await glob(GRAPH_GLOB_PATTERN, {
+    cwd: rootDir,
+    absolute: true,
+    ignore: GRAPH_GLOB_IGNORE,
+  });
+
+  let newFileCount = 0;
+  for (const file of allSourceFiles) {
+    if (refreshed.has(file)) continue; // already in the refreshed map — skip
+    newFileCount++;
+    try {
+      const source = await readFile(file, 'utf-8');
+      const imports = resolveFileImports(file, source, rootDir, resolver);
+      refreshed.set(file, imports);
+    } catch {
+      // Read error — add the file with empty imports so it appears in the graph
+      refreshed.set(file, []);
+    }
+  }
+
+  if (verbose && newFileCount > 0) {
+    console.warn(
+      `[vitest-affected] cache hit, ${newFileCount} new file(s) discovered and parsed`,
     );
   }
 
