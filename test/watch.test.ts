@@ -1,16 +1,20 @@
 /// <reference types="vitest/config" />
-import { describe, test, expect, beforeEach, afterEach } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 import {
   mkdirSync,
   mkdtempSync,
   writeFileSync,
+  readFileSync,
   lstatSync,
   rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import type { Reporter, TestRunEndReason } from 'vitest/reporters';
+import type { TestModule } from 'vitest/node';
 import { vitestAffected } from '../src/plugin.js';
 import { saveGraphSyncInternal } from '../src/graph/cache.js';
+import * as cacheModule from '../src/graph/cache.js';
 
 // ---------------------------------------------------------------------------
 // Env save/restore (same pattern as plugin.test.ts)
@@ -378,5 +382,194 @@ describe('watch filter callback behavior', () => {
     // Third call also within same batch: passes through
     const thirdResult = filter!({ moduleId: mainTestTs });
     expect(thirdResult).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bd-7rv: accumulatedRuntimeEdges — edges accumulate across watch batches
+// ---------------------------------------------------------------------------
+
+function createMockTestModule(
+  moduleId: string,
+  importDurations: Record<string, { selfTime: number; totalTime: number }>,
+): TestModule {
+  return {
+    moduleId,
+    diagnostic: () => ({ importDurations }),
+  } as unknown as TestModule;
+}
+
+/**
+ * Helper: extract the runtime reporter injected by the plugin's config() hook.
+ */
+function extractReporter(
+  plugin: ReturnType<typeof vitestAffected>,
+): Reporter {
+  const config = { test: { reporters: ['default'] } };
+  (plugin as { config: (cfg: Record<string, unknown>) => void }).config(
+    config as Record<string, unknown>,
+  );
+  const reporters = (config.test as { reporters: unknown[] }).reporters;
+  return reporters[reporters.length - 1] as Reporter;
+}
+
+/**
+ * Helper: invoke the plugin's configureVitest hook with a minimal watch context.
+ */
+async function invokeConfigureVitest(
+  plugin: ReturnType<typeof vitestAffected>,
+  tmpDir: string,
+): Promise<void> {
+  const mockProject = {
+    config: {
+      include: ['tests/**/*.test.ts'],
+      exclude: [] as string[],
+      setupFiles: [] as string[],
+    },
+  };
+  const mockVitest = {
+    config: { root: tmpDir, watch: true },
+    projects: [mockProject],
+    onFilterWatchedSpecification: (_cb: unknown) => { /* noop */ },
+  };
+  const hook = (plugin as Record<string, unknown>).configureVitest as (ctx: {
+    vitest: typeof mockVitest;
+    project: typeof mockProject;
+  }) => Promise<void>;
+  await hook({ vitest: mockVitest, project: mockProject });
+}
+
+describe('bd-7rv: accumulatedRuntimeEdges across watch batches', () => {
+  test('saveGraphSyncInternal is called with accumulatedRuntimeEdges, not raw per-call edges', async () => {
+    // This test verifies that the onEdgesCollected callback passes accumulatedRuntimeEdges
+    // (the closure accumulator) to saveGraphSyncInternal, not just the current call's edges.
+    // We spy on saveGraphSyncInternal and check what runtimeEdges argument it receives.
+
+    const { tmpDir, mainTs, mainTestTs } = setupWatchFixture();
+
+    const srcA = mainTs;
+    const testA = mainTestTs;
+
+    const plugin = vitestAffected({ changedFiles: [], cache: true });
+    const reporter = extractReporter(plugin);
+    await invokeConfigureVitest(plugin, tmpDir);
+
+    // Spy AFTER invokeConfigureVitest (which calls saveGraphSyncInternal internally)
+    const saveSpy = vi.spyOn(cacheModule, 'saveGraphSyncInternal');
+
+    // Fire one batch — verify saveGraphSyncInternal receives a Map (accumulatedRuntimeEdges)
+    reporter.onTestModuleEnd!(createMockTestModule(testA, {
+      [srcA]: { selfTime: 1, totalTime: 2 },
+    }));
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    // The onEdgesCollected callback should have called saveGraphSyncInternal once
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    // The 4th argument (runtimeEdges) should be a Map (the accumulator)
+    const callArgs = saveSpy.mock.calls[0];
+    const runtimeEdgesArg = callArgs[3] as Map<string, Set<string>> | undefined;
+    expect(runtimeEdgesArg).toBeInstanceOf(Map);
+    expect(runtimeEdgesArg!.has(srcA)).toBe(true);
+    expect(runtimeEdgesArg!.get(srcA)!.has(testA)).toBe(true);
+  });
+
+  test('failed save preserves accumulatedRuntimeEdges — next batch includes both batches edges', async () => {
+    // If saveGraphSyncInternal throws during onEdgesCollected, accumulatedRuntimeEdges
+    // must NOT be reset. The next successful batch save should include both batches' edges.
+
+    const { tmpDir, mainTs, libTs, mainTestTs } = setupWatchFixture();
+    const cacheDir = path.join(tmpDir, '.vitest-affected');
+
+    const srcA = mainTs;
+    const srcB = libTs;
+    const testA = mainTestTs;
+
+    const plugin = vitestAffected({ changedFiles: [], cache: true });
+    const reporter = extractReporter(plugin);
+    await invokeConfigureVitest(plugin, tmpDir);
+
+    // Make the first save throw to simulate a disk error
+    const saveSpy = vi.spyOn(cacheModule, 'saveGraphSyncInternal');
+    let callCount = 0;
+    saveSpy.mockImplementation((...args) => {
+      callCount++;
+      if (callCount === 1) {
+        // First call from onEdgesCollected: throw to simulate failure
+        throw new Error('simulated disk error');
+      }
+      // Subsequent calls: use real implementation
+      return (saveGraphSyncInternal as (...args: unknown[]) => void)(...args);
+    });
+
+    // Batch 1: srcA → testA (save fails → accumulator NOT reset)
+    reporter.onTestModuleEnd!(createMockTestModule(testA, {
+      [srcA]: { selfTime: 1, totalTime: 2 },
+    }));
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    // Restore to real implementation for batch 2
+    saveSpy.mockRestore();
+
+    // Batch 2: srcB → testA (save succeeds → accumulator has BOTH srcA + srcB)
+    reporter.onTestModuleEnd!(createMockTestModule(testA, {
+      [srcB]: { selfTime: 1, totalTime: 2 },
+    }));
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    // Read the graph.json saved by batch 2
+    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as {
+      version: number;
+      files: Record<string, unknown>;
+      runtimeEdges?: Record<string, string[]>;
+    };
+
+    // Both srcA (from failed batch 1 accumulation) and srcB (batch 2) should appear
+    expect(parsed.runtimeEdges).toBeDefined();
+    expect(parsed.runtimeEdges![srcA]).toBeDefined();
+    expect(parsed.runtimeEdges![srcB]).toBeDefined();
+  });
+
+  test('accumulatedRuntimeEdges is reset after successful save — next batch starts fresh', async () => {
+    // After each successful save, accumulatedRuntimeEdges is reset to undefined.
+    // A subsequent batch starts fresh — it does NOT include edges from the prior batch.
+    // The graph.json after the second successful save contains only the second batch's edges.
+
+    const { tmpDir, mainTs, libTs, mainTestTs } = setupWatchFixture();
+    const cacheDir = path.join(tmpDir, '.vitest-affected');
+
+    const srcA = mainTs;
+    const srcB = libTs;
+    const testA = mainTestTs;
+
+    const plugin = vitestAffected({ changedFiles: [], cache: true });
+    const reporter = extractReporter(plugin);
+    await invokeConfigureVitest(plugin, tmpDir);
+
+    // Batch 1: srcA → testA (save succeeds → accumulator resets)
+    reporter.onTestModuleEnd!(createMockTestModule(testA, {
+      [srcA]: { selfTime: 1, totalTime: 2 },
+    }));
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    // Batch 2: srcB ONLY → testA (accumulator starts fresh — only srcB)
+    reporter.onTestModuleEnd!(createMockTestModule(testA, {
+      [srcB]: { selfTime: 1, totalTime: 2 },
+    }));
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    // Read the graph.json saved by batch 2
+    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as {
+      version: number;
+      files: Record<string, unknown>;
+      runtimeEdges?: Record<string, string[]>;
+    };
+
+    // Batch 2 only has srcB — srcA should NOT appear (accumulator was reset after batch 1)
+    expect(parsed.runtimeEdges).toBeDefined();
+    expect(parsed.runtimeEdges![srcB]).toBeDefined();
+    expect(parsed.runtimeEdges![srcA]).toBeUndefined();
   });
 });

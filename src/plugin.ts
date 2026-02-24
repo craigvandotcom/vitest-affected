@@ -143,6 +143,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   let reverse: Map<string, Set<string>>;
   let cacheDir: string | undefined;
   let runtimeSetRootDir: ((dir: string) => void) | null = null;
+  let accumulatedRuntimeEdges: Map<string, Set<string>> | undefined;
 
   return {
     name: 'vitest-affected',
@@ -159,10 +160,18 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (!cacheDir) return;
         if (!reverse) return;
         mergeRuntimeEdges(reverse, edges);
+        // Accumulate runtime edges across watch batches
+        if (!accumulatedRuntimeEdges) {
+          accumulatedRuntimeEdges = new Map();
+        }
+        mergeRuntimeEdges(accumulatedRuntimeEdges, edges);
         try {
-          saveGraphSyncInternal(forward, cacheDir, undefined, edges);
+          saveGraphSyncInternal(forward, cacheDir, undefined, accumulatedRuntimeEdges);
+          // Reset accumulator after successful save to avoid double-counting on future batches
+          accumulatedRuntimeEdges = undefined;
         } catch {
           // Best-effort: in-memory merge succeeded, disk persistence failed
+          // Do NOT reset accumulatedRuntimeEdges — retry on next batch
         }
       });
 
