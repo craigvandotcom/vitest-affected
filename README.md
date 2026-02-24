@@ -1,8 +1,32 @@
 # vitest-affected
 
-Intelligent test selection for Vitest. Maintains a dependency graph and runs only the tests affected by your changes.
+[![npm version](https://img.shields.io/npm/v/vitest-affected)](https://www.npmjs.com/package/vitest-affected)
+[![license](https://img.shields.io/npm/l/vitest-affected)](https://github.com/craigvandotcom/vitest-affected/blob/main/LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
 
-Instead of running your entire test suite on every change, `vitest-affected` builds a dependency graph of your project's imports and uses `git diff` to determine which source files changed. It then walks the graph in reverse to find exactly which test files need to run.
+Run only the tests affected by your changes. Zero config, full dependency graph analysis, sub-200ms overhead.
+
+```
+  Full suite:       162 tests | 45.2s
+  vitest-affected:    4 tests |  1.2s   (46 files changed → 97.5% reduction)
+```
+
+## Why
+
+Most test runners re-run everything or rely on simple file-name matching. `vitest-affected` builds a real import dependency graph of your project, diffs it against git, and walks the graph in reverse to find exactly which tests are impacted. If you change a utility buried three imports deep, only the tests that transitively depend on it will run.
+
+If anything fails — git error, parse failure, incomplete graph — it falls back to the full suite with a warning. It never silently skips tests.
+
+## Features
+
+- **Full import graph** — static imports, dynamic imports, re-exports via [oxc-parser](https://oxc.rs)
+- **Transitive dependency tracking** — BFS reverse-walk catches changes buried deep in the import chain
+- **Sub-200ms overhead** — 166ms to build a graph of 433 files (0.38ms/file)
+- **Disk caching** — graph persisted to `.vitest-affected/graph.json`, only changed files re-parsed on subsequent runs
+- **Watch mode** — runtime imports captured and merged into the static graph each cycle
+- **Config-change detection** — `package.json`, `tsconfig.json`, `vitest.config.*`, lockfile changes trigger full suite
+- **Safe by default** — any failure falls back to full suite, deleted files handled intelligently
+- **Observability** — optional JSON-line stats log for every run
 
 ## Install
 
@@ -12,9 +36,8 @@ npm install -D vitest-affected
 
 ## Setup
 
-Add the plugin to your `vitest.config.ts`:
-
 ```ts
+// vitest.config.ts
 import { defineConfig } from 'vitest/config';
 import { vitestAffected } from 'vitest-affected';
 
@@ -26,16 +49,41 @@ export default defineConfig({
 });
 ```
 
-That's it. On your next `vitest run`, only affected tests will execute.
+That's it. On your next `vitest run`, only affected tests execute.
 
 ## How It Works
 
-1. **Build a dependency graph** using [oxc-parser](https://github.com/nicolo-ribaudo/oxc) and [oxc-resolver](https://github.com/nicolo-ribaudo/oxc) (static imports, dynamic imports, re-exports)
-2. **Detect changed files** via `git diff` (unstaged, staged, and committed changes vs your base ref)
-3. **Walk the reverse graph** using BFS to find all test files that transitively depend on the changed files
-4. **Mutate `config.include`** so Vitest only runs the affected tests
+```
+git diff → changed files
+                ↓
+        oxc-parser + oxc-resolver → dependency graph (forward + reverse)
+                ↓
+        BFS on reverse graph → affected test files
+                ↓
+        mutate config.include → Vitest runs only those tests
+```
 
-If anything goes wrong (git fails, graph is incomplete), the plugin falls back to running the full test suite with a warning. It never silently skips tests. Deleted files are handled intelligently — if a deleted file is in the dependency graph, its dependent tests run; if it's not in the graph, it's ignored.
+1. **Detect changed files** via `git diff` — unstaged, staged, and committed changes vs your base ref (3 parallel git commands)
+2. **Build the dependency graph** — oxc-parser extracts imports, oxc-resolver resolves specifiers to absolute paths with full tsconfig support
+3. **Reverse-walk with BFS** — from each changed file, traverse all dependents to find affected test files
+4. **Filter test list** — mutate Vitest's `config.include` to only the affected tests
+
+## Performance
+
+Benchmarked on a real project (433 TypeScript/TSX files):
+
+```
+Phase      |  Total   | Per file
+-----------|----------|----------
+Read       |  14.9ms  | 0.034ms
+Hash       |   9.9ms  | 0.023ms
+Parse      |  99.7ms  | 0.230ms
+Resolve    |  41.2ms  | 0.095ms
+-----------|----------|----------
+TOTAL      | 165.8ms  | 0.383ms
+```
+
+With caching enabled (default), only files whose mtime changed are re-parsed. Subsequent runs pay only the delta cost.
 
 ## Options
 
@@ -53,7 +101,7 @@ vitestAffected({
   // Print diagnostic info about graph building and test selection
   verbose: true,
 
-  // When true, allow 0 affected tests (skip entire suite). Default: false (runs full suite instead)
+  // When true, allow 0 affected tests (skip entire suite). Default: false (runs full suite)
   allowNoTests: false,
 
   // Enable dependency graph caching to disk (default: true)
@@ -67,49 +115,47 @@ vitestAffected({
 });
 ```
 
-### Environment Variable
-
-Set `VITEST_AFFECTED_DISABLED=1` to disable the plugin without changing config.
+Set `VITEST_AFFECTED_DISABLED=1` to disable without changing config.
 
 ## Caching
 
-Graph caching is enabled by default. The dependency graph is saved to `.vitest-affected/graph.json` after the first run. Subsequent runs reuse the cached graph — only files whose mtime has changed are re-parsed. This makes cold-start graph building a one-time cost.
+Enabled by default. The dependency graph is saved to `.vitest-affected/graph.json` after the first run. Subsequent runs reuse the cached graph — only files whose mtime has changed are re-parsed.
 
 Add `.vitest-affected/` to your `.gitignore`.
 
 ## Watch Mode
 
-In `vitest --watch` mode, the plugin uses Vitest's runtime reporter to capture actual module imports at test runtime. These runtime edges are merged into the static graph, so the next watch cycle has more accurate dependency information. This handles cases where static analysis can't resolve dynamic imports.
-
-## Requirements
-
-- **Vitest** >= 3.2.0
-- **Node.js** >= 18
-- A **git** repository (the plugin uses `git diff` to detect changes)
-
-## Config File Detection
-
-Changes to project config files automatically trigger a full test suite run:
-
-`package.json`, `tsconfig.json`, `vitest.config.*`, `vite.config.*`, lockfiles
-
-Changes to Vitest `setupFiles` also trigger a full rerun.
+In `vitest --watch`, the plugin captures actual runtime imports via Vitest's reporter and merges them into the static graph. This means the next watch cycle has more accurate dependency information, covering cases where static analysis can't resolve dynamic imports.
 
 ## Observability
 
 Enable `statsFile` to collect a JSON-line log of every run:
 
 ```jsonl
-{"timestamp":"2026-02-24T15:55:30Z","action":"selective","changedFiles":46,"deletedFiles":25,"affectedTests":4,"totalTests":162,"graphSize":492,"durationMs":229}
-{"timestamp":"2026-02-24T16:01:12Z","action":"full-suite","reason":"config-change","changedFiles":1,"deletedFiles":0,"graphSize":492,"durationMs":45}
+{"timestamp":"...","action":"selective","changedFiles":46,"deletedFiles":25,"affectedTests":4,"totalTests":162,"graphSize":492,"durationMs":229}
+{"timestamp":"...","action":"full-suite","reason":"config-change","changedFiles":1,"deletedFiles":0,"graphSize":492,"durationMs":45}
 ```
 
-Each line records what the plugin decided (selective or full-suite), why, and how many tests were affected. Useful for validating the plugin is working correctly over time.
+Each line records what the plugin decided, why, and how many tests were affected.
+
+## Requirements
+
+- **Vitest** >= 3.2.0
+- **Node.js** >= 18
+- A **git** repository
 
 ## Limitations
 
-- **Dynamic imports with template literals**: Imports like `` import(`./locale/${lang}.ts`) `` can't be statically resolved and are skipped
-- **Non-TypeScript/JavaScript files**: CSS, JSON, and other asset imports are excluded from the graph
+- **Template literal dynamic imports** — `` import(`./locale/${lang}.ts`) `` can't be statically resolved
+- **Non-JS/TS files** — CSS, JSON, and asset imports are excluded from the graph
+
+## Compared To
+
+| Approach | Scope | Accuracy |
+|----------|-------|----------|
+| Jest `--onlyChanged` | Direct file changes only | Misses transitive deps |
+| Nx affected | Workspace-level project granularity | No file-level selection |
+| **vitest-affected** | File-level, full transitive graph | Exact test selection |
 
 ## License
 
