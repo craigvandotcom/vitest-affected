@@ -2,7 +2,7 @@
 import type { Plugin } from 'vite';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
-import { existsSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { glob, globSync } from 'tinyglobby';
 import { buildFullGraph, GRAPH_GLOB_IGNORE } from './graph/builder.js';
@@ -19,6 +19,7 @@ export interface VitestAffectedOptions {
   threshold?: number;
   allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
   cache?: boolean; // Enable graph caching (default: true)
+  statsFile?: string; // Path to append JSON-line stats after each run (e.g. '.vitest-affected/stats.jsonl')
 }
 
 /**
@@ -137,6 +138,31 @@ export function mergeRuntimeEdges(
   }
 }
 
+function writeStatsLine(
+  statsFile: string,
+  rootDir: string,
+  data: {
+    action: string;
+    reason?: string;
+    changedFiles?: number;
+    deletedFiles?: number;
+    affectedTests?: number;
+    totalTests?: number;
+    graphSize?: number;
+    cacheHit?: boolean;
+    durationMs?: number;
+  },
+): void {
+  try {
+    const filePath = path.isAbsolute(statsFile) ? statsFile : path.resolve(rootDir, statsFile);
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...data });
+    appendFileSync(filePath, line + '\n');
+  } catch {
+    // Best-effort — never crash on stats writing
+  }
+}
+
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   // Hoisted state — shared between config() and configureVitest()
   let forward: Map<string, Set<string>>;
@@ -216,6 +242,8 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         const rootDir = vitest.config.root;
         const verbose = options.verbose ?? false;
+        const statsFile = options.statsFile;
+        const startMs = Date.now();
 
         // Capture BEFORE any mutation of project.config.include
         const originalInclude = [...project.config.include];
@@ -359,6 +387,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 8. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'no-changes',
+            changedFiles: 0, deletedFiles: 0, graphSize: forward.size,
+            durationMs: Date.now() - startMs,
+          });
           return;
         }
 
@@ -382,6 +415,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Config file change detected — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'config-change',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
           return;
         }
 
@@ -394,6 +432,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Setup file change detected — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'setup-file-change',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
           return;
         }
 
@@ -432,11 +475,23 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
             project.config.include = [];
+            if (statsFile) writeStatsLine(statsFile, rootDir, {
+              action: 'selective', reason: 'allow-no-tests',
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              affectedTests: 0, totalTests: testFiles.length,
+              graphSize: forward.size, durationMs: Date.now() - startMs,
+            });
             return;
           }
           console.warn(
             '[vitest-affected] No affected tests found — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'no-affected-tests',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            affectedTests: 0, totalTests: testFiles.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
           return;
         }
 
@@ -446,6 +501,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'threshold-exceeded',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            affectedTests: affectedTests.length, totalTests: testFiles.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
           return;
         }
 
@@ -474,8 +535,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // 16. Apply results
         if (validTests.length > 0) {
           project.config.include = validTests;
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'selective',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            affectedTests: validTests.length, totalTests: testFiles.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
+        } else if (statsFile) {
+          writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'no-valid-tests-on-disk',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            affectedTests: 0, totalTests: testFiles.length,
+            graphSize: forward.size, durationMs: Date.now() - startMs,
+          });
         }
-        // else: no valid affected tests — full suite runs as fallback
       } catch (err) {
         // 17. Catch-all: safety invariant — never crash, never skip silently
         console.warn(
