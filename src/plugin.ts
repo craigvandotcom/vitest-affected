@@ -362,16 +362,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // 9. Deleted file handling — Phase 1 limitation: fall back to full suite
-        if (deleted.length > 0) {
+        // 9. Deleted file handling — treat as BFS seeds
+        // Deleted files may still exist in the reverse graph from a prior cache.
+        // BFS will find their dependents (tests that imported them — those tests
+        // should run and will likely fail, which is the correct behaviour).
+        // Deleted files NOT in the graph are harmless no-ops in BFS.
+        if (deleted.length > 0 && verbose) {
           console.warn(
-            '[vitest-affected] Deleted files detected — running full suite (Phase 1 limitation)',
+            `[vitest-affected] ${deleted.length} deleted file(s) — will include as BFS seeds`,
           );
-          return;
         }
 
         // 10. Force-rerun check: config file or setupFiles changes → full suite
-        const hasConfigChange = changed.some((f) =>
+        const allChangedFiles = [...changed, ...deleted];
+        const hasConfigChange = allChangedFiles.some((f) =>
           CONFIG_BASENAMES.has(path.basename(f)),
         );
         if (hasConfigChange) {
@@ -385,7 +389,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const setupFileSet = new Set(
           Array.isArray(setupFiles) ? setupFiles : [setupFiles],
         );
-        const hasSetupFileChange = changed.some((f) => setupFileSet.has(f));
+        const hasSetupFileChange = allChangedFiles.some((f) => setupFileSet.has(f));
         if (hasSetupFileChange) {
           console.warn(
             '[vitest-affected] Setup file change detected — running full suite',
@@ -417,9 +421,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         const testFileSet = new Set(testFiles);
 
-        // 12. BFS: find affected tests
+        // 12. BFS: find affected tests (changed + deleted as seeds)
         const affectedTests = bfsAffectedTests(
-          changed,
+          allChangedFiles,
           reverse,
           (f) => testFileSet.has(f),
         );

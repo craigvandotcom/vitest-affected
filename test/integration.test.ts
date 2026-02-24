@@ -209,11 +209,11 @@ export default defineConfig({
 
   /**
    * Test 4: changedFiles with non-existing path (deletion)
-   * Mix existing + non-existing → deletion triggers full suite
-   * Uses diamond fixture (2 test files) so full suite is distinguishable from filtered.
+   * Mix existing + non-existing → deleted file used as BFS seed (no-op if not in graph).
+   * c.ts is shared dep in diamond → both tests run. nonexistent.ts is not in graph → ignored.
    */
   test(
-    'changedFiles with non-existing path triggers full suite (deletion fallback)',
+    'changedFiles with non-existing path: deleted file as BFS seed',
     async () => {
       const tmp = setupFixture('diamond');
       await gitInit(tmp);
@@ -237,9 +237,45 @@ export default defineConfig({
       const report = await runVitest(tmp);
       const testFiles = report.testResults.map((r) => r.name);
 
-      // Full suite runs because deleted file triggers fallback:
-      // diamond fixture has 2 test files — both must run
+      // c.ts is shared dep in diamond — both tests affected.
+      // nonexistent.ts is not in graph — harmless no-op in BFS.
       expect(testFiles).toHaveLength(2);
+      expect(testFiles.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles.some((f) => f.includes('b.test.ts'))).toBe(true);
+    },
+    30_000,
+  );
+
+  /**
+   * Test 4b: Deleted files outside the graph don't trigger full suite
+   * Delete a file NOT in the dependency graph → only changed source file's tests run
+   * This is the body-compass-app scenario: _backlog/ deletions shouldn't affect test selection
+   */
+  test(
+    'deleted files outside graph are ignored: only changed source tests run',
+    async () => {
+      const tmp = setupFixture('simple');
+      await gitInit(tmp);
+
+      // Create and commit an unrelated file, then delete it
+      writeFileSync(path.join(tmp, 'docs.md'), '# Docs\n');
+      await execa('git', ['add', '.'], { cwd: tmp });
+      await execa('git', ['commit', '-m', 'add docs'], { cwd: tmp });
+      rmSync(path.join(tmp, 'docs.md'));
+
+      // Also change src/c.ts (leaf in simple fixture)
+      writeFileSync(
+        path.join(tmp, 'src', 'c.ts'),
+        'export const c = 42;\n',
+      );
+
+      const report = await runVitest(tmp);
+      const testFiles = report.testResults.map((r) => r.name);
+
+      // docs.md is not in the dep graph — deletion is a no-op BFS seed
+      // Only src/c.ts change matters → only a.test.ts runs
+      expect(testFiles.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(testFiles).toHaveLength(1);
     },
     30_000,
   );
