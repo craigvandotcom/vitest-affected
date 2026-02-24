@@ -5,8 +5,8 @@ import type { TestModule } from 'vitest/node';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { glob, globSync } from 'tinyglobby';
-import { buildFullGraph } from './graph/builder.js';
-import { loadOrBuildGraph, saveGraph, loadOrBuildGraphSync, saveGraphSyncInternal, loadCachedMtimes, statAllFiles, diffGraphMtimes } from './graph/cache.js';
+import { buildFullGraph, GRAPH_GLOB_IGNORE } from './graph/builder.js';
+import { loadOrBuildGraph, saveGraph, loadOrBuildGraphSync, saveGraphSyncInternal, diffGraphMtimes } from './graph/cache.js';
 import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
@@ -216,6 +216,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // Mutable state — shared between one-shot path and watch callback
         let currentAffectedSet: Set<string> | null = null;
+        let cachedTestFiles: string[] | null = null;
         let lastRunAt = Date.now();
 
         ({ forward, reverse } = options.cache !== false
@@ -230,6 +231,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (vitest.config.watch) {
           const PERF_CEILING_MS = 300;
           let perfCeilingExceeded = false;
+          let fullRebuildPassThrough = false;
 
           vitest.onFilterWatchedSpecification((spec) => {
             try {
@@ -239,21 +241,28 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               // Conservative: return true for specs not in our graph — we cannot add tests Vitest missed.
 
               // Batch reset: if enough time passed since last computation, reset affected set
-              if ((currentAffectedSet || perfCeilingExceeded) && Date.now() - lastRunAt > 500) {
+              if ((currentAffectedSet || perfCeilingExceeded || fullRebuildPassThrough) && Date.now() - lastRunAt > 500) {
                 currentAffectedSet = null;
                 perfCeilingExceeded = false;
+                fullRebuildPassThrough = false;
               }
 
               // Perf ceiling was hit earlier in this batch — skip rebuild, pass through
               if (perfCeilingExceeded) return true;
 
+              // Full-rebuild pass-through: graph was just rebuilt from scratch, no mtime diff possible
+              if (fullRebuildPassThrough) return true;
+
               if (!currentAffectedSet) {
                 // First filter call in this batch — rebuild and detect changes
                 const buildStart = Date.now();
 
-                const oldMtimes = loadCachedMtimes(cacheDir!);
-                const { forward: newForward, reverse: newReverse } =
-                  loadOrBuildGraphSync(rootDir, cacheDir!);
+                const {
+                  forward: newForward,
+                  reverse: newReverse,
+                  oldMtimes,
+                  currentMtimes,
+                } = loadOrBuildGraphSync(rootDir, cacheDir!);
 
                 const buildDuration = Date.now() - buildStart;
                 if (buildDuration > PERF_CEILING_MS) {
@@ -269,15 +278,30 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
                 forward = newForward;
                 reverse = newReverse;
 
-                const currentMtimes = statAllFiles(forward.keys());
+                // Full-rebuild guard: when loadOrBuildGraphSync did a full rebuild
+                // (cache miss or staleness), both mtime maps are empty. Feeding empty maps
+                // to diffGraphMtimes yields zero seeds → empty affected set → tests silently
+                // skipped. Instead, pass through ALL specs for this batch.
+                if (oldMtimes.size === 0 && currentMtimes.size === 0) {
+                  cachedTestFiles = null; // New files may exist after a full rebuild
+                  fullRebuildPassThrough = true;
+                  lastRunAt = Date.now();
+                  saveGraphSyncInternal(forward, cacheDir!);
+                  return true;
+                }
+
                 const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
                 const bfsSeeds = [...changed, ...added];
 
-                const testFiles = globSync(originalInclude, {
-                  cwd: rootDir,
-                  absolute: true,
-                  ignore: [...originalExclude, '**/node_modules/**'],
-                });
+                // Glob caching: re-glob when cachedTestFiles is null OR new files were added
+                if (cachedTestFiles === null || added.length > 0) {
+                  cachedTestFiles = globSync(originalInclude, {
+                    cwd: rootDir,
+                    absolute: true,
+                    ignore: [...originalExclude, ...GRAPH_GLOB_IGNORE],
+                  });
+                }
+                const testFiles = cachedTestFiles;
                 const testFileSet = new Set(testFiles);
                 const affected = bfsAffectedTests(
                   bfsSeeds,

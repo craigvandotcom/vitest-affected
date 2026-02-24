@@ -243,7 +243,11 @@ describe('watch filter callback behavior', () => {
     expect(result).toBe(true);
   });
 
-  test('unaffected spec (not in changed dependency chain) returns false', async () => {
+  test('unaffected spec: stale cache triggers full-rebuild pass-through (not BFS filtering)', async () => {
+    // With the new design, loadOrBuildGraphSync does FULL REBUILD when any file is stale,
+    // returning empty mtime maps. The full-rebuild guard then passes ALL specs through.
+    // This is correct — when a rebuild occurred, we conservatively include all specs.
+
     const { tmpDir, libTs, mainTestTs } = setupWatchFixture();
 
     const cacheDir = path.join(tmpDir, '.vitest-affected');
@@ -254,7 +258,7 @@ describe('watch filter callback behavior', () => {
     const plugin = vitestAffected({ changedFiles: [], cache: true });
     await runHook(plugin, vitest, project);
 
-    // Overwrite cache with stale mtime for libTs (post-hook, before filter fires)
+    // Overwrite cache with stale mtime for libTs
     const forward = new Map<string, Set<string>>([
       [mainTestTs, new Set([mainTs])],
       [mainTs, new Set([libTs])],
@@ -264,7 +268,7 @@ describe('watch filter callback behavior', () => {
     const staleMtimes = new Map([
       [mainTestTs, lstatSync(mainTestTs).mtimeMs],
       [mainTs, lstatSync(mainTs).mtimeMs],
-      [libTs, 0], // stale → libTs "changed"
+      [libTs, 0], // stale → triggers full rebuild
       [orphanTs, lstatSync(orphanTs).mtimeMs],
     ]);
     saveGraphSyncInternal(forward, cacheDir, staleMtimes);
@@ -272,14 +276,69 @@ describe('watch filter callback behavior', () => {
     const filter = getFilterCallback();
     expect(filter).not.toBeNull();
 
-    // orphanTs is in the forward graph but NOT in the changed chain
-    // (libTs changed, which only affects mainTs → mainTestTs)
-    // So orphanTs should be filtered OUT → false
+    // With stale cache → full rebuild → pass-through for ALL specs.
+    // orphanTs is in the forward graph, but full-rebuild guard passes it through too.
     const result = filter!({ moduleId: orphanTs });
+    expect(result).toBe(true);
+  });
+
+  test('no-change scenario: spec in forward graph with fresh cache returns false (no BFS seeds)', async () => {
+    // When the cache is completely fresh (all mtimes current), loadOrBuildGraphSync
+    // returns non-empty mtime maps (cache hit). diffGraphMtimes finds 0 changed/added.
+    // BFS with empty seeds → empty affected set → known specs return false.
+
+    const { tmpDir, mainTestTs } = setupWatchFixture();
+    const { vitest, project, getFilterCallback } = createWatchMockContext(tmpDir);
+
+    // Run the plugin — writes fresh cache with current mtimes
+    const plugin = vitestAffected({ changedFiles: [], cache: true });
+    await runHook(plugin, vitest, project);
+
+    // Do NOT overwrite the cache — it has fresh mtimes, so loadOrBuildGraphSync
+    // will return non-empty mtime maps and diffGraphMtimes finds 0 changes.
+
+    const filter = getFilterCallback();
+    expect(filter).not.toBeNull();
+
+    // mainTestTs is in the forward graph. No files changed → BFS seeds empty → not in affected set → false
+    const result = filter!({ moduleId: mainTestTs });
     expect(result).toBe(false);
   });
 
-  test('batch reset: currentAffectedSet is recomputed after 500ms', async () => {
+  test('full-rebuild guard: when both mtime maps are empty, all specs pass through', async () => {
+    // When loadOrBuildGraphSync returns empty oldMtimes and currentMtimes (full rebuild path),
+    // diffGraphMtimes would see 0 changed/added → 0 BFS seeds → empty affected set → specs skipped.
+    // The guard must detect this and pass through ALL specs instead.
+
+    const { tmpDir, mainTestTs, orphanTs } = setupWatchFixture();
+    const { vitest, project, getFilterCallback } = createWatchMockContext(tmpDir);
+
+    // Run plugin with a fresh (no-cache) project — first call will be a full rebuild
+    const plugin = vitestAffected({ changedFiles: [], cache: true });
+    await runHook(plugin, vitest, project);
+
+    // Now deliberately DELETE the cache so the watch filter triggers a full rebuild
+    const cacheDir = path.join(tmpDir, '.vitest-affected');
+    rmSync(cacheDir, { recursive: true, force: true });
+
+    const filter = getFilterCallback();
+    expect(filter).not.toBeNull();
+
+    // mainTestTs is a known test file in the fixture — with full rebuild, it must pass through
+    const resultForTest = filter!({ moduleId: mainTestTs });
+    expect(resultForTest).toBe(true);
+
+    // orphanTs is a source file but not a test file — full rebuild still passes through
+    // (conservative: we can't know what's affected, so pass all)
+    const resultForOrphan = filter!({ moduleId: orphanTs });
+    expect(resultForOrphan).toBe(true);
+  });
+
+  test('batch reset: full-rebuild pass-through is consistent within a batch', async () => {
+    // When the first filter call in a batch triggers a full rebuild (stale cache),
+    // the fullRebuildPassThrough flag ensures ALL subsequent calls in the same batch
+    // also pass through — without re-triggering the expensive loadOrBuildGraphSync.
+
     const { tmpDir, libTs, mainTestTs } = setupWatchFixture();
     const cacheDir = path.join(tmpDir, '.vitest-affected');
     const mainTs = path.join(tmpDir, 'src', 'main.ts');
@@ -289,7 +348,7 @@ describe('watch filter callback behavior', () => {
     const plugin = vitestAffected({ changedFiles: [], cache: true });
     await runHook(plugin, vitest, project);
 
-    // Overwrite cache with stale mtime for libTs (post-hook, before filter fires)
+    // Overwrite cache with stale mtime for libTs — will trigger full rebuild
     const forward = new Map<string, Set<string>>([
       [mainTestTs, new Set([mainTs])],
       [mainTs, new Set([libTs])],
@@ -299,7 +358,7 @@ describe('watch filter callback behavior', () => {
     const staleMtimes = new Map([
       [mainTestTs, lstatSync(mainTestTs).mtimeMs],
       [mainTs, lstatSync(mainTs).mtimeMs],
-      [libTs, 0], // stale → libTs "changed"
+      [libTs, 0], // stale → full rebuild
       [orphanTs, lstatSync(orphanTs).mtimeMs],
     ]);
     saveGraphSyncInternal(forward, cacheDir, staleMtimes);
@@ -307,16 +366,16 @@ describe('watch filter callback behavior', () => {
     const filter = getFilterCallback();
     expect(filter).not.toBeNull();
 
-    // First call: libTs is stale → mainTestTs affected → true
+    // First call: stale cache → full rebuild → fullRebuildPassThrough=true → passes through
     const firstResult = filter!({ moduleId: mainTestTs });
     expect(firstResult).toBe(true);
 
-    // Second call within same batch (<500ms): currentAffectedSet is reused.
-    // orphanTs is in forward graph but not in affected chain → false
+    // Second call within same batch (<500ms): fullRebuildPassThrough still true → passes through
+    // (fullRebuildPassThrough flag prevents re-running loadOrBuildGraphSync)
     const secondResult = filter!({ moduleId: orphanTs });
-    expect(secondResult).toBe(false);
+    expect(secondResult).toBe(true);
 
-    // Third call also within same batch: mainTestTs still in cached affected set → true
+    // Third call also within same batch: passes through
     const thirdResult = filter!({ moduleId: mainTestTs });
     expect(thirdResult).toBe(true);
   });
