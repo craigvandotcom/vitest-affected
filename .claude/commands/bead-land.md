@@ -307,9 +307,9 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
+      { label: "Review & merge (Recommended)", description: "Run /work-review then /wave-merge — review code, create PR, ship to main" },
       { label: "Continue bead-work", description: "Run /bead-work — {M} beads remaining" },
       { label: "Refine remaining beads", description: "Run /bead-refine — revise remaining beads before implementing" },
-      { label: "Review & merge (Recommended if all beads done)", description: "Run /work-review then /wave-merge — review code, create PR, ship to main" },
       { label: "Done for now", description: "Close session — pick up later" }
     ]
   }]

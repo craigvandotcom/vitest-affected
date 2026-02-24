@@ -868,10 +868,10 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Beadify (Recommended)", description: "Run /beadify — convert refined plan to beads with parallel validation" },
+      { label: "Plan clean (Recommended)", description: "Run /plan-clean — final correctness check before beadification" },
+      { label: "Beadify directly", description: "Run /beadify — skip correctness check, convert to beads now" },
       { label: "Enhance further", description: "Run /plan-transcender-alien — paradigm-breaking alternative perspectives" },
-      { label: "Implement directly", description: "Start building from refined plan" },
-      { label: "Review artifacts", description: "Inspect model responses and refinement log before deciding" }
+      { label: "Done for now", description: "Plan saved — pick up later" }
     ]
   }]
 )

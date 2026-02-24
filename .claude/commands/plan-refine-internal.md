@@ -458,9 +458,9 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Beadify (Recommended)", description: "Run /beadify — convert refined plan to beads with parallel validation" },
+      { label: "Plan clean (Recommended)", description: "Run /plan-clean — final correctness check before beadification" },
+      { label: "Beadify directly", description: "Run /beadify — skip correctness check, convert to beads now" },
       { label: "External multi-model refine", description: "Run /plan-refine-external — multiple diverse AI models for deeper review" },
-      { label: "Implement directly", description: "Skip beadification — implement from plan directly" },
       { label: "Done for now", description: "Plan saved and committed — pick up later" }
     ]
   }]

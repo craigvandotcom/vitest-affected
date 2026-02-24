@@ -397,7 +397,7 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Start new feature", description: "Run /plan-init — begin planning the next wave" },
+      { label: "Start new feature (Recommended)", description: "Run /plan-init — begin planning the next wave" },
       { label: "Hygiene pass", description: "Run /hygiene — codebase health check after the merge" },
       { label: "Done", description: "Feature shipped — nothing more to do" }
     ]
