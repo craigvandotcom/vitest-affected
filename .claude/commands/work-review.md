@@ -530,12 +530,19 @@ Write results to {ARTIFACTS_DIR}/auto-fix-result.md:
 
 ### Verify Fixes
 
-Read the engineer's result file. Confirm:
+Read the engineer's result file. Then **run the quality gate yourself** — do not trust the engineer's report alone:
+
+```bash
+# MANDATORY: run project quality gate after auto-fixes (see AGENTS.md > Project Commands)
+{CMD_TYPECHECK} && {CMD_TEST}
+```
+
+Confirm:
 1. All AUTO_FIX items applied (or documented why not)
-2. Project checks pass
+2. Quality gate passes (you just ran it — not the engineer's claim)
 3. No unintended side effects (review diff)
 
-**If checks fail:** Revert the breaking fix and move that item to NEEDS_DECISION.
+**If checks fail:** Revert the breaking fix and move that item to NEEDS_DECISION. A prior session had the auto-fix engineer remove live imports as "dead code" — only the quality gate caught the regression.
 
 **TaskUpdate(task: "Phase 4", status: "completed")**
 
