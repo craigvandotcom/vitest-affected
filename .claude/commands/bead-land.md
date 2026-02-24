@@ -309,7 +309,7 @@ AskUserQuestion(
     options: [
       { label: "Continue bead-work", description: "Run /bead-work — {M} beads remaining" },
       { label: "Refine remaining beads", description: "Run /bead-refine — revise remaining beads before implementing" },
-      { label: "Feature complete", description: "All beads done — ready for final review or merge" },
+      { label: "Review & merge (Recommended if all beads done)", description: "Run /work-review then /wave-merge — review code, create PR, ship to main" },
       { label: "Done for now", description: "Close session — pick up later" }
     ]
   }]

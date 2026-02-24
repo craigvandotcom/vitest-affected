@@ -792,7 +792,7 @@ AskUserQuestion(
     header: "Next step",
     multiSelect: false,
     options: [
-      { label: "Merge (Recommended)", description: "Create PR and ship to main" },
+      { label: "Merge (Recommended)", description: "Run /wave-merge — create PR, triage CI/agent feedback, ship to main" },
       { label: "Another review pass", description: "Run /work-review again — fresh eyes on the updated code" },
       { label: "Manual review", description: "Done with automated review — you'll review manually" },
       { label: "Done for now", description: "Review saved — pick up later" }
