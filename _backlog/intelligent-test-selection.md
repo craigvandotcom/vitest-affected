@@ -1018,7 +1018,7 @@ Edge case: two saves within 500ms (auto-save) may reuse a stale affected set. Th
 
 **Depends on:** Phase 2 (Watch Mode + Caching)
 **Effort:** Days
-**New file:** `src/runtime.ts`
+**New file:** None — reporter factory and merge helper are inlined into `plugin.ts` (~40 lines, single consumer)
 **New deps:** None
 **Status: Ready.** Uses exclusively official, typed, documented Vitest APIs. Zero undocumented internals.
 
@@ -1037,9 +1037,7 @@ Phase 1's static graph misses dependencies that don't appear as import statement
 | `vi.importActual('./baz')` | Inside mock scope | Vitest processes the import → in `importDurations` |
 | `vi.hoisted(() => import('./x'))` | Hoisted, not a static import | Vitest processes the import → in `importDurations` |
 | CSS/SCSS modules | Vitest transforms but not a TS import | Processed by Vite pipeline → in `importDurations` |
-| `fs.readFileSync('./data.json')` | Not an import at all | **NOT caught** — use `extraDependencies` option |
-
-**Safety invariant preserved:** Runtime edges only ADD to the graph (union). False negatives can only decrease.
+| `fs.readFileSync('./data.json')` | Not an import at all | **NOT caught** — future `extraDependencies` option (not in Phase 3 scope) |
 
 ## Key Discovery: `TestModule.diagnostic().importDurations`
 
@@ -1093,37 +1091,37 @@ This is strictly better than the previous V8 coverage approach because:
 - No `onAfterSetServer` (undocumented), no `(vitest as any).reporters` (internal)
 - Users don't need to configure anything — just add the plugin
 
-## Architecture: `src/runtime.ts`
+## Architecture: Inlined in `plugin.ts`
+
+The reporter factory and merge helper are inlined directly into `plugin.ts` (~40 lines total). They have exactly one consumer and don't encapsulate a reusable algorithm (unlike `selector.ts` which is a general BFS).
 
 ```typescript
-import type { Reporter } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
 
 /**
- * Collect runtime dependency edges from Vitest's importDurations diagnostic.
- * Auto-injected by the plugin — users never interact with this directly.
+ * Create a reporter that collects runtime dependency edges from importDurations.
+ * rootDir is set AFTER creation via the returned setter — config() fires before
+ * the resolved root is available (vitest.config.root is only in configureVitest).
  */
-export function createRuntimeReporter(
-  rootDir: string,
+function createRuntimeReporter(
   onEdgesCollected: (edges: Map<string, Set<string>>) => void,
-): Reporter {
-  // Accumulated reverse edges: source file → set of test files that loaded it
+): { reporter: Reporter; setRootDir: (dir: string) => void } {
+  let rootDir: string | null = null;
   const runtimeReverse = new Map<string, Set<string>>();
 
-  return {
+  const reporter: Reporter = {
     onTestModuleEnd(testModule: TestModule) {
+      if (!rootDir) return; // rootDir not yet set — skip silently
       const testPath = testModule.moduleId;
+      if (!testPath.startsWith('/')) return; // virtual module — skip
       const durations = testModule.diagnostic().importDurations;
 
+      const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
       for (const modulePath of Object.keys(durations)) {
-        // Skip non-absolute paths (/@vite/env, virtual modules)
         if (!modulePath.startsWith('/')) continue;
-        // Skip node_modules
         if (modulePath.includes('/node_modules/')) continue;
-        // Skip files outside rootDir
-        const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
         if (!modulePath.startsWith(rootPrefix) && modulePath !== rootDir) continue;
-        // Skip self-reference
         if (modulePath === testPath) continue;
 
         if (!runtimeReverse.has(modulePath)) {
@@ -1133,11 +1131,20 @@ export function createRuntimeReporter(
       }
     },
 
-    onTestRunEnd() {
+    onTestRunEnd(_testModules: ReadonlyArray<TestModule>, _errors: ReadonlyArray<unknown>, reason: TestRunEndReason) {
+      // Skip persistence on interrupted runs — partial data would poison the cache
+      if (reason === 'interrupted') return;
       if (runtimeReverse.size > 0) {
         onEdgesCollected(runtimeReverse);
       }
+      // Clear for next watch-mode run — stale edges from deleted deps must not persist
+      runtimeReverse.clear();
     },
+  };
+
+  return {
+    reporter,
+    setRootDir(dir: string) { rootDir = dir; },
   };
 }
 
@@ -1145,7 +1152,7 @@ export function createRuntimeReporter(
  * Merge runtime edges into the static reverse graph.
  * Runtime edges only ADD — never remove static edges.
  */
-export function mergeRuntimeEdges(
+function mergeRuntimeEdges(
   staticReverse: Map<string, Set<string>>,
   runtimeReverse: Map<string, Set<string>>,
 ): void {
@@ -1159,6 +1166,11 @@ export function mergeRuntimeEdges(
 }
 ```
 
+**Key design decisions:**
+- **Deferred rootDir:** `createRuntimeReporter` takes NO rootDir argument. Instead, it returns a `setRootDir` setter called from `configureVitest()` where `vitest.config.root` is available. This avoids the `config.root` timing issue (`config()` fires before resolution).
+- **Abort safety:** `onTestRunEnd` checks `reason` parameter — on `'interrupted'`, skips persistence to avoid poisoning the cache with partial edge data. Clears `runtimeReverse` after each complete run.
+- **Private functions:** Not exported — implementation details of the plugin, not public API.
+
 ## Plugin Integration
 
 ### Auto-Injecting the Reporter
@@ -1167,8 +1179,12 @@ In the Vite plugin's `config()` hook (fires before Vitest initializes):
 
 ```typescript
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
-  // Shared state between config() and configureVitest()
-  let runtimeReporter: Reporter | null = null;
+  // Shared mutable state between config() and configureVitest()
+  // config() fires BEFORE configureVitest() — bindings are set later
+  let runtimeSetRootDir: ((dir: string) => void) | null = null;
+  let reverse: Map<string, Set<string>> = new Map();
+  let forward: Map<string, Set<string>> = new Map();
+  let cacheDir = '';
 
   return {
     name: 'vitest-affected',
@@ -1178,110 +1194,94 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
       // Auto-inject runtime reporter for dependency tracking
       const test = (config.test ??= {});
-      const reporters = (test.reporters ??= ['default']);
-      // Ensure reporters is an array (can be string or array)
-      if (typeof reporters === 'string') {
-        test.reporters = [reporters];
-      }
+      const reporters = test.reporters ?? ['default'];
+      // Normalize to array — handles string, object, or array
+      const reportersArray = Array.isArray(reporters) ? reporters : [reporters];
 
-      runtimeReporter = createRuntimeReporter(
-        config.root ?? process.cwd(),
-        (edges) => {
-          // Called in onTestRunEnd — merge and persist
-          // Forward/reverse maps and cacheDir are captured in configureVitest closure
-        },
-      );
+      const { reporter, setRootDir } = createRuntimeReporter((edges) => {
+        // Guard: configureVitest may not have completed (workspace guard, error, etc.)
+        if (!cacheDir) return;
+        // Callback fires in onTestRunEnd — forward/reverse/cacheDir
+        // are captured as outer-scope let bindings, assigned in configureVitest()
+        mergeRuntimeEdges(reverse, edges);
+        saveGraphSyncInternal(forward, cacheDir, undefined, edges);
+      });
 
-      (test.reporters as unknown[]).push(runtimeReporter);
+      runtimeSetRootDir = setRootDir;
+      test.reporters = [...reportersArray, reporter];
     },
 
     async configureVitest({ vitest, project }) {
-      // ... existing Phase 1+2 logic ...
-      // Wire runtimeReporter's callback to persist edges into cache
+      // ... existing Phase 1+2 logic assigns forward, reverse, cacheDir ...
+
+      // Wire rootDir to the reporter (resolved root only available here)
+      if (runtimeSetRootDir) {
+        runtimeSetRootDir(vitest.config.root);
+      }
     },
   };
 }
 ```
 
-### `extraDependencies` Option
+**Key closure pattern:** `forward`, `reverse`, and `cacheDir` are `let` bindings in the outer `vitestAffected()` scope. They start empty and are assigned in `configureVitest()`. The `onEdgesCollected` callback captures these bindings by reference, so when it fires in `onTestRunEnd`, it reads the live values.
 
-For non-import file access (`fs.readFileSync`, data files, etc.) that no import tracking can catch:
+## Persistence: Optional Fields on `graph.json` v1
 
-```typescript
-export interface VitestAffectedOptions {
-  // ... existing options ...
-  extraDependencies?: Record<string, string[]>;
-  // Keys: glob patterns for source files (relative to rootDir)
-  // Values: glob patterns for test files that depend on them
-  // Example: { 'data/*.json': ['test/data-loader.test.ts'] }
-}
-```
-
-At graph build time, resolve the globs and add the resulting edges to the reverse map. This runs once per graph build — not per test.
-
-### Compression Ratio Logging
-
-Always-on (not gated behind `verbose`). Replace the current silent success with:
-
-```typescript
-console.log(
-  `[vitest-affected] ${validTests.length}/${testFileSet.size} tests affected (${
-    ((1 - validTests.length / testFileSet.size) * 100).toFixed(0)
-  }% skipped) in ${(performance.now() - t0).toFixed(0)}ms`
-);
-```
-
-## Persistence: Fold Into `graph.json`
+No version bump needed. Add `runtimeEdges` and `runtimeCollectedAt` as optional fields on the existing v1 format. Old caches missing these fields simply default to empty — zero migration code.
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "builtAt": 1708000000000,
   "files": { ... },
   "runtimeEdges": {
     "/abs/path/src/utils/food.ts": ["/abs/path/tests/food.test.tsx", "/abs/path/tests/utils.test.ts"]
-  },
-  "runtimeCollectedAt": 1708000000000
+  }
 }
 ```
 
-**Version migration:** Reading v1 cache → treat as valid with empty runtime edges. Bump to v2 on next write. v2 reading v1 is a no-op (missing fields default to empty).
+**No migration needed:** The existing `loadOrBuildGraph`, `loadOrBuildGraphSync`, and `loadCachedMtimes` all check `version === CACHE_VERSION` which remains `1`. Adding optional fields to the JSON doesn't change the version. Readers simply check `if (disk.runtimeEdges) { ... }` and default to empty Map when absent.
+
+**Cache interface update:**
+```typescript
+interface CacheDiskFormat {
+  version: 1;
+  builtAt: number;
+  files: Record<string, CacheFileEntry>;
+  runtimeEdges?: Record<string, string[]>;      // source → test files (optional)
+}
+```
+
+**Save path:** `saveGraphSyncInternal` and `saveGraph` accept an optional `runtimeEdges?: Map<string, Set<string>>` parameter. When provided, serialize to `Record<string, string[]>`. **When omitted** (e.g., watch filter save), read and preserve existing `runtimeEdges` from the current cache file before overwriting. This prevents the watch filter save from erasing previously persisted runtime edges. Pattern: read existing cache → extract `runtimeEdges` → write new cache with preserved `runtimeEdges`.
+
+**Load path:** After `entriesToMaps(entries)` builds the static reverse map on the cache-hit-no-changes path, check `if (disk.runtimeEdges)` and merge them into the reverse map. On full-rebuild paths, start with empty runtime edges — `onTestRunEnd` repopulates after the next complete run. No carry-forward complexity on the load path.
 
 ## Implementation Steps
 
-1. **Implement `runtime.ts`** — `createRuntimeReporter`, `mergeRuntimeEdges`. ~50 lines.
-2. **Add `extraDependencies` option** — Resolve globs at graph-build time, inject into reverse map. ~30 lines.
-3. **Add compression ratio logging** — Always-on one-liner in plugin.ts.
-4. **Update `plugin.ts`** — Add `config()` hook for reporter auto-injection. Wire `onEdgesCollected` callback to merge+persist.
-5. **Update cache format** — Bump version to 2. Add `runtimeEdges` + `runtimeCollectedAt`. Handle v1→v2 migration in `loadOrBuildGraph`.
-6. **Tests** — Reporter edge collection, merge correctness (runtime adds edges, doesn't remove), extraDependencies glob resolution, v1→v2 cache migration, compression ratio output.
+1. **Update `plugin.ts`** — Add `config()` hook for reporter auto-injection. Inline `createRuntimeReporter` (with deferred rootDir setter, `runtimeReverse.clear()` after callback) and `mergeRuntimeEdges` as private functions. Hoist `forward`, `reverse`, `cacheDir` to outer scope. Wire `onEdgesCollected` callback with `if (!cacheDir) return` guard, merge + persist via `saveGraphSyncInternal(forward, cacheDir, undefined, edges)`. Normalize `reporters` array with `Array.isArray()` check.
+2. **Update `cache.ts`** — Add optional `runtimeEdges?` field to `CacheDiskFormat`. **Save:** add `runtimeEdges?: Map<string, Set<string>>` parameter to `saveGraph` and `saveGraphSyncInternal`; when provided, serialize as `Record<string, string[]>`; when omitted, read and preserve existing `runtimeEdges` from current cache file (prevents watch filter save from erasing them). **Load:** on cache-hit-no-changes path, merge `disk.runtimeEdges` into reverse map if present. On full-rebuild path, start fresh (no carry-forward). No version bump — stays at v1.
+3. **Tests** — Reporter edge collection (mock `TestModule` with `importDurations`), merge correctness (runtime adds edges, doesn't remove), abort safety (`reason: 'interrupted'` skips persistence), `runtimeReverse.clear()` between runs, cache round-trip with runtime edges (write → read → edges preserved), save without runtimeEdges preserves existing (watch filter scenario), deferred rootDir (reporter skips edges when rootDir not set), `cacheDir` guard (empty cacheDir prevents write).
 
 ## Merge Algorithm
 
 ```
-effective_graph = static_graph ∪ runtime_graph ∪ extra_dependencies
+effective_graph = static_graph ∪ runtime_graph
 ```
 
-All three sources only ADD edges. The effective graph is always a superset of the static graph. Over-selection is possible; under-selection is reduced to near-zero.
+Both sources only ADD edges. The effective graph is always a superset of the static graph. Over-selection is possible; under-selection is reduced to near-zero.
+
+**Future:** `extraDependencies` option (for non-import file access like `fs.readFileSync`) and always-on compression ratio logging are deferred to separate beads — they are orthogonal to the core `importDurations` feature.
 
 ## Known Limitations (Phase 3)
 
 - **Runtime edges are one run behind:** Run N's `importDurations` data benefits run N+1. First run after adding a new dynamic dependency will use static graph only (safe — falls back to full suite if the dependency isn't in the graph).
-- **`importDurations` only tracks Vitest-processed modules:** Files loaded via `fs.readFileSync`, `fetch`, or other non-import mechanisms do NOT appear. Use `extraDependencies` for these cases.
+- **`importDurations` only tracks Vitest-processed modules:** Files loaded via `fs.readFileSync`, `fetch`, or other non-import mechanisms do NOT appear. A future `extraDependencies` option can address these cases.
 - **`/@vite/env` and virtual modules:** Non-file-path keys in `importDurations` (e.g., `/@vite/env`) are filtered out by the `startsWith('/')` check.
 - **`isolate: false` is fine:** Unlike V8 coverage (which is per-worker), `importDurations` is per-test-module. Each `onTestModuleEnd` call receives only that module's dependencies, regardless of isolation settings.
-- **Reporter injection order:** Our reporter is appended to the end of the reporters array. If users configure `reporters: [...]` (replacing the default), our reporter is still appended. If users set `reporters: false` or similar, the injection may fail — but the plugin continues without runtime edges (static graph still works).
-- **Cache version downgrade:** Phase 2 code reading v2 cache treats unknown fields as ignored. v2 → v1 downgrade triggers full rebuild (safe — unknown version).
-- **`extraDependencies` globs are resolved at graph-build time:** If the glob matches new files between graph builds, those files won't be tracked until the next rebuild. In watch mode, this means new data files added between restarts may be missed. Restarting Vitest picks them up.
-
-### What's No Longer a Limitation (vs Old Phase 3)
-
-- ~~`onAfterSetServer` is undocumented~~ → Reporter API is fully official
-- ~~`vitest.reporters` hacking~~ → Auto-injected via `config()` hook
-- ~~V8 coverage must be enabled~~ → `importDurations` is always collected
-- ~~Per-worker union ambiguity~~ → Per-test-module granularity
-- ~~Coverage file race conditions~~ → No file I/O timing issues
-- ~~URL normalization of `file://` URLs~~ → Keys are already absolute paths
+- **Reporter injection order:** Our reporter is appended to the end of the reporters array. If users configure `reporters: [...]` (replacing the default), our reporter is still appended. If users set `reporters: false` or similar, the injection may fail — but the plugin continues without runtime edges (static graph still works). Normalization handles string, object, and array reporter configs via `Array.isArray()` check.
+- **Watch mode runtime edge persistence:** When `onFilterWatchedSpecification` triggers a graph rebuild via `loadOrBuildGraphSync`, the in-memory runtime edges are discarded. The watch filter's `saveGraphSyncInternal` call preserves existing `runtimeEdges` from the cache file (read-merge-write when `runtimeEdges` param is omitted). On cache-hit-no-changes, `loadOrBuildGraphSync` merges them back into the reverse map. On full-rebuild, runtime edges start fresh — `onTestRunEnd` repopulates after the next complete run.
+- **Interrupted runs discard runtime edges:** If `onTestRunEnd` fires with `reason: 'interrupted'`, runtime edge persistence is skipped to avoid poisoning the cache with partial data. The `runtimeReverse` map is NOT cleared on interrupt, so a subsequent complete run in the same process accumulates fresh edges.
+- **Runtime edges are monotonically additive per session:** `runtimeReverse` is cleared after each complete `onTestRunEnd`. Stale edges from deleted dynamic dependencies are purged from the in-memory map. However, previously persisted stale edges in the cache file survive until the next complete run overwrites them. This is conservative — over-selection, never under-selection.
 
 ---
 
@@ -1312,11 +1312,10 @@ Note: `resolveFileImports` and `createResolver` are exported from `builder.ts` f
 
 | Phase 2 produces | Phase 3 consumes |
 |---|---|
-| `{ forward, reverse }` (same as Phase 1, no new types) | Extended cache format with `runtimeEdges?`, `runtimeCollectedAt?` |
-| `loadOrBuildGraph` / `saveGraph` | Handles v1→v2 migration, serializes runtime edges |
-| `cache.ts` disk format (version 1) | Bumped to version 2 with runtime edge fields |
-| `tinyglobby` glob → `testFileSet` | Reused for `extraDependencies` glob resolution |
-| Vite plugin structure (`config()` + `configureVitest()`) | Phase 3 adds `config()` hook for reporter auto-injection |
+| `{ forward, reverse }` (same as Phase 1, no new types) | Runtime edges merged into `reverse` via `mergeRuntimeEdges` |
+| `loadOrBuildGraph` / `saveGraph` / `saveGraphSyncInternal` | Extended to read/write optional `runtimeEdges` field |
+| `cache.ts` disk format (version 1) | Same version — adds optional `runtimeEdges?`, `runtimeCollectedAt?` fields |
+| Vite plugin structure (`configureVitest()`) | Phase 3 adds `config()` hook for reporter auto-injection + hoists shared state to outer scope |
 
 ---
 
@@ -1459,3 +1458,24 @@ Our advantage: Start with static import graph analysis (cheap, fast, no overhead
 - **Fragility eliminated:** 0 undocumented APIs (was 2). Reporter API, `config()` hook, and `ModuleDiagnostic` are all official, typed exports from `vitest/node`.
 - **Accuracy improved:** Per-test-module granularity (was per-worker). No `isolate: false` ambiguity.
 - **Brainstorm process:** 33 approaches evaluated across 9 categories (Reporter API, static analysis extensions, user declarations, verification, NODE_V8_COVERAGE, custom pool, ESM loader hooks, Vite transform pipeline, external/hybrid). Narrowed to 9, then to 3. The `importDurations` approach dominated on all axes: resilience, simplicity, reliability.
+
+### Phase 3: Round 1 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 8 auto-applied (2 Critical, 4 High, 2 consensus-based)
+- **Key fixes:** Fixed `config.root` timing issue — reporter now uses deferred rootDir setter, set from `configureVitest()`. Added abort safety to `onTestRunEnd` (checks `reason`, skips on `'interrupt'`). Inlined `runtime.ts` into `plugin.ts` (single consumer, ~40 lines). Removed cache v2 version bump — added `runtimeEdges?` as optional fields on v1 format. Fixed reporter array normalization (`Array.isArray()` instead of `typeof === 'string'`). Deferred `extraDependencies` and compression ratio logging to separate beads (orthogonal features). Hoisted `forward`/`reverse`/`cacheDir` to outer scope for closure wiring. Collapsed implementation steps from 6 to 3.
+- **Consensus:** 3/3 agents flagged `config.root` timing. 3/3 flagged cache version migration as unnecessary. 2/3 flagged `extraDependencies` as scope creep. 2/3 flagged compression ratio as scope creep.
+- **Trajectory:** 2 Critical found → continue (need Round 2 verification)
+
+### Phase 3: Round 2 (Medium: Builder/Breaker/Trimmer — 3x Opus)
+
+- **Changes:** 6 auto-applied (2 Critical, 1 High, 3 Medium bundled with Critical fixes)
+- **Key fixes:** Fixed `'interrupt'` → `'interrupted'` (2/3 consensus — abort guard was a no-op). Specified full save/load contract for runtime edges: `saveGraphSyncInternal` accepts optional `runtimeEdges` param, `loadOrBuildGraphSync` reads them back on BOTH cache-hit and full-rebuild paths (carries forward from old cache). Added `runtimeReverse.clear()` after `onTestRunEnd` callback to prevent stale edge accumulation. Added `if (!cacheDir) return` guard in `onEdgesCollected`. Fixed `onTestRunEnd` param types from `unknown` to proper Reporter interface types.
+- **Consensus:** 2/3 flagged `'interrupt'` typo (Builder + Breaker). 2/3 flagged save/load paths missing runtime edges (Builder + Breaker). Trimmer focused on plan style (code listing bulk, limitation count).
+- **Trajectory:** 2 Critical found → continue (need Round 3 verification)
+
+### Phase 3: Round 3 (Medium: Builder/Breaker/Trimmer — 3x Opus) — VERIFICATION
+
+- **Changes:** 4 applied (1 High consensus, 3 Medium closely-tied fixes)
+- **Key fixes:** Resolved competing views on watch-mode runtime edge persistence: save-level preservation (when `runtimeEdges` param omitted, `saveGraphSyncInternal` reads and preserves existing runtime edges from cache — satisfies Builder+Breaker data-loss concern). Simplified load path (no carry-forward on full rebuild — satisfies Trimmer complexity concern). Removed dead `runtimeCollectedAt` field. Added `testPath.startsWith('/')` guard for virtual `TestModule.moduleId`.
+- **Consensus:** 2/3 flagged watch filter save erasing runtime edges (Builder + Breaker). Trimmer counter-argued carry-forward is premature. Resolution: save-level preservation satisfies both positions.
+- **Trajectory:** 0 Critical, 1 High (resolved) → **finalize**
