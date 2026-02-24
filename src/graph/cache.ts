@@ -154,8 +154,8 @@ export async function loadOrBuildGraph(
         const imports = resolveFileImports(filePath, source, rootDir, resolver);
         refreshed.set(filePath, imports);
       } catch {
-        // Read error → use empty imports for this file
-        refreshed.set(filePath, []);
+        // Read error → preserve cached imports (conservative: don't silently drop edges)
+        refreshed.set(filePath, entry.imports);
       }
     } else {
       // Up to date — filter out any imports that no longer exist on disk
@@ -213,10 +213,28 @@ export async function saveGraph(
     };
   }
 
+  // Preserve existing runtimeEdges from disk (read-merge-write)
+  let runtimeEdges: Record<string, string[]> | undefined;
+  const cachePath = path.join(cacheDir, GRAPH_FILE);
+  try {
+    const raw = await readFile(cachePath, 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      (parsed as CacheDiskFormat).runtimeEdges !== undefined
+    ) {
+      runtimeEdges = (parsed as CacheDiskFormat).runtimeEdges;
+    }
+  } catch {
+    // ENOENT or JSON parse error — no existing runtime edges to preserve
+  }
+
   const payload: CacheDiskFormat = {
     version: CACHE_VERSION,
     builtAt: Date.now(),
     files,
+    ...(runtimeEdges !== undefined ? { runtimeEdges } : {}),
   };
 
   const json = JSON.stringify(payload);
@@ -441,7 +459,8 @@ export function loadOrBuildGraphSync(
   // --- No changes — rebuild maps from cached entries ---
   const entries = new Map<string, string[]>();
   for (const [filePath, entry] of Object.entries(disk.files)) {
-    entries.set(filePath, entry.imports);
+    // Filter out imports that no longer exist on disk (consistent with async path)
+    entries.set(filePath, entry.imports.filter((imp) => existsSync(imp)));
   }
 
   const { forward, reverse } = entriesToMaps(entries);

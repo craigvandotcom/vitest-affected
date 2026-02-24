@@ -76,7 +76,8 @@ export function createRuntimeReporter(
     const { importDurations } = testModule.diagnostic();
     const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
 
-    for (const modulePath of Object.keys(importDurations)) {
+    for (const rawPath of Object.keys(importDurations)) {
+      const modulePath = normalizeModuleId(rawPath);
       // Must be absolute
       if (!modulePath.startsWith('/')) continue;
       // Skip node_modules
@@ -156,8 +157,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
       const { reporter, setRootDir } = createRuntimeReporter((edges) => {
         if (!cacheDir) return;
+        if (!reverse) return;
         mergeRuntimeEdges(reverse, edges);
-        saveGraphSyncInternal(forward, cacheDir, undefined, edges);
+        try {
+          saveGraphSyncInternal(forward, cacheDir, undefined, edges);
+        } catch {
+          // Best-effort: in-memory merge succeeded, disk persistence failed
+        }
       });
 
       test.reporters = [...reportersArray, reporter];
