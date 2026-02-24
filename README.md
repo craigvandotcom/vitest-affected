@@ -35,7 +35,7 @@ That's it. On your next `vitest run`, only affected tests will execute.
 3. **Walk the reverse graph** using BFS to find all test files that transitively depend on the changed files
 4. **Mutate `config.include`** so Vitest only runs the affected tests
 
-If anything goes wrong (git fails, graph is incomplete, deleted files detected), the plugin falls back to running the full test suite with a warning. It never silently skips tests.
+If anything goes wrong (git fails, graph is incomplete), the plugin falls back to running the full test suite with a warning. It never silently skips tests. Deleted files are handled intelligently — if a deleted file is in the dependency graph, its dependent tests run; if it's not in the graph, it's ignored.
 
 ## Options
 
@@ -58,6 +58,9 @@ vitestAffected({
 
   // Enable dependency graph caching to disk (default: true)
   cache: true,
+
+  // Append JSON-line stats after each run for observability
+  statsFile: '.vitest-affected/stats.jsonl',
 
   // Disable the plugin entirely
   disabled: false,
@@ -92,9 +95,19 @@ Changes to project config files automatically trigger a full test suite run:
 
 Changes to Vitest `setupFiles` also trigger a full rerun.
 
+## Observability
+
+Enable `statsFile` to collect a JSON-line log of every run:
+
+```jsonl
+{"timestamp":"2026-02-24T15:55:30Z","action":"selective","changedFiles":46,"deletedFiles":25,"affectedTests":4,"totalTests":162,"graphSize":492,"durationMs":229}
+{"timestamp":"2026-02-24T16:01:12Z","action":"full-suite","reason":"config-change","changedFiles":1,"deletedFiles":0,"graphSize":492,"durationMs":45}
+```
+
+Each line records what the plugin decided (selective or full-suite), why, and how many tests were affected. Useful for validating the plugin is working correctly over time.
+
 ## Limitations
 
-- **Deleted files**: If git reports deleted files, the plugin falls back to the full suite (the graph can't resolve files that no longer exist)
 - **Dynamic imports with template literals**: Imports like `` import(`./locale/${lang}.ts`) `` can't be statically resolved and are skipped
 - **Non-TypeScript/JavaScript files**: CSS, JSON, and other asset imports are excluded from the graph
 
