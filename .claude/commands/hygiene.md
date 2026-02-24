@@ -126,16 +126,9 @@ You are a bug hunter doing a "fresh eyes" review of this codebase. You compete w
 
 ## Your Method
 
-1. Start with recent git activity: `git log --oneline -15` and `git diff HEAD~5..HEAD --stat`
-2. Pick 3-5 files that look interesting (recently changed, complex, critical path)
-3. For each file: read it completely, trace its imports, understand the data flow
-4. Look super carefully with fresh eyes for:
-   - Obvious bugs, logic errors, off-by-one mistakes
-   - Silent failures (wrong results, no error thrown)
-   - Race conditions on shared state
-   - Null/undefined hazards
-   - Error paths that swallow exceptions
-   - Type assertions hiding real issues (`as any`, `!` operator abuse)
+Explore the codebase with completely fresh eyes. Start wherever interests you — recent git activity, hot paths, complex modules, or random exploration. Read files deeply, trace imports, and follow data flows across the full chain.
+
+Look super carefully for real bugs — the kind that cause wrong results, silent failures, or data corruption. Trust your judgment on where to dig and what matters. Some areas worth considering: logic errors, race conditions, null hazards, swallowed exceptions, type assertion abuse — but follow your instincts, not a checklist.
 
 ## Output
 
@@ -167,17 +160,9 @@ You are a codebase explorer doing deep random investigation. You compete with 2 
 
 ## Your Method
 
-1. Pick a random starting point — a feature directory, a utility file, a hook
-2. Read it deeply, then trace its functionality through related files
-3. Follow imports, check callers, understand the full data path
-4. Do this for 3-4 different entry points across the codebase
-5. Look super carefully with fresh eyes for:
-   - Dead code (unused exports, unreachable branches)
-   - Inconsistent patterns (same thing done 3 different ways)
-   - Missing error handling at system boundaries
-   - Stale comments that no longer match the code
-   - Copy-paste code that drifted apart
-   - Dependencies that could be removed
+Pick random starting points across the codebase and go deep. Read files thoroughly, follow import chains, trace data flows end-to-end, check callers and callees. Do this for 3-4 different entry points — let curiosity guide you.
+
+You're looking for anything a fresh pair of eyes would catch — dead code, inconsistent patterns, missing error handling, stale comments, copy-paste drift, unnecessary dependencies. But don't limit yourself to these categories. If something feels off, investigate it. Trust your instincts.
 
 ## Output
 
@@ -209,17 +194,9 @@ You are a structural reviewer checking architecture health. You compete with 2 o
 
 ## Your Method
 
-1. Read the project structure from AGENTS.md > Architecture, then explore source directories
-2. Check dependency health: are imports clean? Any circular deps?
-3. Check test coverage: find test directories/files — are critical paths tested?
-4. Check for:
-   - Modules/classes doing too much (SRP violations >150 lines)
-   - Functions/modules with mixed concerns
-   - API routes missing validation
-   - Shared state that should be local (or vice versa)
-   - Over-abstraction (wrappers that add nothing)
-   - Under-abstraction (copy-paste that should be shared)
-   - Security: hardcoded values, missing auth checks, exposed secrets
+Read the project structure, then explore source directories with fresh eyes. Assess the overall health of the architecture — dependency cleanliness, test coverage, module boundaries, abstraction levels.
+
+Think about structural integrity: are modules well-bounded? Are dependencies flowing in the right direction? Is there over-abstraction or under-abstraction? Are critical paths tested? But explore broadly — structural issues often hide in unexpected places. Trust your architectural intuition.
 
 ## Output
 

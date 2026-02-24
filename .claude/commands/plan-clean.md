@@ -104,19 +104,17 @@ You are verifying plan ACCURACY against the actual codebase. You compete with 2 
 
 ## Your Method
 
-1. Extract every file path, function name, type name, and import referenced in the plan
-2. For each reference: read the actual source file and verify it exists with the claimed name/signature/location
-3. Check external dependencies: are library names correct? Do the APIs the plan assumes actually exist? Verify against package manifest and docs.
-4. Check internal references: does Phase N's output match Phase N+1's expected input?
-5. Flag any path, name, or API that doesn't match reality
+Cross-reference the plan's claims against reality. Extract file paths, function names, type names, imports, and external APIs â€” then verify each against the actual codebase and package manifests.
 
-## What You're Looking For
+## Examples of What to Look For (not exhaustive)
 
 - File paths that don't exist or have wrong names
 - Functions/types referenced with wrong signatures or locations
 - External library APIs assumed incorrectly (wrong method names, wrong parameters)
 - Version-specific features assumed but not available in installed version
 - Internal plan references that point to wrong sections
+
+Use your judgment â€” if something seems inaccurate, verify it.
 
 ## Output
 
@@ -148,13 +146,9 @@ You are auditing plan STRUCTURE and LOGIC. You compete with 2 other reviewers â€
 
 ## Your Method
 
-1. Read the plan end-to-end, checking logical flow between sections
-2. Verify each phase's prerequisites are produced by a prior phase
-3. Check for contradictions: does Section A say one thing while Section B assumes another?
-4. Verify completeness: are there steps that reference outcomes not defined anywhere?
-5. Check ordering: are dependencies sequenced correctly?
+Read the plan end-to-end, checking that the logical flow holds. Trace what each phase produces and what the next phase consumes â€” verify the chain is unbroken.
 
-## What You're Looking For
+## Examples of What to Look For (not exhaustive)
 
 - Logical gaps: Phase 3 needs X but no prior phase creates X
 - Contradictions: two sections making incompatible claims
@@ -162,6 +156,8 @@ You are auditing plan STRUCTURE and LOGIC. You compete with 2 other reviewers â€
 - Missing steps: jumps from state A to state C without B
 - Unclear ownership: deliverables not assigned to a specific phase
 - Redundant sections: same information stated in multiple places
+
+Use your judgment â€” if the logic feels off somewhere, dig into it.
 
 ## Output
 
@@ -193,13 +189,9 @@ You are checking plan HYGIENE and CLARITY. You compete with 2 other reviewers â€
 
 ## Your Method
 
-1. Read the plan looking for artifacts of the planning/refinement process
-2. Check for verbose commentary, hedging, or "notes to self" that don't belong in a final plan
-3. Check for consistency in terminology, formatting, and heading structure
-4. Identify sections that could be more concise without losing information
-5. Look for ambiguous language that could be misinterpreted during implementation
+Read the plan looking for anything that doesn't belong in a final, clean document. Check for artifacts of the planning process, verbosity, inconsistencies, and ambiguity.
 
-## What You're Looking For
+## Examples of What to Look For (not exhaustive)
 
 - Iteration artifacts: "TODO", "FIXME", "we discussed", "in a previous round", "originally we planned"
 - Verbose commentary: paragraphs that could be bullet points, explanations of obvious things
@@ -207,6 +199,8 @@ You are checking plan HYGIENE and CLARITY. You compete with 2 other reviewers â€
 - Formatting inconsistencies: mixed heading levels, inconsistent list styles
 - Hedging language: "maybe", "possibly", "we could consider" â€” a final plan should be decisive
 - Dead content: commented-out sections, crossed-out alternatives, old options that weren't chosen
+
+Use your judgment â€” if something reads poorly for an implementer picking this up cold, flag it.
 
 ## Output
 

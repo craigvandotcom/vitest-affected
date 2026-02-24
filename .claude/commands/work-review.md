@@ -252,7 +252,7 @@ You are a security reviewer. You compete with 3 other reviewers — only evidenc
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - OWASP Top 10 vulnerabilities (injection, XSS, CSRF, SSRF)
 - Auth/authz bypass opportunities
@@ -261,6 +261,8 @@ You are a security reviewer. You compete with 3 other reviewers — only evidenc
 - Input validation gaps at system boundaries
 - Insecure defaults (permissive CORS, missing rate limits)
 - Dependency vulnerabilities (known CVEs in new deps)
+
+Use your judgment — these are starting points, not a complete list. If you spot something security-relevant not listed here, report it.
 
 ## Output
 
@@ -293,7 +295,7 @@ You are a performance reviewer. You compete with 3 other reviewers — only evid
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - N+1 queries or sequential awaits (waterfalls)
 - Missing caching opportunities
@@ -303,6 +305,8 @@ You are a performance reviewer. You compete with 3 other reviewers — only evid
 - Inefficient algorithms (O(n^2) where O(n) suffices)
 - Bundle size impact (barrel imports, large deps)
 - Missing indexes on queried columns
+
+Use your judgment — these are starting points, not a complete list. If you spot something performance-relevant not listed here, report it.
 
 ## Output
 
@@ -335,7 +339,7 @@ You are an architecture reviewer. You compete with 3 other reviewers — only ev
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - Pattern misalignment with existing codebase
 - Single Responsibility Principle violations
@@ -345,6 +349,8 @@ You are an architecture reviewer. You compete with 3 other reviewers — only ev
 - Wrong abstraction level (under/over-abstraction)
 - Missing error handling at system boundaries
 - Naming inconsistencies
+
+Use your judgment — these are starting points, not a complete list. If you spot architectural issues not listed here, report them.
 
 ## Output
 
@@ -377,7 +383,7 @@ You are a correctness reviewer. You compete with 3 other reviewers — only evid
 {DIFF CONTENT}
 ```
 
-## Check For
+## Examples of What to Look For (not exhaustive)
 
 - Logic errors and off-by-one mistakes
 - Silent failures (wrong results without errors)
@@ -388,6 +394,8 @@ You are a correctness reviewer. You compete with 3 other reviewers — only evid
 - Edge cases not handled (empty arrays, zero values, unicode)
 - State management issues (stale closures, missing cleanup)
 - Missing test coverage for new functionality
+
+Use your judgment — these are starting points, not a complete list. If you spot correctness issues not listed here, report them.
 
 ## Output
 

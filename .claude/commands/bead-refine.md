@@ -120,16 +120,7 @@ Cross-reference every bead against the original plan to ensure NOTHING was lost 
 
 ## Method
 
-1. Read the original plan file: {PLAN_FILE}
-2. Read ALL beads: {paste ARTIFACTS_DIR/beads-full-dump.txt or inline}
-3. For each plan section/feature:
-   - Is it fully represented in at least one bead?
-   - Were any details lost, simplified, or omitted?
-   - Are test requirements from the plan captured in bead acceptance criteria?
-4. For each bead:
-   - Is it self-contained? Could an engineer implement without reading the plan?
-   - Are acceptance criteria specific and verifiable (not vague)?
-   - Does it include test requirements?
+Read the original plan ({PLAN_FILE}) and ALL beads ({paste ARTIFACTS_DIR/beads-full-dump.txt or inline}). Cross-reference every plan section against the beads — check that nothing was lost, oversimplified, or omitted during beadification. Also check each bead for self-containment: could an engineer implement it without ever reading the plan? Are acceptance criteria specific and verifiable? Use your judgment on what matters most.
 
 ## Output
 
@@ -162,17 +153,7 @@ Can an engineer cold-start on each bead tomorrow and implement it mechanically? 
 
 ## Method
 
-1. Read ALL beads: {paste ARTIFACTS_DIR/beads-full-dump.txt or inline}
-2. For each bead, check:
-   - Is the scope clear and bounded? (no ambiguous "handle all edge cases")
-   - Are dependencies correct? Does this bead actually need what it depends on?
-   - Is granularity right? (Too big = needs splitting. Too small = merge candidate.)
-   - Are there blocking ambiguities where you'd have to guess?
-   - Could you write RED tests from just the acceptance criteria?
-3. You have codebase access. Read referenced files to verify:
-   - Functions/types mentioned in beads actually exist
-   - File paths referenced are correct
-   - Patterns described match actual codebase patterns
+Read ALL beads ({paste ARTIFACTS_DIR/beads-full-dump.txt or inline}) and put yourself in the implementer's seat. For each bead: could you cold-start on it tomorrow and build it mechanically? If you'd need to ask a question, that's a finding. Check scope clarity, dependency correctness, granularity, and whether you could write RED tests from just the acceptance criteria. You have codebase access — read referenced files to verify functions, types, and patterns actually exist as described. Use your judgment on what blocks implementation.
 
 ## Output
 
