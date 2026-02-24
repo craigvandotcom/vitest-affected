@@ -143,6 +143,7 @@ For each issue:
 **Fix:** Specific change — new bead, updated description, added acceptance criteria
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -185,6 +186,7 @@ For each issue:
 **Fix:** Specific change — clearer spec, split proposal, dependency fix
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -228,6 +230,7 @@ For each issue:
 **Fix:** Specific structural change — split into X+Y, merge A+B, add/remove dep
 
 Limit: top 5 issues. If additional Critical/High, add as one-liners. Under 500 words. Skip Low.
+If nothing found, say so — don't invent issues.
 """)
 ```
 

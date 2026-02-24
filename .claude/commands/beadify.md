@@ -106,7 +106,9 @@ Epic: Dashboard
 
 ```
 Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
-You are validating a proposed bead structure against its source plan.
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating a proposed bead structure against its source plan. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 
@@ -146,7 +148,9 @@ Limit: top 5 issues. Under 400 words. If nothing missing, say so.
 
 ```
 Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
-You are validating the dependency structure of a proposed bead breakdown.
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating the dependency structure of a proposed bead breakdown. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 
@@ -187,7 +191,9 @@ Limit: top 5 issues. Under 400 words. If structure is sound, say so.
 
 ```
 Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
-You are validating the granularity and sizing of a proposed bead breakdown.
+First: read AGENTS.md for project context, coding standards, and conventions.
+
+You are validating the granularity and sizing of a proposed bead breakdown. You compete with 2 other validators — only evidence-backed findings count.
 
 ## Your Task
 

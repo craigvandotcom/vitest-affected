@@ -128,13 +128,14 @@ For each issue: ## Issue N: Title | Severity: Critical/High/Medium | Section: X 
 ```
 First: read AGENTS.md for project context.
 
-You are a practical implementer and spec auditor. Can I build this tomorrow?
+You are a practical implementer and spec auditor. You compete with 2 other reviewers — only evidence-backed findings count. Can I build this tomorrow?
 
 Check: steps complete and unambiguous, dependencies correctly ordered, every deliverable owned by exactly one phase, no gaps between what one phase produces and the next requires. Trace what each phase produces vs what the next phase consumes.
 
 You have codebase access. Read referenced files to confirm functions/types exist with claimed signatures. For each issue: quote the plan, show what code actually has, state what's needed.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-builder.md using the Write tool.
 ```
@@ -146,13 +147,14 @@ Task(subagent_type: "general-purpose", model: "{AGENT_MODEL}", description: "Bui
 ```
 First: read AGENTS.md for project context.
 
-You are an adversary and architect critic. What breaks?
+You are an adversary and architect critic. You compete with 2 other reviewers — only evidence-backed findings count. What breaks?
 
 Check: silent failures (wrong results, no error), race conditions on shared state, missing error paths, wrong abstractions, tight coupling. Show the scenario: given [precondition], when [action], then [bad outcome]. Check: do new fields survive existing read-modify-write cycles?
 
 You have codebase access. Read write paths for shared data structures. Cite specific files and functions. Skip theoretical risks — every finding needs a concrete scenario.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-breaker.md using the Write tool.
 ```
@@ -164,13 +166,14 @@ Task(subagent_type: "general-purpose", model: "{AGENT_MODEL}", description: "Bre
 ```
 First: read AGENTS.md for project context.
 
-You are a simplifier and devil's advocate. What to cut, and is this the right approach?
+You are a simplifier and devil's advocate. You compete with 2 other reviewers — only evidence-backed findings count. What to cut, and is this the right approach?
 
 Check: what can be deleted without losing core value, what's built for v3 but not needed now, where abstraction adds overhead without reuse, whether a fundamentally simpler approach achieves 90% of the value at 30% of the cost. If a fundamentally simpler approach exists, that's your highest-priority finding.
 
 You have codebase access. Verify claimed constraints are real, not assumed. Your only verbs: remove, defer, inline, collapse. Challenge the approach itself — not just the details.
 
 Limit: top 5 issues. If you have additional Critical/High, add as one-liners. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-trimmer.md using the Write tool.
 ```
@@ -191,6 +194,7 @@ Check: structural flaws (wrong abstractions, misplaced responsibilities, tight c
 You have codebase access. Read actual source files to verify client/server context, data shapes, import chains. If the plan says "X calls Y", open both files and confirm. For each finding: what you checked, what you found, why it's a problem.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-architect.md using the Write tool.
 ```
@@ -209,6 +213,7 @@ Check: unstated assumptions (flip each one -- does the plan survive?), silent fa
 You have codebase access. Read ALL existing write paths for shared data structures. Verify auth middleware/factories exist. Cite specific files and functions. Show the scenario: given [precondition], when [action], then [bad outcome].
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-adversary.md using the Write tool.
 ```
@@ -227,6 +232,7 @@ Check: inversion test (for each major decision, argue the opposite), hidden cons
 You have codebase access. Read referenced plans and actual code to verify claimed constraints are real, not assumed. Be intellectually honest -- if the approach is genuinely best, say so, then find the ONE thing it got wrong.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-devils-advocate.md using the Write tool.
 ```
@@ -245,6 +251,7 @@ Check: blocking ambiguity (steps where you'd guess), hidden complexity (looks li
 You have codebase access. Read EVERY file the plan references. Verify functions, types, utilities exist with claimed signatures. For each issue: quote the plan's claim, show what the code actually has, state what's needed.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-implementer.md using the Write tool.
 ```
@@ -263,6 +270,7 @@ Check: gaps (trace each phase's inputs -- does a prior phase produce them?), con
 You have codebase access. For each referenced function, type, or factory -- read the source. Verify it exists, is exported, has the claimed signature.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-spec-auditor.md using the Write tool.
 ```
@@ -281,6 +289,7 @@ Check: remove (delete without losing core value?), defer (built for v3 but not n
 DO NOT suggest adding anything. Your only verbs: remove, simplify, defer, inline.
 
 Limit: top 5 issues. Under 400 words. Skip Low.
+If nothing found, say so — don't invent issues.
 
 Write your complete findings to {ARTIFACTS_DIR}/round-{CURRENT_ROUND}-simplifier.md using the Write tool.
 ```

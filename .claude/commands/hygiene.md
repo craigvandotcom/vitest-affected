@@ -119,7 +119,7 @@ Each agent writes findings to `$ARTIFACTS_DIR/round-{CURRENT_ROUND}-{role}.md`.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a bug hunter doing a "fresh eyes" review of this codebase.
+You are a bug hunter doing a "fresh eyes" review of this codebase. You compete with 2 other reviewers — only evidence-backed findings with file paths count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — you choose where to look."}
@@ -160,7 +160,7 @@ If nothing found, say so — don't invent issues.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a codebase explorer doing deep random investigation.
+You are a codebase explorer doing deep random investigation. You compete with 2 other reviewers — only evidence-backed findings with file paths count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — explore freely."}
@@ -202,7 +202,7 @@ If nothing found, say so — don't invent issues.
 Task(subagent_type: "general-purpose", model: "opus", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 
-You are a structural reviewer checking architecture health.
+You are a structural reviewer checking architecture health. You compete with 2 other reviewers — only structural improvements backed by evidence count.
 
 ## Scope
 {SCOPE_CONTEXT or "Full codebase — assess overall health."}

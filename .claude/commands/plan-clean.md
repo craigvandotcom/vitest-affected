@@ -130,6 +130,7 @@ For each finding:
 **Fix:** The specific correction needed
 
 Limit: top 7 findings. Under 400 words. Only report real inaccuracies — don't flag stylistic issues.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -174,6 +175,7 @@ For each finding:
 **Fix:** The specific correction needed
 
 Limit: top 7 findings. Under 400 words. Only report structural issues — don't flag accuracy or style.
+If nothing found, say so — don't invent issues.
 """)
 ```
 
@@ -219,6 +221,7 @@ For each finding:
 **Fix:** Brief description of the edit
 
 Limit: top 7 findings. Under 400 words. Only report hygiene issues — don't flag accuracy or logic.
+If nothing found, say so — don't invent issues.
 """)
 ```
 

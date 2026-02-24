@@ -200,6 +200,7 @@ For each opportunity, provide:
 
 Be aggressive — look for meaningful improvements. But every suggestion must have evidence from this session.
 Context bloat is the enemy. Prefer refining existing content over adding new content.
+If nothing noteworthy happened, say so — don't invent learnings to fill the report.
 """)
 ```
 

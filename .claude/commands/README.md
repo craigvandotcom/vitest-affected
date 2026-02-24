@@ -41,6 +41,12 @@ Inspired by Jeffrey Emanuel's Agentic Coding Flywheel methodology: 80-85% planni
 | `wave-merge` | Merge wave branch to main — PR creation, CI/agent feedback triage, auto-fix, merge |
 | `hygiene` | Iterative codebase review — 3 Opus agents, multiple rounds until plateau |
 
+### Meta
+
+| Command | Purpose |
+| ------- | ------- |
+| `prompt-enhance` | Analyze and enhance subagent prompts — score against pattern rubric, diagnose gaps, rewrite |
+
 ### Ideas
 
 | Command | Purpose |
