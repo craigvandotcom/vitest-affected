@@ -27,13 +27,17 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 
 `PLAN_FILE`: Check argument, then `.claude/plans/*.md`, then `PLAN.md` in project root. If none found, STOP: "No plan found. Provide a path or run /plan-init first."
 
+### Skill Routing
+
+Scan the plan for domain keywords. Check `AGENTS.md > Available Skills` for relevant skills. Include skill paths in reviewer prompts where applicable.
+
 ### Configuration
 
 ```
 CURRENT_ROUND=1
 MAX_ROUNDS=3
 AGENT_MODEL=sonnet
-ARTIFACTS_DIR=/tmp/plan-team-$(date +%Y%m%d-%H%M%S)
+ARTIFACTS_DIR=/tmp/plan-clean-$(date +%Y%m%d-%H%M%S)
 ```
 
 ```bash
@@ -43,7 +47,7 @@ mkdir -p "$ARTIFACTS_DIR"
 ### Checkpoint Plan
 
 ```bash
-git add "$PLAN_FILE" && git commit -m "docs(plan): checkpoint before plan-team
+git add "$PLAN_FILE" && git commit -m "docs(plan): checkpoint before plan-clean
 
 Co-Authored-By: Claude <noreply@anthropic.com>" || true
 ```
@@ -67,6 +71,16 @@ EOF
 ### Compaction Recovery
 
 If `$ARTIFACTS_DIR/progress.md` exists, parse the last `### Round N` entry to recover `CURRENT_ROUND` (set to N+1). If `consensus-registry.md` exists, read it to recover the deferred findings pool.
+
+### Create Workflow Tasks
+
+```
+TaskCreate(subject: "Phase 0: Initialize plan-clean", description: "Identify plan, checkpoint, create consensus registry", activeForm: "Initializing plan-clean...")
+TaskCreate(subject: "Phases 1-3: Review loop", description: "3 Sonnet reviewers per round, synthesize, convergence check. Up to MAX_ROUNDS.", activeForm: "Reviewing plan...")
+TaskCreate(subject: "Phase 4: Finalize", description: "Present no-consensus findings, commit, report", activeForm: "Finalizing plan-clean...")
+```
+
+**TaskUpdate(task: "Phase 0", status: "completed")**
 
 ---
 

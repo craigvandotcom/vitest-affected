@@ -323,8 +323,12 @@ Remove session artifacts (they've been consumed by retrospective). Run each sepa
 ```bash
 rm -rf /tmp/bead-work
 rm -rf /tmp/plan-refine-internal-*
+rm -rf /tmp/plan-refine-*
+rm -rf /tmp/plan-clean-*
 rm -rf /tmp/bead-refine-*
 rm -rf /tmp/beadify-*
+rm -rf /tmp/hygiene-*
+rm -rf /tmp/work-review-*
 ```
 
 ### Final Verification

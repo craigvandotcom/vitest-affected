@@ -8,6 +8,15 @@ Run this after a few bead-work sessions, or daily for maintenance. For feature-s
 
 ---
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Full codebase, recent commits, or specific directory (user-selected scope)                 |
+| **Output**       | Fixed issues committed, health assessment report                                           |
+| **Artifacts**    | Round findings in `$ARTIFACTS_DIR/round-{N}-{role}.md`, consensus registry                 |
+| **Verification** | Quality gate (test, lint, type-check, build) all passing                                   |
+
 ## Phase 0: Initialize
 
 ### Select Scope
@@ -79,6 +88,20 @@ ls -d */ | head -20
 ```
 
 Save this as `CODEBASE_CONTEXT` for agent prompts.
+
+### Skill Routing
+
+Scan codebase for domain keywords. Check `AGENTS.md > Available Skills` for relevant skills. Include skill paths in reviewer prompts where applicable.
+
+### Create Workflow Tasks
+
+```
+TaskCreate(subject: "Phase 0: Initialize hygiene review", description: "Select scope, gather context, create consensus registry", activeForm: "Initializing hygiene review...")
+TaskCreate(subject: "Phases 1-4: Review loop", description: "3 Opus agents per round, synthesize, apply fixes, convergence check. Up to MAX_ROUNDS.", activeForm: "Running hygiene review...")
+TaskCreate(subject: "Phase 5: Finalize", description: "Present no-consensus findings, quality gate, commit, report", activeForm: "Finalizing hygiene review...")
+```
+
+**TaskUpdate(task: "Phase 0", status: "completed")**
 
 ---
 

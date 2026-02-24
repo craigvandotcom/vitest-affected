@@ -8,6 +8,15 @@ Competitive framing: agents compete — only evidence-backed findings count. Cod
 
 ---
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Approved plan file (from `/plan-init`)                                                     |
+| **Output**       | Refined plan (in-place edit), Refinement Log appended                                      |
+| **Artifacts**    | Round findings in `$ARTIFACTS_DIR/round-{N}-{role}.md`, consensus registry                 |
+| **Verification** | Convergence trend (fewer findings each round), plan committed                              |
+
 ## Phase 0: Initialize
 
 ```bash
@@ -75,6 +84,16 @@ git add "$PLAN_FILE" && git commit -m "docs(plan): checkpoint before plan-refine
 
 Co-Authored-By: Claude <noreply@anthropic.com>" || true
 ```
+
+### Create Workflow Tasks
+
+```
+TaskCreate(subject: "Phase 0: Initialize plan-refine", description: "Identify plan, select tier, checkpoint, create consensus registry", activeForm: "Initializing plan-refine...")
+TaskCreate(subject: "Phases 1-4: Refinement loop", description: "Parallel agents per round, synthesize, apply, convergence check. Repeat up to MAX_ROUNDS.", activeForm: "Refining plan...")
+TaskCreate(subject: "Phase 5: Finalize", description: "Present no-consensus findings, commit, report", activeForm: "Finalizing refinement...")
+```
+
+**TaskUpdate(task: "Phase 0", status: "completed")**
 
 ---
 

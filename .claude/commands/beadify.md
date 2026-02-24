@@ -105,7 +105,7 @@ Epic: Dashboard
 **Validator 1: Completeness Checker**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 You are validating a proposed bead structure against its source plan.
 
 ## Your Task
@@ -145,7 +145,7 @@ Limit: top 5 issues. Under 400 words. If nothing missing, say so.
 **Validator 2: Dependency Checker**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 You are validating the dependency structure of a proposed bead breakdown.
 
 ## Your Task
@@ -186,7 +186,7 @@ Limit: top 5 issues. Under 400 words. If structure is sound, say so.
 **Validator 3: Granularity Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 You are validating the granularity and sizing of a proposed bead breakdown.
 
 ## Your Task

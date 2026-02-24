@@ -11,6 +11,15 @@ description: Multi-model iterative plan refinement - sends plan to 3-4 AI models
 - You need diverse AI insights on technical decisions
 - You're uncertain if your plan is optimal
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Plan file (from `/plan-init` or `/plan-refine-internal`)                                   |
+| **Output**       | Refined plan (in-place edit), `REFINEMENT-LOG.md` in `.claude/plans/research/`             |
+| **Artifacts**    | Model responses in `$WORK_DIR/`, consensus registry                                        |
+| **Verification** | Convergence trend, plan committed                                                          |
+
 **This is plan refinement through iteration.** Multiple AI models review in parallel, you (Claude Code orchestrator) synthesize improvements, repeat until convergence. Not for trivial plans - for important architectural decisions.
 
 **You are the conductor, not the musician.** You coordinate the process and do the synthesis work. You delegate model calls to the OpenRouter tool via bash.
@@ -52,6 +61,10 @@ else
     AGENTS_FILE=""
 fi
 ```
+
+### Skill Routing
+
+Scan the plan for domain keywords. Check `AGENTS.md > Available Skills` for relevant skills. Include skill content in model prompts where applicable.
 
 ### Model Set
 

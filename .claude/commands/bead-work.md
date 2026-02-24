@@ -8,6 +8,15 @@ For parallelism, open multiple terminal sessions — each runs `/bead-work` inde
 
 ---
 
+## I/O Contract
+
+|                  |                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| **Input**        | Unblocked beads (from `/bead-refine` or `/beadify`)                                       |
+| **Output**       | Implemented code, committed per bead, pushed to wave branch                                |
+| **Artifacts**    | Per-bead results in `/tmp/bead-work/bead-{id}-result.md`, progress in `/tmp/bead-work/progress.md` |
+| **Verification** | Per-bead quality gate (test, lint, type-check), beads closed in `br`                       |
+
 ## Phase 0: Initialize
 
 **MANDATORY FIRST STEP: Create task list with TaskCreate BEFORE starting (after asking user for bead count).**
@@ -220,7 +229,7 @@ git add <specific files>
 git commit -m "feat(<scope>): <bead title>
 
 Bead: <id>
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+Co-Authored-By: Claude <noreply@anthropic.com>"
 git push
 ```
 

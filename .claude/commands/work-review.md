@@ -241,7 +241,7 @@ Each agent writes findings to `$ARTIFACTS_DIR/round-1-{role}.md`.
 **Agent 1: Security Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has security skills: "Read .claude/skills/<security-skill>/SKILL.md for security patterns."}
 
@@ -282,7 +282,7 @@ If nothing found, say so — don't invent issues.
 **Agent 2: Performance Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has performance skills: "Read .claude/skills/<perf-skill>/SKILL.md for optimization patterns."}
 
@@ -324,7 +324,7 @@ If nothing found, say so — don't invent issues.
 **Agent 3: Architecture Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has architecture/coding skills: "Read .claude/skills/<arch-skill>/SKILL.md for patterns."}
 
@@ -366,7 +366,7 @@ If nothing found, say so — don't invent issues.
 **Agent 4: Correctness Reviewer**
 
 ```
-Task(subagent_type: "general-purpose", model: "haiku", prompt: """
+Task(subagent_type: "general-purpose", model: "sonnet", prompt: """
 First: read AGENTS.md for project context, coding standards, and conventions.
 {If project has testing skills: "Read .claude/skills/<testing-skill>/SKILL.md for test patterns."}
 
@@ -836,7 +836,7 @@ rm -rf "$ARTIFACTS_DIR"
 | ---------- | ----------------------------------------- | -------------------------------------- |
 | **Scope**  | Feature branch diff                       | Whole codebase                         |
 | **When**   | After `/bead-work` or `/work`             | Between sessions, daily maintenance    |
-| **Agents** | 4 specialized Haiku reviewers, 1-2 rounds | 3 Opus explorers, multi-round          |
+| **Agents** | 4 specialized Sonnet reviewers, 1-2 rounds | 3 Opus explorers, multi-round          |
 | **Fixes**  | Engineer sub-agent                        | Conductor applies directly             |
 | **Focus**  | Security, perf, arch, correctness         | Bugs, dead code, drift, health         |
 
