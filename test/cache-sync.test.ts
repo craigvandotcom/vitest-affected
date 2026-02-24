@@ -333,6 +333,132 @@ describe('loadOrBuildGraphSync', () => {
 
     expect(buildSyncSpy).toHaveBeenCalledOnce();
   });
+
+  // ── bd-q0g: expanded return type ──────────────────────────────────────────
+
+  test('bd-q0g: returns oldMtimes and currentMtimes fields on cache hit (no-staleness)', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const aFile = path.join(rootDir, 'src', 'a.ts');
+    const bFile = path.join(rootDir, 'src', 'b.ts');
+    writeProjectFiles(rootDir, {
+      'src/a.ts': 'import { b } from "./b";\nexport const a = 1;\n',
+      'src/b.ts': 'export const b = 2;\n',
+      'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+    });
+
+    const realMtimeA = lstatSync(aFile).mtimeMs;
+    const realMtimeB = lstatSync(bFile).mtimeMs;
+    const mtimes = new Map([
+      [aFile, realMtimeA],
+      [bFile, realMtimeB],
+    ]);
+    const forward = new Map<string, Set<string>>([
+      [aFile, new Set([bFile])],
+      [bFile, new Set()],
+    ]);
+    saveGraphSyncInternal(forward, cacheDir, mtimes);
+
+    const result = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    // Must expose both mtime maps
+    expect(result).toHaveProperty('oldMtimes');
+    expect(result).toHaveProperty('currentMtimes');
+    expect(result.oldMtimes).toBeInstanceOf(Map);
+    expect(result.currentMtimes).toBeInstanceOf(Map);
+  });
+
+  test('bd-q0g: cache hit — oldMtimes matches what was saved and currentMtimes matches real disk mtimes', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const aFile = path.join(rootDir, 'src', 'a.ts');
+    const bFile = path.join(rootDir, 'src', 'b.ts');
+    writeProjectFiles(rootDir, {
+      'src/a.ts': 'import { b } from "./b";\nexport const a = 1;\n',
+      'src/b.ts': 'export const b = 2;\n',
+      'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+    });
+
+    const savedMtimeA = lstatSync(aFile).mtimeMs;
+    const savedMtimeB = lstatSync(bFile).mtimeMs;
+    const savedMtimes = new Map([
+      [aFile, savedMtimeA],
+      [bFile, savedMtimeB],
+    ]);
+    const forward = new Map<string, Set<string>>([
+      [aFile, new Set([bFile])],
+      [bFile, new Set()],
+    ]);
+    saveGraphSyncInternal(forward, cacheDir, savedMtimes);
+
+    const result = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    // oldMtimes should reflect the values saved in the cache file
+    expect(result.oldMtimes.get(aFile)).toBe(savedMtimeA);
+    expect(result.oldMtimes.get(bFile)).toBe(savedMtimeB);
+
+    // currentMtimes should reflect real disk mtimes (same here, since files not changed)
+    const diskMtimeA = lstatSync(aFile).mtimeMs;
+    const diskMtimeB = lstatSync(bFile).mtimeMs;
+    expect(result.currentMtimes.get(aFile)).toBe(diskMtimeA);
+    expect(result.currentMtimes.get(bFile)).toBe(diskMtimeB);
+  });
+
+  test('bd-q0g: cache miss (no graph.json) — oldMtimes and currentMtimes are empty Maps', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    writeProjectFiles(rootDir, {
+      'src/a.ts': 'export const a = 1;\n',
+      'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+    });
+
+    // No cache file exists — triggers full rebuild
+    const result = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    expect(result.oldMtimes).toBeInstanceOf(Map);
+    expect(result.currentMtimes).toBeInstanceOf(Map);
+    expect(result.oldMtimes.size).toBe(0);
+    expect(result.currentMtimes.size).toBe(0);
+  });
+
+  test('bd-q0g: stale cache (mtime changed) — oldMtimes and currentMtimes are empty Maps (full rebuild path)', () => {
+    const rootDir = makeTmpDir();
+    tempDirs.push(rootDir);
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const aFile = path.join(rootDir, 'src', 'a.ts');
+    const bFile = path.join(rootDir, 'src', 'b.ts');
+    writeProjectFiles(rootDir, {
+      'src/a.ts': 'import { b } from "./b";\nexport const a = 1;\n',
+      'src/b.ts': 'export const b = 2;\n',
+      'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+    });
+
+    // Save with a stale mtime — this will trigger full rebuild
+    const staleMtimes = new Map([
+      [aFile, lstatSync(aFile).mtimeMs],
+      [bFile, 0], // stale
+    ]);
+    const forward = new Map<string, Set<string>>([
+      [aFile, new Set([bFile])],
+      [bFile, new Set()],
+    ]);
+    saveGraphSyncInternal(forward, cacheDir, staleMtimes);
+
+    const result = loadOrBuildGraphSync(rootDir, cacheDir);
+
+    // Full rebuild path returns empty mtime maps
+    expect(result.oldMtimes).toBeInstanceOf(Map);
+    expect(result.currentMtimes).toBeInstanceOf(Map);
+    expect(result.oldMtimes.size).toBe(0);
+    expect(result.currentMtimes.size).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -345,13 +471,21 @@ describe('runtimeEdges persistence', () => {
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    // Use an empty forward map so diffGraphMtimes produces no changes (cache hit guaranteed)
-    const forward = new Map<string, Set<string>>();
+    // srcFile must be under rootDir (path confinement) and in forward map (stale pruning)
+    const srcFile = path.join(rootDir, 'src', 'utils.ts');
+    const testFile = path.join(rootDir, 'tests', 'utils.test.ts');
+
+    // Write testFile to disk so it passes existsSync check during pruning
+    writeProjectFiles(rootDir, {
+      'src/utils.ts': 'export const utils = 1;\n',
+      'tests/utils.test.ts': 'import { utils } from "../src/utils";\n',
+    });
+
+    // Use forward map with srcFile (required to survive stale pruning)
+    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
     const mtimes = new Map<string, number>();
 
     // Define runtime edges: source file -> set of test files that loaded it
-    const srcFile = '/abs/src/utils.ts';
-    const testFile = '/abs/tests/utils.test.ts';
     const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
 
     saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
@@ -368,11 +502,18 @@ describe('runtimeEdges persistence', () => {
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    const forward = new Map<string, Set<string>>();
+    // srcFile must be under rootDir and in forward map; testFile must exist on disk
+    const srcFile = path.join(rootDir, 'src', 'lib.ts');
+    const testFile = path.join(rootDir, 'tests', 'lib.test.ts');
+
+    writeProjectFiles(rootDir, {
+      'src/lib.ts': 'export const lib = 1;\n',
+      'tests/lib.test.ts': 'import { lib } from "../src/lib";\n',
+    });
+
+    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
     const mtimes = new Map<string, number>();
 
-    const srcFile = '/abs/src/lib.ts';
-    const testFile = '/abs/tests/lib.test.ts';
     const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
 
     // First save WITH runtime edges

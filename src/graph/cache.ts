@@ -80,6 +80,58 @@ function entriesToMaps(
   return { forward, reverse };
 }
 
+/**
+ * Returns true if `filePath` is under `rootDir` (same boundary check as
+ * builder.ts). Accepts exact match or prefix + path.sep.
+ */
+function isUnderRootDir(filePath: string, rootDir: string): boolean {
+  const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+  return filePath === rootDir || filePath.startsWith(rootPrefix);
+}
+
+/**
+ * Validates disk.files schema. Returns true if the value is a plain object
+ * where every entry has typeof mtime === 'number' and imports is a string[].
+ */
+function isValidFilesObject(
+  value: unknown,
+): value is Record<string, CacheFileEntry> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  for (const entry of Object.values(value as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return false;
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e['mtime'] !== 'number') return false;
+    if (!Array.isArray(e['imports'])) return false;
+    for (const imp of e['imports'] as unknown[]) {
+      if (typeof imp !== 'string') return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Validates runtimeEdges schema. Returns true if the value is a plain object
+ * where all keys are strings and all values are arrays of strings.
+ */
+function isValidRuntimeEdgesObject(
+  value: unknown,
+): value is Record<string, string[]> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    if (!Array.isArray(v)) return false;
+    for (const item of v as unknown[]) {
+      if (typeof item !== 'string') return false;
+    }
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -115,7 +167,18 @@ export async function loadOrBuildGraph(
       parsed !== null &&
       (parsed as CacheDiskFormat).version === CACHE_VERSION
     ) {
-      disk = parsed as CacheDiskFormat;
+      const candidate = parsed as { version: 1; builtAt: number; files: unknown; runtimeEdges?: unknown };
+
+      // Schema validation: disk.files must be a valid plain object
+      if (!isValidFilesObject(candidate.files)) {
+        // Schema violation in disk.files → full rebuild
+        if (verbose) {
+          console.warn('[vitest-affected] Cache schema invalid (disk.files) — falling back to full rebuild');
+        }
+        return buildFullGraph(rootDir);
+      }
+
+      disk = candidate as CacheDiskFormat;
     }
     // else: unknown version → fall through to full rebuild
   } catch {
@@ -127,12 +190,28 @@ export async function loadOrBuildGraph(
     return buildFullGraph(rootDir);
   }
 
+  // --- Path confinement: pre-filter disk.files entries to rootDir ---
+  let skippedCount = 0;
+  const validFiles: Array<[string, CacheFileEntry]> = [];
+  for (const [filePath, entry] of Object.entries(disk.files)) {
+    if (!isUnderRootDir(filePath, rootDir)) {
+      skippedCount++;
+      continue;
+    }
+    validFiles.push([filePath, entry]);
+  }
+  if (skippedCount > 0 && verbose) {
+    console.warn(
+      `[vitest-affected] Skipped ${skippedCount} cache entry/entries outside rootDir (path confinement)`,
+    );
+  }
+
   // --- Cache hit: stat each file, reparse stale ones ---
   const resolver = createResolver(rootDir);
   const refreshed = new Map<string, string[]>();
   let staleCount = 0;
 
-  for (const [filePath, entry] of Object.entries(disk.files)) {
+  for (const [filePath, entry] of validFiles) {
     // If file no longer exists, skip it (deleted between runs)
     if (!existsSync(filePath)) {
       continue;
@@ -173,10 +252,28 @@ export async function loadOrBuildGraph(
   const { forward, reverse } = entriesToMaps(refreshed);
 
   // Merge persisted runtime edges into the reverse map
-  if (disk.runtimeEdges) {
-    for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
-      if (!reverse.has(file)) reverse.set(file, new Set(tests));
-      else for (const t of tests) reverse.get(file)!.add(t);
+  if (disk.runtimeEdges !== undefined) {
+    // Schema validation: runtimeEdges must be a valid plain object with string[] values
+    if (!isValidRuntimeEdgesObject(disk.runtimeEdges)) {
+      if (verbose) {
+        console.warn('[vitest-affected] Cache schema invalid (runtimeEdges) — skipping runtime edge merge');
+      }
+      // Do NOT trigger full rebuild — static graph is still valid
+    } else {
+      // Path confinement: only merge keys that are under rootDir
+      for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
+        if (!isUnderRootDir(file, rootDir)) {
+          if (verbose) {
+            console.warn(`[vitest-affected] Skipping runtimeEdges key outside rootDir: ${file}`);
+          }
+          continue;
+        }
+        // Filter test values to only those under rootDir
+        const confinedTests = tests.filter((t) => isUnderRootDir(t, rootDir));
+        if (confinedTests.length === 0) continue;
+        if (!reverse.has(file)) reverse.set(file, new Set(confinedTests));
+        else for (const t of confinedTests) reverse.get(file)!.add(t);
+      }
     }
   }
 
@@ -328,6 +425,33 @@ export function loadCachedMtimes(cacheDir: string): Map<string, number> {
 }
 
 /**
+ * Prune stale runtimeEdges from a serialized record.
+ *
+ * - Keys not present in `forwardKeys` are removed (source file no longer tracked).
+ * - Values are filtered to paths that exist in `forwardKeys` OR on disk (existsSync).
+ *   This handles renamed/deleted test files that are no longer tracked.
+ */
+function pruneRuntimeEdges(
+  edges: Record<string, string[]>,
+  forwardKeys: Set<string>,
+): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const [key, values] of Object.entries(edges)) {
+    // Prune keys not in forward map
+    if (!forwardKeys.has(key)) continue;
+
+    // Filter values: keep only those in forward OR on disk
+    const validValues = values.filter(
+      (v) => forwardKeys.has(v) || existsSync(v),
+    );
+    if (validValues.length > 0) {
+      result[key] = validValues;
+    }
+  }
+  return result;
+}
+
+/**
  * Sync cache persistence.
  * Uses same atomic write pattern (temp file → renameSync).
  * If `mtimes` is provided, use it instead of stat-ing files again.
@@ -338,6 +462,10 @@ export function loadCachedMtimes(cacheDir: string): Map<string, number> {
  * When `runtimeEdges` is OMITTED (e.g., watch filter save): reads the existing
  * cache file and preserves its `runtimeEdges` field (read-merge-write pattern).
  * This prevents the watch filter from erasing previously persisted runtime edges.
+ *
+ * In BOTH branches, stale runtimeEdges are pruned:
+ * - Keys not in the forward map are removed.
+ * - Values (test paths) not in forward AND not on disk are removed.
  */
 export function saveGraphSyncInternal(
   forward: Map<string, Set<string>>,
@@ -348,6 +476,7 @@ export function saveGraphSyncInternal(
   mkdirSync(cacheDir, { recursive: true });
 
   const resolvedMtimes = mtimes ?? statAllFiles(forward.keys());
+  const forwardKeys = new Set(forward.keys());
 
   const files: Record<string, CacheFileEntry> = {};
   for (const [filePath, imports] of forward) {
@@ -360,23 +489,32 @@ export function saveGraphSyncInternal(
   let serializedRuntimeEdges: Record<string, string[]> | undefined;
 
   if (runtimeEdges !== undefined) {
-    // Caller provided runtime edges — serialize them
-    serializedRuntimeEdges = {};
+    // Caller provided runtime edges — serialize them, then prune stale entries.
+    // Always write the field when explicitly provided (even if empty after pruning).
+    const raw: Record<string, string[]> = {};
     for (const [file, tests] of runtimeEdges) {
-      serializedRuntimeEdges[file] = [...tests];
+      raw[file] = [...tests];
     }
+    serializedRuntimeEdges = pruneRuntimeEdges(raw, forwardKeys);
   } else {
-    // runtimeEdges omitted — read-merge-write: preserve existing from disk
+    // runtimeEdges omitted — read-merge-write: preserve existing from disk, then prune
     const cachePath = path.join(cacheDir, GRAPH_FILE);
     try {
-      const raw = readFileSync(cachePath, 'utf-8');
-      const parsed: unknown = JSON.parse(raw);
+      const rawFile = readFileSync(cachePath, 'utf-8');
+      const parsed: unknown = JSON.parse(rawFile);
       if (
         typeof parsed === 'object' &&
         parsed !== null &&
-        (parsed as CacheDiskFormat).runtimeEdges !== undefined
+        (parsed as CacheDiskFormat).runtimeEdges !== undefined &&
+        isValidRuntimeEdgesObject((parsed as CacheDiskFormat).runtimeEdges)
       ) {
-        serializedRuntimeEdges = (parsed as CacheDiskFormat).runtimeEdges;
+        const pruned = pruneRuntimeEdges(
+          (parsed as CacheDiskFormat).runtimeEdges!,
+          forwardKeys,
+        );
+        if (Object.keys(pruned).length > 0) {
+          serializedRuntimeEdges = pruned;
+        }
       }
     } catch {
       // ENOENT or JSON parse error — no existing runtime edges to preserve
@@ -408,6 +546,10 @@ export function saveGraphSyncInternal(
  * CRITICAL: The sync variant does FULL REBUILD on any staleness,
  * NOT incremental per-file reparse like the async version.
  * This is intentional — simpler, and ~166ms is acceptable for watch mode.
+ *
+ * Returns `oldMtimes` and `currentMtimes` so callers (e.g. watch filter)
+ * can reuse the mtime data already computed internally, avoiding redundant
+ * I/O. On full rebuild (cache miss or staleness), both are empty Maps.
  */
 export function loadOrBuildGraphSync(
   rootDir: string,
@@ -415,6 +557,8 @@ export function loadOrBuildGraphSync(
 ): {
   forward: Map<string, Set<string>>;
   reverse: Map<string, Set<string>>;
+  oldMtimes: Map<string, number>;
+  currentMtimes: Map<string, number>;
 } {
   // Clean up orphaned temp files
   cleanupOrphanedTmp(cacheDir);
@@ -431,20 +575,42 @@ export function loadOrBuildGraphSync(
       parsed !== null &&
       (parsed as CacheDiskFormat).version === CACHE_VERSION
     ) {
-      disk = parsed as CacheDiskFormat;
+      const candidate = parsed as { version: 1; builtAt: number; files: unknown; runtimeEdges?: unknown };
+
+      // Schema validation: disk.files must be a valid plain object
+      if (!isValidFilesObject(candidate.files)) {
+        // Schema violation in disk.files → full rebuild
+        const { forward, reverse } = buildFullGraphSync(rootDir);
+        return { forward, reverse, oldMtimes: new Map(), currentMtimes: new Map() };
+      }
+
+      disk = candidate as CacheDiskFormat;
     }
   } catch {
     // ENOENT or JSON.parse error → fall through to full rebuild
   }
 
+  const emptyMtimes = new Map<string, number>();
+
   if (disk === null) {
-    // Cache miss — full rebuild
-    return buildFullGraphSync(rootDir);
+    // Cache miss — full rebuild; return empty mtime maps
+    const { forward, reverse } = buildFullGraphSync(rootDir);
+    return { forward, reverse, oldMtimes: emptyMtimes, currentMtimes: new Map() };
+  }
+
+  // --- Path confinement: pre-filter disk.files entries to rootDir ---
+  const validFiles: Array<[string, CacheFileEntry]> = [];
+  for (const [filePath, entry] of Object.entries(disk.files)) {
+    if (!isUnderRootDir(filePath, rootDir)) {
+      // Skip entries outside rootDir (path confinement)
+      continue;
+    }
+    validFiles.push([filePath, entry]);
   }
 
   // --- Cache hit: check if any file is stale ---
   const cachedMtimes = new Map<string, number>();
-  for (const [filePath, entry] of Object.entries(disk.files)) {
+  for (const [filePath, entry] of validFiles) {
     cachedMtimes.set(filePath, entry.mtime);
   }
 
@@ -452,13 +618,14 @@ export function loadOrBuildGraphSync(
   const { changed, added, deleted } = diffGraphMtimes(cachedMtimes, currentMtimes);
 
   if (changed.length > 0 || added.length > 0 || deleted.length > 0) {
-    // Any staleness → full rebuild
-    return buildFullGraphSync(rootDir);
+    // Any staleness → full rebuild; return empty mtime maps
+    const { forward, reverse } = buildFullGraphSync(rootDir);
+    return { forward, reverse, oldMtimes: new Map(), currentMtimes: new Map() };
   }
 
   // --- No changes — rebuild maps from cached entries ---
   const entries = new Map<string, string[]>();
-  for (const [filePath, entry] of Object.entries(disk.files)) {
+  for (const [filePath, entry] of validFiles) {
     // Filter out imports that no longer exist on disk (consistent with async path)
     entries.set(filePath, entry.imports.filter((imp) => existsSync(imp)));
   }
@@ -466,12 +633,25 @@ export function loadOrBuildGraphSync(
   const { forward, reverse } = entriesToMaps(entries);
 
   // Merge persisted runtime edges into the reverse map
-  if (disk.runtimeEdges) {
-    for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
-      if (!reverse.has(file)) reverse.set(file, new Set(tests));
-      else for (const t of tests) reverse.get(file)!.add(t);
+  if (disk.runtimeEdges !== undefined) {
+    // Schema validation: runtimeEdges must be a valid plain object with string[] values
+    if (!isValidRuntimeEdgesObject(disk.runtimeEdges)) {
+      // Skip merge only — static graph is still valid, no full rebuild
+    } else {
+      // Path confinement: only merge keys that are under rootDir
+      for (const [file, tests] of Object.entries(disk.runtimeEdges)) {
+        if (!isUnderRootDir(file, rootDir)) {
+          continue;
+        }
+        // Filter test values to only those under rootDir
+        const confinedTests = tests.filter((t) => isUnderRootDir(t, rootDir));
+        if (confinedTests.length === 0) continue;
+        if (!reverse.has(file)) reverse.set(file, new Set(confinedTests));
+        else for (const t of confinedTests) reverse.get(file)!.add(t);
+      }
     }
   }
 
-  return { forward, reverse };
+  // Cache hit with no staleness — return the mtime data so callers can reuse it
+  return { forward, reverse, oldMtimes: cachedMtimes, currentMtimes };
 }

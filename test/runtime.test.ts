@@ -34,6 +34,17 @@ function makeTmpDir(): string {
   return mkdtempSync(path.join(tmpdir(), 'vitest-runtime-test-'));
 }
 
+function writeProjectFiles(
+  projectDir: string,
+  files: Record<string, string>,
+): void {
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(projectDir, rel);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, content, 'utf-8');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
@@ -452,12 +463,17 @@ describe('Cache persistence: runtime edges', () => {
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    // Use an empty forward map — no static files, guaranteed cache hit (no mtimes to check)
-    const forward = new Map<string, Set<string>>();
-    const mtimes = new Map<string, number>();
+    // srcFile must be under rootDir and in forward map (path confinement + stale pruning)
+    // testFile must exist on disk (value preservation predicate: in forward OR on disk)
+    const srcFile = path.join(rootDir, 'src', 'utils.ts');
+    const testFile = path.join(rootDir, 'tests', 'utils.test.ts');
+    writeProjectFiles(rootDir, {
+      'src/utils.ts': 'export const utils = 1;\n',
+      'tests/utils.test.ts': 'import { utils } from "../src/utils";\n',
+    });
 
-    const srcFile = '/abs/src/utils.ts';
-    const testFile = '/abs/tests/utils.test.ts';
+    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
+    const mtimes = new Map<string, number>();
     const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
 
     saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
@@ -479,11 +495,17 @@ describe('Cache persistence: save without runtimeEdges preserves existing', () =
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    const forward = new Map<string, Set<string>>();
+    // srcFile must be under rootDir and in forward map; testFile must exist on disk
+    const srcFile = path.join(rootDir, 'src', 'lib.ts');
+    const testFile = path.join(rootDir, 'tests', 'lib.test.ts');
+    writeProjectFiles(rootDir, {
+      'src/lib.ts': 'export const lib = 1;\n',
+      'tests/lib.test.ts': 'import { lib } from "../src/lib";\n',
+    });
+
+    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
     const mtimes = new Map<string, number>();
 
-    const srcFile = '/abs/src/lib.ts';
-    const testFile = '/abs/tests/lib.test.ts';
     const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
 
     // First save WITH runtime edges
