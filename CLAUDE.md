@@ -26,14 +26,16 @@ No separate eslint/prettier/biome — TypeScript strict mode is the only static 
 ```
 src/
 ├── index.ts          # Public API: vitestAffected() + VitestAffectedOptions type
-├── plugin.ts         # Vitest plugin — configureVitest({ vitest, project }) hook
+├── plugin.ts         # Vitest plugin — configureVitest hook + runtime reporter
 ├── graph/
-│   └── builder.ts    # oxc-parser + oxc-resolver → { forward, reverse } graph maps
+│   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports for changed files
+│   ├── cache.ts      # v2 cache: loadCachedReverseMap / saveCacheSync (JSON persistence)
+│   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs
 ├── git.ts            # 3 parallel git commands → { changed[], deleted[] }
 └── selector.ts       # Pure BFS on reverse graph → affected test file paths
 ```
 
-**Data flow:** `plugin.configureVitest` orchestrates: build graph → get changed files → BFS reverse graph → mutate `project.config.include` to absolute test paths.
+**Data flow:** `plugin.configureVitest` orchestrates: load cached reverse map → get changed files → delta parse new imports → BFS reverse graph → mutate `project.config.include`. After each run, the runtime reporter collects `importDurations` and merges into the cache.
 
 **Safety invariant:** Never silently skip tests. Any failure in graph/git/BFS → fallback to full suite with warning.
 
@@ -44,7 +46,7 @@ src/
 - **ESM-only** output (`format: ['esm']` in tsup) — Vitest users are ESM-native
 - **`configureVitest` hook** receives `{ vitest, project }` where `project.config.include` is mutated
 - **`/// <reference types="vitest/config" />`** triple-slash directive required for type augmentation
-- **peerDep `vitest >=3.1.0`** for Phase 1 (configureVitest hook requires 3.1+); bump to >=3.2.0 deferred to Phase 2
+- **peerDep `vitest >=3.2.0`** (configureVitest hook + importDurations require 3.2+)
 
 ## Beads Workflow
 

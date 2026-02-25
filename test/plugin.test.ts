@@ -4,6 +4,7 @@ import path from 'node:path';
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
+import { saveCacheSync } from '../src/graph/cache.js';
 
 const tempDirs: string[] = [];
 
@@ -33,6 +34,8 @@ afterEach(() => {
  * Create a temp project with a real test file and an orphan source file.
  * The orphan file is NOT in any test's dependency chain — changing it
  * produces zero affected tests.
+ *
+ * Also writes a v2 cache that maps main.ts → main.test.ts (but NOT orphan.ts).
  */
 function setupOrphanFixture(): { tmpDir: string; orphanPath: string } {
   const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-plugin-'));
@@ -48,6 +51,15 @@ function setupOrphanFixture(): { tmpDir: string; orphanPath: string } {
     path.join(tmpDir, 'tests', 'main.test.ts'),
     'import { main } from "../src/main";\nimport { test, expect } from "vitest";\ntest("main", () => expect(main).toBe(1));\n',
   );
+
+  // Write a v2 cache: main.ts → main.test.ts (orphan.ts not in cache)
+  const cacheDir = path.join(tmpDir, '.vitest-affected');
+  const reverse = new Map<string, Set<string>>();
+  reverse.set(
+    path.join(tmpDir, 'src', 'main.ts'),
+    new Set([path.join(tmpDir, 'tests', 'main.test.ts')]),
+  );
+  saveCacheSync(cacheDir, reverse);
 
   return { tmpDir, orphanPath: path.join(tmpDir, 'src', 'orphan.ts') };
 }
@@ -66,6 +78,8 @@ function createMockContext(rootDir: string) {
   const mockVitest = {
     config: { root: rootDir, watch: false },
     projects: [mockProject],
+    reporters: [] as unknown[],
+    onFilterWatchedSpecification: () => {},
   };
   return { vitest: mockVitest, project: mockProject, projectConfig };
 }
@@ -77,7 +91,7 @@ describe('allowNoTests option', () => {
     const plugin = vitestAffected({
       allowNoTests: true,
       changedFiles: [orphanPath],
-      cache: false,
+      cache: true,
     });
 
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
@@ -97,7 +111,7 @@ describe('allowNoTests option', () => {
 
     const plugin = vitestAffected({
       changedFiles: [orphanPath],
-      cache: false,
+      cache: true,
     });
 
     const { vitest, project, projectConfig } = createMockContext(tmpDir);

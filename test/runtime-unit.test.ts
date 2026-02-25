@@ -1,8 +1,8 @@
 /// <reference types="vitest/config" />
-import { describe, test, expect, vi } from 'vitest';
+import { describe, test, expect } from 'vitest';
 import type { TestModule } from 'vitest/node';
 import type { TestRunEndReason } from 'vitest/reporters';
-import { createRuntimeReporter, mergeRuntimeEdges } from '../src/plugin.js';
+import { createRuntimeReporter } from '../src/plugin.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -17,49 +17,6 @@ function createMockTestModule(
     diagnostic: () => ({ importDurations }),
   } as unknown as TestModule;
 }
-
-// ---------------------------------------------------------------------------
-// mergeRuntimeEdges
-// ---------------------------------------------------------------------------
-
-describe('mergeRuntimeEdges', () => {
-  test('merges runtime edges into static reverse map (union)', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    staticReverse.set('/src/a.ts', new Set(['/tests/a.test.ts']));
-
-    const runtimeReverse = new Map<string, Set<string>>();
-    runtimeReverse.set('/src/b.ts', new Set(['/tests/b.test.ts']));
-    runtimeReverse.set('/src/a.ts', new Set(['/tests/b.test.ts'])); // merge into existing set
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.get('/src/a.ts')).toEqual(
-      new Set(['/tests/a.test.ts', '/tests/b.test.ts']),
-    );
-    expect(staticReverse.get('/src/b.ts')).toEqual(new Set(['/tests/b.test.ts']));
-  });
-
-  test('does not remove existing edges (union only)', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    staticReverse.set('/src/a.ts', new Set(['/tests/a.test.ts']));
-
-    const runtimeReverse = new Map<string, Set<string>>();
-    // No /src/a.ts in runtime — should not remove
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.get('/src/a.ts')).toEqual(new Set(['/tests/a.test.ts']));
-  });
-
-  test('handles empty maps', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    const runtimeReverse = new Map<string, Set<string>>();
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.size).toBe(0);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // createRuntimeReporter

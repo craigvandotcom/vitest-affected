@@ -2,7 +2,7 @@ import { describe, test, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
 import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { buildFullGraph, resolveFileImports, createResolver } from '../src/graph/builder.js';
+import { resolveFileImports, createResolver, deltaParseNewImports } from '../src/graph/builder.js';
 
 const fixtureDir = (name: string) => path.resolve(import.meta.dirname, 'fixtures', name);
 
@@ -99,160 +99,7 @@ describe('resolveFileImports', () => {
   });
 });
 
-describe('buildFullGraph - simple fixture (A→B→C)', () => {
-  test('forward map has entries for all source files and test file', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { forward } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(forward.keys());
-    const aTs = keys.find(k => k.endsWith('src/a.ts'));
-    const bTs = keys.find(k => k.endsWith('src/b.ts'));
-    const cTs = keys.find(k => k.endsWith('src/c.ts'));
-    const testA = keys.find(k => k.endsWith('tests/a.test.ts'));
-
-    expect(aTs).toBeDefined();
-    expect(bTs).toBeDefined();
-    expect(cTs).toBeDefined();
-    expect(testA).toBeDefined();
-  });
-
-  test('a.ts → {b.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { forward } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(forward.keys());
-    const aTs = keys.find(k => k.endsWith('src/a.ts'))!;
-    const bTs = keys.find(k => k.endsWith('src/b.ts'))!;
-
-    expect(forward.get(aTs)).toBeDefined();
-    const aDeps = forward.get(aTs)!;
-    expect(aDeps.has(bTs)).toBe(true);
-    expect(aDeps.size).toBe(1);
-  });
-
-  test('b.ts → {c.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { forward } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(forward.keys());
-    const bTs = keys.find(k => k.endsWith('src/b.ts'))!;
-    const cTs = keys.find(k => k.endsWith('src/c.ts'))!;
-
-    const bDeps = forward.get(bTs)!;
-    expect(bDeps.has(cTs)).toBe(true);
-    expect(bDeps.size).toBe(1);
-  });
-
-  test('c.ts → {} (empty set)', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { forward } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(forward.keys());
-    const cTs = keys.find(k => k.endsWith('src/c.ts'))!;
-
-    const cDeps = forward.get(cTs)!;
-    expect(cDeps.size).toBe(0);
-  });
-
-  test('tests/a.test.ts → {a.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { forward } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(forward.keys());
-    const aTs = keys.find(k => k.endsWith('src/a.ts'))!;
-    const testA = keys.find(k => k.endsWith('tests/a.test.ts'))!;
-
-    const testDeps = forward.get(testA)!;
-    expect(testDeps.has(aTs)).toBe(true);
-  });
-
-  test('reverse: c.ts → {b.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { reverse } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(reverse.keys());
-    const bTs = keys.find(k => k.endsWith('src/b.ts'))!;
-    const cTs = keys.find(k => k.endsWith('src/c.ts'))!;
-
-    expect(reverse.get(cTs)).toBeDefined();
-    expect(reverse.get(cTs)!.has(bTs)).toBe(true);
-  });
-
-  test('reverse: b.ts → {a.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { reverse } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(reverse.keys());
-    const aTs = keys.find(k => k.endsWith('src/a.ts'))!;
-    const bTs = keys.find(k => k.endsWith('src/b.ts'))!;
-
-    expect(reverse.get(bTs)!.has(aTs)).toBe(true);
-  });
-
-  test('reverse: a.ts → {tests/a.test.ts}', async () => {
-    const simpleDir = fixtureDir('simple');
-    const { reverse } = await buildFullGraph(simpleDir);
-
-    const keys = Array.from(reverse.keys());
-    const aTs = keys.find(k => k.endsWith('src/a.ts'))!;
-    const testA = keys.find(k => k.endsWith('tests/a.test.ts'))!;
-
-    expect(reverse.get(aTs)!.has(testA)).toBe(true);
-  });
-});
-
-describe('buildFullGraph - diamond fixture (A→B→C, A→D→C)', () => {
-  test('reverse of c.ts includes both b.ts and d.ts', async () => {
-    const diamondDir = fixtureDir('diamond');
-    const { reverse } = await buildFullGraph(diamondDir);
-
-    const keys = Array.from(reverse.keys());
-    const bTs = keys.find(k => k.endsWith('src/b.ts'))!;
-    const cTs = keys.find(k => k.endsWith('src/c.ts'))!;
-    const dTs = keys.find(k => k.endsWith('src/d.ts'))!;
-
-    expect(bTs).toBeDefined();
-    expect(cTs).toBeDefined();
-    expect(dTs).toBeDefined();
-
-    const cReverse = reverse.get(cTs)!;
-    expect(cReverse.has(bTs)).toBe(true);
-    expect(cReverse.has(dTs)).toBe(true);
-  });
-
-  test('forward map includes all diamond nodes', async () => {
-    const diamondDir = fixtureDir('diamond');
-    const { forward } = await buildFullGraph(diamondDir);
-
-    const keys = Array.from(forward.keys());
-    expect(keys.some(k => k.endsWith('src/a.ts'))).toBe(true);
-    expect(keys.some(k => k.endsWith('src/b.ts'))).toBe(true);
-    expect(keys.some(k => k.endsWith('src/c.ts'))).toBe(true);
-    expect(keys.some(k => k.endsWith('src/d.ts'))).toBe(true);
-  });
-});
-
-describe('buildFullGraph - circular fixture (A→B→A)', () => {
-  test('terminates without infinite loop', async () => {
-    const circularDir = fixtureDir('circular');
-    // Should resolve without hanging
-    const result = await buildFullGraph(circularDir);
-    expect(result).toBeDefined();
-    expect(result.forward).toBeDefined();
-    expect(result.reverse).toBeDefined();
-  });
-
-  test('both files appear in the graph', async () => {
-    const circularDir = fixtureDir('circular');
-    const { forward } = await buildFullGraph(circularDir);
-
-    const keys = Array.from(forward.keys());
-    expect(keys.some(k => k.endsWith('src/a.ts'))).toBe(true);
-    expect(keys.some(k => k.endsWith('src/b.ts'))).toBe(true);
-  });
-});
-
-describe('builder.ts bug fixes (bd-3me)', () => {
+describe('builder.ts bug fixes', () => {
   test('path boundary rejects sibling directories with shared prefix', () => {
     // Create two sibling dirs: /tmp/foo and /tmp/foo-bar
     const base = mkdtempSync(path.join(tmpdir(), 'vitest-affected-boundary-'));
@@ -301,26 +148,67 @@ describe('builder.ts bug fixes (bd-3me)', () => {
     warnSpy.mockRestore();
   });
 
-  test('buildFullGraph excludes test/fixtures directory', async () => {
-    // Create a project with a test/fixtures subdirectory
-    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-fixtures-ignore-'));
-    tempDirs.push(tmpDir);
-    mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
-    mkdirSync(path.join(tmpDir, 'test', 'fixtures', 'simple', 'src'), { recursive: true });
+});
 
-    writeFileSync(path.join(tmpDir, 'src', 'main.ts'), 'export const main = 1;\n');
-    writeFileSync(
-      path.join(tmpDir, 'test', 'fixtures', 'simple', 'src', 'a.ts'),
-      'export const a = 1;\n',
+describe('deltaParseNewImports', () => {
+  test('returns empty array when all imports are already in cachedReverse', () => {
+    const simpleDir = fixtureDir('simple');
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const bFile = path.join(simpleDir, 'src', 'b.ts');
+
+    // cachedReverse already knows about b.ts
+    const cachedReverse = new Map<string, Set<string>>();
+    cachedReverse.set(bFile, new Set([aFile]));
+
+    const newTargets = deltaParseNewImports([aFile], cachedReverse, simpleDir);
+    expect(newTargets).toEqual([]);
+  });
+
+  test('returns new import targets not in cachedReverse', () => {
+    const simpleDir = fixtureDir('simple');
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+
+    // cachedReverse is empty — b.ts is "new"
+    const cachedReverse = new Map<string, Set<string>>();
+
+    const newTargets = deltaParseNewImports([aFile], cachedReverse, simpleDir);
+    expect(newTargets.length).toBeGreaterThan(0);
+    expect(newTargets.some(t => t.endsWith('b.ts'))).toBe(true);
+  });
+
+  test('skips files that cannot be read', () => {
+    const simpleDir = fixtureDir('simple');
+    const nonexistent = path.join(simpleDir, 'src', 'does-not-exist.ts');
+    const cachedReverse = new Map<string, Set<string>>();
+
+    const newTargets = deltaParseNewImports([nonexistent], cachedReverse, simpleDir);
+    expect(newTargets).toEqual([]);
+  });
+
+  test('handles multiple changed files', () => {
+    const simpleDir = fixtureDir('simple');
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const bFile = path.join(simpleDir, 'src', 'b.ts');
+
+    // cachedReverse is empty
+    const cachedReverse = new Map<string, Set<string>>();
+
+    const newTargets = deltaParseNewImports([aFile, bFile], cachedReverse, simpleDir);
+    // a.ts imports b.ts, b.ts imports c.ts — both should be new
+    expect(newTargets.some(t => t.endsWith('b.ts'))).toBe(true);
+    expect(newTargets.some(t => t.endsWith('c.ts'))).toBe(true);
+  });
+
+  test('verbose mode logs new targets', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const simpleDir = fixtureDir('simple');
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const cachedReverse = new Map<string, Set<string>>();
+
+    deltaParseNewImports([aFile], cachedReverse, simpleDir, true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[vitest-affected] Delta parse: new import target')
     );
-    writeFileSync(path.join(tmpDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
-
-    const { forward } = await buildFullGraph(tmpDir);
-    const keys = Array.from(forward.keys());
-
-    // Fixture files should NOT be in the graph
-    expect(keys.some(k => k.includes('test/fixtures'))).toBe(false);
-    // Source files SHOULD be in the graph
-    expect(keys.some(k => k.endsWith('src/main.ts'))).toBe(true);
+    warnSpy.mockRestore();
   });
 });

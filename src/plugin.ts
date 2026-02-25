@@ -4,9 +4,9 @@ import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
 import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { glob, globSync } from 'tinyglobby';
-import { buildFullGraph, GRAPH_GLOB_IGNORE } from './graph/builder.js';
-import { loadOrBuildGraph, saveGraph, loadOrBuildGraphSync, saveGraphSyncInternal, diffGraphMtimes } from './graph/cache.js';
+import { glob } from 'tinyglobby';
+import { deltaParseNewImports } from './graph/builder.js';
+import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
 import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
@@ -66,22 +66,23 @@ export function createRuntimeReporter(
   }
 
   function onTestModuleEnd(testModule: TestModule): void {
-    const testPath = testModule.moduleId;
+    const testPath = normalizeModuleId(testModule.moduleId);
 
     // Guard: rootDir not yet set
     if (!rootDir) return;
 
-    // Guard: virtual module IDs don't start with '/'
-    if (!testPath.startsWith('/')) return;
+    // Guard: virtual module IDs are not absolute paths
+    if (!path.isAbsolute(testPath)) return;
 
     const { importDurations } = testModule.diagnostic();
+    // Vite normalizes all paths to forward slashes (even on Windows), so use '/' here.
     const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
 
     for (const rawPath of Object.keys(importDurations)) {
       const modulePath = normalizeModuleId(rawPath);
       // Must be absolute
-      if (!modulePath.startsWith('/')) continue;
-      // Skip node_modules
+      if (!path.isAbsolute(modulePath)) continue;
+      // Skip node_modules (Vite paths always use forward slashes)
       if (modulePath.includes('/node_modules/')) continue;
       // Must be under rootDir
       if (!modulePath.startsWith(rootPrefix)) continue;
@@ -105,7 +106,11 @@ export function createRuntimeReporter(
     if (reason === 'interrupted') return;
 
     if (runtimeReverse.size > 0) {
-      onEdgesCollected(runtimeReverse);
+      // Snapshot: pass a copy so clear() doesn't affect the callback's data
+      const snapshot = new Map(
+        [...runtimeReverse].map(([k, v]) => [k, new Set(v)]),
+      );
+      onEdgesCollected(snapshot);
     }
     runtimeReverse.clear();
   }
@@ -116,26 +121,6 @@ export function createRuntimeReporter(
   };
 
   return { reporter, setRootDir };
-}
-
-/**
- * @internal
- * Merges runtime reverse edges into the static reverse map (union — only adds, never removes).
- */
-export function mergeRuntimeEdges(
-  staticReverse: Map<string, Set<string>>,
-  runtimeReverse: Map<string, Set<string>>,
-): void {
-  for (const [modulePath, testPaths] of runtimeReverse) {
-    if (!staticReverse.has(modulePath)) {
-      staticReverse.set(modulePath, new Set(testPaths));
-    } else {
-      const existing = staticReverse.get(modulePath)!;
-      for (const testPath of testPaths) {
-        existing.add(testPath);
-      }
-    }
-  }
 }
 
 function writeStatsLine(
@@ -165,46 +150,11 @@ function writeStatsLine(
 
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   // Hoisted state — shared between config() and configureVitest()
-  let forward: Map<string, Set<string>>;
-  let reverse: Map<string, Set<string>>;
+  let reverse: Map<string, Set<string>> = new Map();
   let cacheDir: string | undefined;
-  let runtimeSetRootDir: ((dir: string) => void) | null = null;
-  let accumulatedRuntimeEdges: Map<string, Set<string>> | undefined;
 
   return {
     name: 'vitest-affected',
-
-    config(config) {
-      // Guard: skip if disabled
-      if (options.disabled || process.env.VITEST_AFFECTED_DISABLED === '1') return;
-
-      const test = (config.test ??= {}) as { reporters?: unknown };
-      const reporters = test.reporters ?? ['default'];
-      const reportersArray = Array.isArray(reporters) ? reporters : [reporters];
-
-      const { reporter, setRootDir } = createRuntimeReporter((edges) => {
-        if (!cacheDir) return;
-        if (!reverse) return;
-        if (!forward) return;
-        mergeRuntimeEdges(reverse, edges);
-        // Accumulate runtime edges across watch batches
-        if (!accumulatedRuntimeEdges) {
-          accumulatedRuntimeEdges = new Map();
-        }
-        mergeRuntimeEdges(accumulatedRuntimeEdges, edges);
-        try {
-          saveGraphSyncInternal(forward, cacheDir, undefined, accumulatedRuntimeEdges);
-          // Reset accumulator after successful save to avoid double-counting on future batches
-          accumulatedRuntimeEdges = undefined;
-        } catch {
-          // Best-effort: in-memory merge succeeded, disk persistence failed
-          // Do NOT reset accumulatedRuntimeEdges — retry on next batch
-        }
-      });
-
-      test.reporters = [...reportersArray, reporter];
-      runtimeSetRootDir = setRootDir;
-    },
 
     async configureVitest({ vitest, project }) {
       try {
@@ -219,7 +169,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // 4. Workspace guard
+        // 3. Workspace guard
         if (vitest.projects.length > 1) {
           console.warn(
             '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
@@ -227,7 +177,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // 5. Config shape validation
+        // 4. Config shape validation
         if (
           !vitest.config ||
           !vitest.config.root ||
@@ -245,130 +195,83 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const statsFile = options.statsFile;
         const startMs = Date.now();
 
-        // Capture BEFORE any mutation of project.config.include
-        const originalInclude = [...project.config.include];
-        const originalExclude = [...(project.config.exclude ?? [])];
-
-        // 6. Build graph
+        // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
         cacheDir = path.join(rootDir, '.vitest-affected');
 
-        // Mutable state — shared between one-shot path and watch callback
-        let currentAffectedSet: Set<string> | null = null;
-        let cachedTestFiles: string[] | null = null;
-        let lastRunAt = Date.now();
-
-        ({ forward, reverse } = options.cache !== false
-          ? await loadOrBuildGraph(rootDir, cacheDir, verbose)
-          : await buildFullGraph(rootDir));
-        if (options.cache !== false) await saveGraph(forward, cacheDir);
-
-        // Wire runtime reporter rootDir now that graph is built
-        if (runtimeSetRootDir) runtimeSetRootDir(vitest.config.root);
-
-        // Register watch-mode filter (fires on subsequent reruns, not initial run)
-        if (vitest.config.watch) {
-          const PERF_CEILING_MS = 300;
-          let perfCeilingExceeded = false;
-          let fullRebuildPassThrough = false;
-
-          vitest.onFilterWatchedSpecification((spec) => {
-            try {
-              // CRITICAL: onFilterWatchedSpecification acts as a refinement FILTER, not a selector.
-              // Vitest's runtime module graph determines which tests are CANDIDATES.
-              // Our static graph removes FALSE POSITIVES (specs Vitest selected but we know aren't affected).
-              // Conservative: return true for specs not in our graph — we cannot add tests Vitest missed.
-
-              // Batch reset: if enough time passed since last computation, reset affected set
-              if ((currentAffectedSet || perfCeilingExceeded || fullRebuildPassThrough) && Date.now() - lastRunAt > 500) {
-                currentAffectedSet = null;
-                perfCeilingExceeded = false;
-                fullRebuildPassThrough = false;
-              }
-
-              // Perf ceiling was hit earlier in this batch — skip rebuild, pass through
-              if (perfCeilingExceeded) return true;
-
-              // Full-rebuild pass-through: graph was just rebuilt from scratch, no mtime diff possible
-              if (fullRebuildPassThrough) return true;
-
-              if (!currentAffectedSet) {
-                // First filter call in this batch — rebuild and detect changes
-                const buildStart = Date.now();
-
-                const {
-                  forward: newForward,
-                  reverse: newReverse,
-                  oldMtimes,
-                  currentMtimes,
-                } = loadOrBuildGraphSync(rootDir, cacheDir!);
-
-                const buildDuration = Date.now() - buildStart;
-                if (buildDuration > PERF_CEILING_MS) {
-                  // Performance ceiling exceeded — fall back to pass-through for entire batch
-                  console.warn(
-                    `[vitest-affected] Graph build took ${buildDuration}ms (>${PERF_CEILING_MS}ms) — passing through all specs`,
-                  );
-                  perfCeilingExceeded = true;
-                  lastRunAt = Date.now();
-                  return true;
-                }
-
-                forward = newForward;
-                reverse = newReverse;
-
-                // Full-rebuild guard: when loadOrBuildGraphSync did a full rebuild
-                // (cache miss or staleness), both mtime maps are empty. Feeding empty maps
-                // to diffGraphMtimes yields zero seeds → empty affected set → tests silently
-                // skipped. Instead, pass through ALL specs for this batch.
-                if (oldMtimes.size === 0 && currentMtimes.size === 0) {
-                  cachedTestFiles = null; // New files may exist after a full rebuild
-                  fullRebuildPassThrough = true;
-                  lastRunAt = Date.now();
-                  saveGraphSyncInternal(forward, cacheDir!);
-                  return true;
-                }
-
-                const { changed, added } = diffGraphMtimes(oldMtimes, currentMtimes);
-                const bfsSeeds = [...changed, ...added];
-
-                // Glob caching: re-glob when cachedTestFiles is null OR new files were added
-                if (cachedTestFiles === null || added.length > 0) {
-                  cachedTestFiles = globSync(originalInclude, {
-                    cwd: rootDir,
-                    absolute: true,
-                    ignore: [...originalExclude, ...GRAPH_GLOB_IGNORE],
-                  });
-                }
-                const testFiles = cachedTestFiles;
-                const testFileSet = new Set(testFiles);
-                const affected = bfsAffectedTests(
-                  bfsSeeds,
-                  reverse,
-                  (f) => testFileSet.has(f),
-                );
-                currentAffectedSet = new Set(affected);
-                lastRunAt = Date.now();
-
-                saveGraphSyncInternal(forward, cacheDir!);
-              }
-
-              // CRITICAL: normalize before lookup
-              const moduleId = normalizeModuleId(spec.moduleId);
-
-              // Conservative: keep specs not in our graph
-              if (!forward.has(moduleId)) return true;
-              return currentAffectedSet.has(moduleId);
-            } catch (err) {
-              // Safety invariant: never crash Vitest — fall back to full suite
-              console.warn(
-                `[vitest-affected] Watch filter error — passing through all specs: ${err instanceof Error ? err.message : String(err)}`,
-              );
-              return true;
-            }
-          });
+        let cacheHit: boolean;
+        if (options.cache !== false) {
+          ({ reverse, hit: cacheHit } = loadCachedReverseMap(cacheDir, rootDir, verbose));
+        } else {
+          reverse = new Map();
+          cacheHit = false;
         }
 
-        // 7. Get changed files
+        // Inject runtime reporter that merges runtime edges into cached reverse map.
+        // On selective runs only a subset of tests execute, so we merge new edges
+        // into the existing cache rather than replacing it (which would destroy
+        // graph data for tests that didn't run this time).
+        const { reporter, setRootDir } = createRuntimeReporter((edges) => {
+          if (!cacheDir) return;
+          try {
+            // Per-test overwrite: collect which tests ran this cycle, then
+            // remove their stale edges before adding new ones. This ensures
+            // removed imports are reflected (not just accumulated forever).
+            const ranTests = new Set<string>();
+            for (const tests of edges.values()) {
+              for (const t of tests) ranTests.add(t);
+            }
+            // Strip stale edges for tests that ran
+            for (const [file, tests] of reverse) {
+              for (const t of ranTests) tests.delete(t);
+              if (tests.size === 0) reverse.delete(file);
+            }
+            // Add fresh edges from this run
+            for (const [file, tests] of edges) {
+              if (!reverse.has(file)) {
+                reverse.set(file, new Set(tests));
+              } else {
+                for (const t of tests) {
+                  reverse.get(file)!.add(t);
+                }
+              }
+            }
+            saveCacheSync(cacheDir, reverse);
+          } catch {
+            // Best-effort: runtime edge persistence failed — cache will be stale next run
+          }
+        });
+        setRootDir(rootDir);
+
+        // configureVitest fires BEFORE Vitest's createReporters assigns vitest.reporters.
+        // A direct push onto the current (empty) array is lost when createReporters
+        // overwrites it with a new array. Use a property setter to intercept that
+        // assignment and append our reporter to whatever Vitest creates.
+        const vitestAny = vitest as unknown as { reporters: Reporter[] };
+        try {
+          let _reporters = vitestAny.reporters;
+          _reporters.push(reporter);
+          Object.defineProperty(vitest, 'reporters', {
+            configurable: true,
+            enumerable: true,
+            get() { return _reporters; },
+            set(value: Reporter[]) {
+              _reporters = value;
+              if (!value.includes(reporter)) {
+                value.push(reporter);
+              }
+            },
+          });
+        } catch {
+          // Fallback: direct push (works in unit tests with plain mock objects)
+          vitestAny.reporters.push(reporter);
+        }
+
+        // Register watch-mode filter: pass-through (Vitest's own module graph handles it)
+        if (vitest.config.watch) {
+          vitest.onFilterWatchedSpecification(() => true);
+        }
+
+        // 6. Get changed files
         let changed: string[];
         let deleted: string[];
 
@@ -385,28 +288,24 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           deleted = result.deleted;
         }
 
-        // 8. No changes check — run full suite
+        // 7. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-changes',
-            changedFiles: 0, deletedFiles: 0, graphSize: forward.size,
+            changedFiles: 0, deletedFiles: 0, graphSize: reverse.size,
             durationMs: Date.now() - startMs,
           });
           return;
         }
 
-        // 9. Deleted file handling — treat as BFS seeds
-        // Deleted files may still exist in the reverse graph from a prior cache.
-        // BFS will find their dependents (tests that imported them — those tests
-        // should run and will likely fail, which is the correct behaviour).
-        // Deleted files NOT in the graph are harmless no-ops in BFS.
+        // 8. Deleted file handling — treat as BFS seeds
         if (deleted.length > 0 && verbose) {
           console.warn(
             `[vitest-affected] ${deleted.length} deleted file(s) — will include as BFS seeds`,
           );
         }
 
-        // 10. Force-rerun check: config file or setupFiles changes → full suite
+        // 9. Force-rerun check: config file or setupFiles changes → full suite
         const allChangedFiles = [...changed, ...deleted];
         const hasConfigChange = allChangedFiles.some((f) =>
           CONFIG_BASENAMES.has(path.basename(f)),
@@ -418,7 +317,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'config-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, durationMs: Date.now() - startMs,
           });
           return;
         }
@@ -435,12 +334,32 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'setup-file-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, durationMs: Date.now() - startMs,
           });
           return;
         }
 
-        // 11. Glob test files using project.config.include patterns
+        // 10. Cache miss → full suite (first run collects runtime data)
+        if (!cacheHit) {
+          if (verbose) {
+            console.warn(
+              '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
+            );
+          }
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'cache-miss',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            graphSize: 0, cacheHit: false,
+            durationMs: Date.now() - startMs,
+          });
+          return;
+        }
+
+        // 11. Delta parse: find new imports in changed files not yet in cache
+        const extraSeeds = deltaParseNewImports(changed, reverse, rootDir, verbose);
+        const bfsSeeds = [...allChangedFiles, ...extraSeeds];
+
+        // 12. Glob test files using project.config.include patterns
         const includePatterns = project.config.include;
         if (!includePatterns || includePatterns.length === 0) {
           console.warn(
@@ -464,14 +383,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         const testFileSet = new Set(testFiles);
 
-        // 12. BFS: find affected tests (changed + deleted as seeds)
+        // 13. BFS: find affected tests
         const affectedTests = bfsAffectedTests(
-          allChangedFiles,
+          bfsSeeds,
           reverse,
           (f) => testFileSet.has(f),
         );
 
-        // 13. Threshold check
+        // 14. Threshold check
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
             project.config.include = [];
@@ -479,7 +398,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               action: 'selective', reason: 'allow-no-tests',
               changedFiles: changed.length, deletedFiles: deleted.length,
               affectedTests: 0, totalTests: testFiles.length,
-              graphSize: forward.size, durationMs: Date.now() - startMs,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
             });
             return;
           }
@@ -490,7 +409,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             action: 'full-suite', reason: 'no-affected-tests',
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: 0, totalTests: testFiles.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           });
           return;
         }
@@ -505,12 +424,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             action: 'full-suite', reason: 'threshold-exceeded',
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           });
           return;
         }
 
-        // 14. Verbose warnings: log changed files not in graph
+        // 15. Verbose warnings: log changed files not in graph
         if (options.verbose) {
           for (const f of changed) {
             if (!reverse.has(f)) {
@@ -521,7 +440,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           }
         }
 
-        // 15. existsSync filter — warn on missing
+        // 16. existsSync filter — warn on missing
         const validTests = affectedTests.filter((f) => {
           if (!existsSync(f)) {
             console.warn(
@@ -532,25 +451,25 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return true;
         });
 
-        // 16. Apply results
+        // 17. Apply results
         if (validTests.length > 0) {
           project.config.include = validTests;
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'selective',
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: validTests.length, totalTests: testFiles.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           });
         } else if (statsFile) {
           writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-valid-tests-on-disk',
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: 0, totalTests: testFiles.length,
-            graphSize: forward.size, durationMs: Date.now() - startMs,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           });
         }
       } catch (err) {
-        // 17. Catch-all: safety invariant — never crash, never skip silently
+        // 18. Catch-all: safety invariant — never crash, never skip silently
         console.warn(
           `[vitest-affected] Unexpected error — running full suite: ${err instanceof Error ? err.message : String(err)}`,
         );

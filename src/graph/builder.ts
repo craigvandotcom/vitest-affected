@@ -1,23 +1,7 @@
 import { ResolverFactory } from 'oxc-resolver';
 import { parseSync } from 'oxc-parser';
-import { glob, globSync } from 'tinyglobby';
 import { readFileSync, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-
-// ---------------------------------------------------------------------------
-// Shared glob constants — used by both async buildFullGraph and sync variant
-// ---------------------------------------------------------------------------
-
-export const GRAPH_GLOB_PATTERN = '**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}';
-export const GRAPH_GLOB_IGNORE = [
-  '**/node_modules/**',
-  '**/dist/**',
-  '**/.vitest-affected/**',
-  '**/coverage/**',
-  '**/.next/**',
-  '**/test/fixtures/**',
-];
 
 const BINARY_EXTENSIONS = new Set([
   '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.tiff',
@@ -96,14 +80,14 @@ export function resolveFileImports(
 
   const dir = path.dirname(file);
   const resolved: string[] = [];
+  // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
+  const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
 
   for (const specifier of specifiers) {
     const result = resolver.sync(dir, specifier);
     if (result.error) continue;
     if (!result.path) continue;
-    if (result.path.includes('/node_modules/')) continue;
-    // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
-    const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+    if (result.path.includes(`${path.sep}node_modules${path.sep}`)) continue;
     if (!result.path.startsWith(rootPrefix) && result.path !== rootDir) continue;
     resolved.push(result.path);
   }
@@ -111,106 +95,38 @@ export function resolveFileImports(
   return resolved;
 }
 
-export async function buildFullGraph(rootDir: string): Promise<{
-  forward: Map<string, Set<string>>;
-  reverse: Map<string, Set<string>>;
-}> {
-  const files = await glob(GRAPH_GLOB_PATTERN, {
-    cwd: rootDir,
-    absolute: true,
-    ignore: GRAPH_GLOB_IGNORE,
-  });
-
+/**
+ * Parse only the changed files and return import targets that are NOT
+ * already present in the cached reverse map.  These "new targets" become
+ * extra BFS seeds so that newly-added imports are correctly propagated
+ * even though the runtime cache hasn't seen them yet.
+ *
+ * Cost: parses only 1-5 files (~5ms) instead of the entire tree.
+ */
+export function deltaParseNewImports(
+  changedFiles: string[],
+  cachedReverse: Map<string, Set<string>>,
+  rootDir: string,
+  verbose?: boolean,
+): string[] {
   const resolver = createResolver(rootDir);
-  const forward = new Map<string, Set<string>>();
-
-  for (const file of files) {
-    if (!forward.has(file)) {
-      forward.set(file, new Set());
-    }
-
-    let source: string;
-    try {
-      source = await readFile(file, 'utf-8');
-    } catch {
-      continue;
-    }
-
-    const deps = resolveFileImports(file, source, rootDir, resolver);
-    for (const dep of deps) {
-      forward.get(file)!.add(dep);
-      // Ensure dependency also has an entry
-      if (!forward.has(dep)) {
-        forward.set(dep, new Set());
-      }
-    }
-  }
-
-  // Build reverse graph by inverting forward
-  const reverse = new Map<string, Set<string>>();
-  for (const [file, deps] of forward) {
-    if (!reverse.has(file)) {
-      reverse.set(file, new Set());
-    }
-    for (const dep of deps) {
-      if (!reverse.has(dep)) {
-        reverse.set(dep, new Set());
-      }
-      reverse.get(dep)!.add(file);
-    }
-  }
-
-  return { forward, reverse };
-}
-
-export function buildFullGraphSync(rootDir: string): {
-  forward: Map<string, Set<string>>;
-  reverse: Map<string, Set<string>>;
-} {
-  const files = globSync(GRAPH_GLOB_PATTERN, {
-    cwd: rootDir,
-    absolute: true,
-    ignore: GRAPH_GLOB_IGNORE,
-  });
-
-  const resolver = createResolver(rootDir);
-  const forward = new Map<string, Set<string>>();
-
-  for (const file of files) {
-    if (!forward.has(file)) {
-      forward.set(file, new Set());
-    }
-
+  const newTargets: string[] = [];
+  for (const file of changedFiles) {
     let source: string;
     try {
       source = readFileSync(file, 'utf-8');
     } catch {
       continue;
     }
-
-    const deps = resolveFileImports(file, source, rootDir, resolver);
-    for (const dep of deps) {
-      forward.get(file)!.add(dep);
-      // Ensure dependency also has an entry
-      if (!forward.has(dep)) {
-        forward.set(dep, new Set());
+    const imports = resolveFileImports(file, source, rootDir, resolver);
+    for (const imp of imports) {
+      if (!cachedReverse.has(imp)) {
+        newTargets.push(imp);
+        if (verbose) {
+          console.warn(`[vitest-affected] Delta parse: new import target ${imp} from ${file}`);
+        }
       }
     }
   }
-
-  // Build reverse graph by inverting forward
-  const reverse = new Map<string, Set<string>>();
-  for (const [file, deps] of forward) {
-    if (!reverse.has(file)) {
-      reverse.set(file, new Set());
-    }
-    for (const dep of deps) {
-      if (!reverse.has(dep)) {
-        reverse.set(dep, new Set());
-      }
-      reverse.get(dep)!.add(file);
-    }
-  }
-
-  return { forward, reverse };
+  return newTargets;
 }

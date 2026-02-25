@@ -7,13 +7,12 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
-  lstatSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
-import { createRuntimeReporter, mergeRuntimeEdges, vitestAffected } from '../src/plugin.js';
-import { saveGraphSyncInternal, loadOrBuildGraphSync } from '../src/graph/cache.js';
+import { createRuntimeReporter, vitestAffected } from '../src/plugin.js';
+import { saveCacheSync, loadCachedReverseMap } from '../src/graph/cache.js';
 import * as cacheModule from '../src/graph/cache.js';
 
 // ---------------------------------------------------------------------------
@@ -127,53 +126,6 @@ describe('Reporter: edge collection from importDurations', () => {
     expect(edges.get(sharedDep)).toEqual(new Set([testA, testB]));
     expect(edges.get(depA)).toEqual(new Set([testA]));
     expect(edges.get(depB)).toEqual(new Set([testB]));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Scenario 2: Merge correctness
-// ---------------------------------------------------------------------------
-
-describe('mergeRuntimeEdges: merge correctness', () => {
-  test('runtime edges are ADDED (union) to static reverse map', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    staticReverse.set('/src/a.ts', new Set(['/tests/a.test.ts']));
-
-    const runtimeReverse = new Map<string, Set<string>>();
-    runtimeReverse.set('/src/b.ts', new Set(['/tests/b.test.ts']));
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.has('/src/b.ts')).toBe(true);
-    expect(staticReverse.get('/src/b.ts')).toEqual(new Set(['/tests/b.test.ts']));
-  });
-
-  test('static edges are NOT removed after merge', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    staticReverse.set('/src/a.ts', new Set(['/tests/a.test.ts']));
-    staticReverse.set('/src/c.ts', new Set(['/tests/c.test.ts']));
-
-    // Runtime only touches /src/a.ts — /src/c.ts must survive
-    const runtimeReverse = new Map<string, Set<string>>();
-    runtimeReverse.set('/src/a.ts', new Set(['/tests/extra.test.ts']));
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.get('/src/c.ts')).toEqual(new Set(['/tests/c.test.ts']));
-  });
-
-  test('overlapping keys merge their test file sets', () => {
-    const staticReverse = new Map<string, Set<string>>();
-    staticReverse.set('/src/a.ts', new Set(['/tests/a.test.ts']));
-
-    const runtimeReverse = new Map<string, Set<string>>();
-    runtimeReverse.set('/src/a.ts', new Set(['/tests/b.test.ts'])); // same key, new test
-
-    mergeRuntimeEdges(staticReverse, runtimeReverse);
-
-    expect(staticReverse.get('/src/a.ts')).toEqual(
-      new Set(['/tests/a.test.ts', '/tests/b.test.ts']),
-    );
   });
 });
 
@@ -316,48 +268,47 @@ describe('Reporter: deferred rootDir', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Scenario 6: Integration — cacheDir guard prevents write when configureVitest skipped
+// Scenario 6: cacheDir guard in onEdgesCollected callback
 // ---------------------------------------------------------------------------
 
-describe('Integration: cacheDir guard prevents write when configureVitest skipped', () => {
-  test('no saveGraphSyncInternal call when configureVitest was not invoked', () => {
-    // Spy on saveGraphSyncInternal before creating plugin
-    const saveSpy = vi.spyOn(cacheModule, 'saveGraphSyncInternal');
+describe('Integration: cacheDir guard in onEdgesCollected callback', () => {
+  test('no saveCacheSync call when plugin is disabled (configureVitest returns early)', async () => {
+    const saveSpy = vi.spyOn(cacheModule, 'saveCacheSync');
 
-    // Restore VITEST_AFFECTED_DISABLED in case it's set in test env
     const savedEnv = process.env.VITEST_AFFECTED_DISABLED;
-    delete process.env.VITEST_AFFECTED_DISABLED;
+    process.env.VITEST_AFFECTED_DISABLED = '1';
 
     try {
       const plugin = vitestAffected();
-      const config = { test: { reporters: ['default'] } };
 
-      // Call the config hook to inject the reporter — but do NOT call configureVitest
-      (plugin as { config: (config: Record<string, unknown>) => void }).config(
-        config as Record<string, unknown>,
-      );
+      const projectConfig = {
+        include: ['tests/**/*.test.ts'],
+        exclude: [] as string[],
+        setupFiles: [] as string[],
+      };
+      const mockProject = { config: projectConfig };
+      const mockVitest = {
+        config: { root: '/project', watch: false },
+        projects: [mockProject],
+        reporters: [] as unknown[],
+        onFilterWatchedSpecification: () => {},
+      };
 
-      // Extract the reporter appended by config hook
-      const reporters = (config.test as { reporters: unknown[] }).reporters;
-      const reporter = reporters[reporters.length - 1] as Reporter;
+      const hook = (plugin as Record<string, unknown>).configureVitest as (ctx: {
+        vitest: typeof mockVitest;
+        project: typeof mockProject;
+      }) => Promise<void>;
 
-      // Fire a complete test run through the reporter
-      // cacheDir is still undefined because configureVitest was skipped
-      reporter.onTestModuleEnd!(createMockTestModule('/project/tests/a.test.ts', {
-        '/project/src/a.ts': { selfTime: 1, totalTime: 2 },
-      }));
+      await hook({ vitest: mockVitest, project: mockProject });
 
-      // We need to set rootDir via the returned setRootDir — but in this integration
-      // test, the reporter's onEdgesCollected closure checks `if (!cacheDir) return`
-      // Since configureVitest was never called, cacheDir remains undefined
-      // So even if we trigger onTestRunEnd, the guard fires and saveGraphSyncInternal is never called
-
-      reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
-
+      // When disabled, no reporter is injected — so no saveCacheSync can be called
+      expect(mockVitest.reporters).toHaveLength(0);
       expect(saveSpy).not.toHaveBeenCalled();
     } finally {
       if (savedEnv !== undefined) {
         process.env.VITEST_AFFECTED_DISABLED = savedEnv;
+      } else {
+        delete process.env.VITEST_AFFECTED_DISABLED;
       }
     }
   });
@@ -454,17 +405,15 @@ describe('Reporter: virtual testModule.moduleId', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Scenario 9: Cache round-trip with runtimeEdges
+// Scenario 9: v2 cache round-trip with runtime reporter
 // ---------------------------------------------------------------------------
 
-describe('Cache persistence: runtime edges', () => {
-  test('round-trip: saveGraphSyncInternal with runtimeEdges → loadOrBuildGraphSync returns them in reverse', () => {
+describe('Cache persistence: runtime edges via v2 format', () => {
+  test('round-trip: saveCacheSync → loadCachedReverseMap returns correct reverse map', () => {
     const rootDir = makeTmpDir();
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    // srcFile must be under rootDir and in forward map (path confinement + stale pruning)
-    // testFile must exist on disk (value preservation predicate: in forward OR on disk)
     const srcFile = path.join(rootDir, 'src', 'utils.ts');
     const testFile = path.join(rootDir, 'tests', 'utils.test.ts');
     writeProjectFiles(rootDir, {
@@ -472,129 +421,41 @@ describe('Cache persistence: runtime edges', () => {
       'tests/utils.test.ts': 'import { utils } from "../src/utils";\n',
     });
 
-    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
-    const mtimes = new Map<string, number>();
-    const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
+    const reverse = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
+    saveCacheSync(cacheDir, reverse);
 
-    saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
-
-    const { reverse } = loadOrBuildGraphSync(rootDir, cacheDir);
-
-    expect(reverse.has(srcFile)).toBe(true);
-    expect(reverse.get(srcFile)?.has(testFile)).toBe(true);
+    const { reverse: loaded, hit } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(hit).toBe(true);
+    expect(loaded.has(srcFile)).toBe(true);
+    expect(loaded.get(srcFile)?.has(testFile)).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Scenario 10: Save without runtimeEdges preserves existing
-// ---------------------------------------------------------------------------
-
-describe('Cache persistence: save without runtimeEdges preserves existing', () => {
-  test('second save (watch filter path) without runtimeEdges preserves previously written runtimeEdges', () => {
-    const rootDir = makeTmpDir();
-    tempDirs.push(rootDir);
-    const cacheDir = path.join(rootDir, '.vitest-affected');
-
-    // srcFile must be under rootDir and in forward map; testFile must exist on disk
-    const srcFile = path.join(rootDir, 'src', 'lib.ts');
-    const testFile = path.join(rootDir, 'tests', 'lib.test.ts');
-    writeProjectFiles(rootDir, {
-      'src/lib.ts': 'export const lib = 1;\n',
-      'tests/lib.test.ts': 'import { lib } from "../src/lib";\n',
-    });
-
-    const forward = new Map<string, Set<string>>([[srcFile, new Set()]]);
-    const mtimes = new Map<string, number>();
-
-    const runtimeEdges = new Map<string, Set<string>>([[srcFile, new Set([testFile])]]);
-
-    // First save WITH runtime edges
-    saveGraphSyncInternal(forward, cacheDir, mtimes, runtimeEdges);
-
-    // Second save WITHOUT runtime edges (simulating watch filter save)
-    saveGraphSyncInternal(forward, cacheDir, mtimes);
-
-    // Read cache file directly and verify runtimeEdges field is preserved
-    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as {
-      version: number;
-      files: Record<string, unknown>;
-      runtimeEdges?: Record<string, string[]>;
-    };
-
-    expect(parsed.runtimeEdges).toBeDefined();
-    expect(parsed.runtimeEdges![srcFile]).toEqual([testFile]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Scenario 11: Full rebuild discards runtimeEdges
-// ---------------------------------------------------------------------------
-
-describe('Cache persistence: full rebuild discards runtimeEdges', () => {
-  test('stale mtime triggers full rebuild — runtime edges from old cache NOT in result', () => {
-    const fixtureDir = path.resolve(import.meta.dirname, 'fixtures', 'simple');
-    const cacheDir = makeTmpDir();
-    tempDirs.push(cacheDir);
-
-    // Write a cache with a real fixture file at stale mtime=0 and runtimeEdges
-    // diffGraphMtimes detects the mtime mismatch → full rebuild is triggered
-    const realFile = path.join(fixtureDir, 'src', 'a.ts');
-    const srcFile = '/abs/src/runtime-src.ts';
-    const testFile = '/abs/tests/runtime.test.ts';
-
-    const cacheData = {
-      version: 1,
-      builtAt: Date.now(),
-      files: {
-        [realFile]: { mtime: 0, imports: [] }, // stale mtime → triggers rebuild
-      },
-      runtimeEdges: { [srcFile]: [testFile] },
-    };
-    mkdirSync(cacheDir, { recursive: true });
-    writeFileSync(path.join(cacheDir, 'graph.json'), JSON.stringify(cacheData), 'utf-8');
-
-    // loadOrBuildGraphSync detects stale → calls buildFullGraphSync
-    // buildFullGraphSync starts fresh — runtime edges are NOT merged
-    const { reverse } = loadOrBuildGraphSync(fixtureDir, cacheDir);
-
-    expect(reverse.has(srcFile)).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Scenario 12: ENOENT on fresh install
+// Scenario 10: ENOENT on fresh install
 // ---------------------------------------------------------------------------
 
 describe('Cache persistence: ENOENT on fresh install', () => {
-  test('saveGraphSyncInternal without runtimeEdges does not throw and written cache has no runtimeEdges', () => {
+  test('loadCachedReverseMap without existing cache returns cache miss', () => {
     const rootDir = makeTmpDir();
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    // No cache file exists yet (fresh install)
-    const forward = new Map<string, Set<string>>();
-
-    expect(() => saveGraphSyncInternal(forward, cacheDir)).not.toThrow();
-
-    const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { runtimeEdges?: unknown };
-    expect(parsed.runtimeEdges).toBeUndefined();
+    const { reverse, hit } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(hit).toBe(false);
+    expect(reverse.size).toBe(0);
   });
 
-  test('saveGraphSyncInternal with empty runtimeEdges does not throw', () => {
+  test('saveCacheSync with empty reverse map does not throw', () => {
     const rootDir = makeTmpDir();
     tempDirs.push(rootDir);
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
-    const forward = new Map<string, Set<string>>();
-    const emptyRuntimeEdges = new Map<string, Set<string>>();
-
-    expect(() => saveGraphSyncInternal(forward, cacheDir, undefined, emptyRuntimeEdges)).not.toThrow();
+    expect(() => saveCacheSync(cacheDir, new Map())).not.toThrow();
 
     const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { runtimeEdges?: Record<string, string[]> };
-    // Empty runtimeEdges serializes to an empty object — defined but empty
-    expect(typeof parsed.runtimeEdges).toBe('object');
+    const parsed = JSON.parse(raw) as { version: number; reverseMap: Record<string, string[]> };
+    expect(parsed.version).toBe(2);
+    expect(typeof parsed.reverseMap).toBe('object');
   });
 });
