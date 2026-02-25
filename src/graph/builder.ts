@@ -81,15 +81,18 @@ export function resolveFileImports(
   const dir = path.dirname(file);
   const resolved: string[] = [];
   // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
-  const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+  // rootDir comes from Vite (always forward slashes), so use '/' not path.sep
+  const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
 
   for (const specifier of specifiers) {
     const result = resolver.sync(dir, specifier);
     if (result.error) continue;
     if (!result.path) continue;
-    if (result.path.includes(`${path.sep}node_modules${path.sep}`)) continue;
-    if (!result.path.startsWith(rootPrefix) && result.path !== rootDir) continue;
-    resolved.push(result.path);
+    // Normalize resolver output to forward slashes (Vite convention)
+    const resolvedPath = result.path.replaceAll('\\', '/');
+    if (resolvedPath.includes('/node_modules/')) continue;
+    if (!resolvedPath.startsWith(rootPrefix) && resolvedPath !== rootDir) continue;
+    resolved.push(resolvedPath);
   }
 
   return resolved;

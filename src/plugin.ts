@@ -37,14 +37,20 @@ const CONFIG_BASENAMES = new Set([
   'vitest.config.js',
   'vitest.config.mts',
   'vitest.config.mjs',
+  'vitest.config.cts',
+  'vitest.config.cjs',
   'vitest.workspace.ts',
   'vitest.workspace.js',
   'vitest.workspace.mts',
   'vitest.workspace.mjs',
+  'vitest.workspace.cts',
+  'vitest.workspace.cjs',
   'vite.config.ts',
   'vite.config.js',
   'vite.config.mts',
   'vite.config.mjs',
+  'vite.config.cts',
+  'vite.config.cjs',
 ]);
 
 /**
@@ -137,14 +143,20 @@ function writeStatsLine(
     cacheHit?: boolean;
     durationMs?: number;
   },
+  verbose = false,
 ): void {
   try {
     const filePath = path.isAbsolute(statsFile) ? statsFile : path.resolve(rootDir, statsFile);
     mkdirSync(path.dirname(filePath), { recursive: true });
     const line = JSON.stringify({ timestamp: new Date().toISOString(), ...data });
     appendFileSync(filePath, line + '\n');
-  } catch {
+  } catch (err) {
     // Best-effort — never crash on stats writing
+    if (verbose) {
+      console.warn(
+        `[vitest-affected] Failed to write stats: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
 
@@ -276,9 +288,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         let deleted: string[];
 
         if (options.changedFiles !== undefined) {
-          // Resolve relative paths to rootDir; split by existsSync
+          // Resolve relative paths to rootDir and normalize to forward slashes (Vite convention)
           const resolved = options.changedFiles.map((f) =>
-            path.isAbsolute(f) ? f : path.resolve(rootDir, f),
+            (path.isAbsolute(f) ? f : path.resolve(rootDir, f)).replaceAll('\\', '/'),
           );
           changed = resolved.filter((f) => existsSync(f));
           deleted = resolved.filter((f) => !existsSync(f));
@@ -294,7 +306,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             action: 'full-suite', reason: 'no-changes',
             changedFiles: 0, deletedFiles: 0, graphSize: reverse.size,
             durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
@@ -318,13 +330,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             action: 'full-suite', reason: 'config-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
-        const setupFiles = project.config.setupFiles ?? [];
+        const setupFilesRaw = project.config.setupFiles ?? [];
         const setupFileSet = new Set(
-          Array.isArray(setupFiles) ? setupFiles : [setupFiles],
+          (Array.isArray(setupFilesRaw) ? setupFilesRaw : [setupFilesRaw]).map(
+            (f) => (path.isAbsolute(f) ? f : path.resolve(rootDir, f)).replaceAll('\\', '/'),
+          ),
         );
         const hasSetupFileChange = allChangedFiles.some((f) => setupFileSet.has(f));
         if (hasSetupFileChange) {
@@ -335,7 +349,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             action: 'full-suite', reason: 'setup-file-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
@@ -351,7 +365,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             graphSize: 0, cacheHit: false,
             durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
@@ -368,11 +382,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        const testFiles = await glob(includePatterns, {
+        // Normalize glob results to forward slashes (Vite convention) for Windows compat
+        const testFiles = (await glob(includePatterns, {
           cwd: rootDir,
           absolute: true,
           ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
-        });
+        })).map((f) => f.replaceAll('\\', '/'));
 
         if (testFiles.length === 0) {
           console.warn(
@@ -399,7 +414,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               changedFiles: changed.length, deletedFiles: deleted.length,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            });
+            }, verbose);
             return;
           }
           console.warn(
@@ -410,7 +425,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
@@ -425,7 +440,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
           return;
         }
 
@@ -459,14 +474,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
         } else if (statsFile) {
           writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-valid-tests-on-disk',
             changedFiles: changed.length, deletedFiles: deleted.length,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
+          }, verbose);
         }
       } catch (err) {
         // 18. Catch-all: safety invariant — never crash, never skip silently

@@ -31,7 +31,7 @@ src/
 │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports for changed files
 │   ├── cache.ts      # v2 cache: loadCachedReverseMap / saveCacheSync (JSON persistence)
 │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs
-├── git.ts            # 3 parallel git commands → { changed[], deleted[] }
+├── git.ts            # 4 parallel git commands → { changed[], deleted[] }
 └── selector.ts       # Pure BFS on reverse graph → affected test file paths
 ```
 

@@ -52,7 +52,8 @@ function cleanupOrphanedTmp(cacheDir: string): void {
  * builder.ts). Accepts exact match or prefix + path.sep.
  */
 function isUnderRootDir(filePath: string, rootDir: string): boolean {
-  const rootPrefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+  // Cache paths are Vite-normalized (always forward slashes), so use '/' not path.sep
+  const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
   return filePath === rootDir || filePath.startsWith(rootPrefix);
 }
 

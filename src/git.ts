@@ -115,8 +115,9 @@ export async function getChangedFiles(
   const deleted: string[] = [];
 
   // Helper: classify and add a relative path
+  // Normalize to forward slashes so paths match Vite's convention
   const classify = (rel: string) => {
-    const absPath = path.resolve(gitRoot, rel);
+    const absPath = path.resolve(gitRoot, rel).replaceAll('\\', '/');
     if (seenPaths.has(absPath)) return;
     seenPaths.add(absPath);
     if (existsSync(absPath)) {
