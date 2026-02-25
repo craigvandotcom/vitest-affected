@@ -7,13 +7,19 @@
 Run only the tests affected by your changes. Zero config, runtime dependency tracking, ~5ms selection overhead.
 
 ```
-  Full suite:       162 tests | 45.2s
-  vitest-affected:    4 tests |  1.2s   (46 files changed → 97.5% reduction)
+  Full suite:       2,771 tests | 152s
+  vitest-affected:     22 tests |  3.1s   (98% reduction)
 ```
 
 ## Why
 
-Most test runners re-run everything or rely on simple file-name matching. `vitest-affected` uses Vitest's own runtime import data to build an exact reverse dependency map, diffs it against git, and walks the graph to find exactly which tests are impacted. If you change a utility buried three imports deep, only the tests that transitively depend on it will run.
+**Test more often, not just faster.**
+
+If you're running AI coding agents — or multiple agents in parallel — each one needs to verify its changes with tests. On a large codebase, running the full suite after every change is either painfully slow or impossible (machine melts). So you skip tests, and bugs slip through.
+
+`vitest-affected` makes it practical to test after every single change. Each agent runs ~20 tests in seconds instead of 2,771 tests in minutes. You get continuous verification without overloading your machine.
+
+It works by using Vitest's own runtime import data to build an exact reverse dependency map, diffing it against git, and walking the graph to find exactly which tests are impacted. If you change a utility buried three imports deep, only the tests that transitively depend on it will run.
 
 If anything fails — git error, corrupt cache, incomplete graph — it falls back to the full suite with a warning. It never silently skips tests.
 
@@ -141,6 +147,21 @@ Each line records what the plugin decided, why, and how many tests were affected
 - **First run requires full suite** — the runtime dependency map is built from actual test execution, so the first run (or after cache deletion) runs everything
 - **Non-JS/TS files** — CSS, JSON, and asset imports are excluded from the dependency graph
 - **Single-project only** — workspaces with multiple Vitest projects fall back to full suite (multi-project support planned)
+
+## Agent Workflows
+
+`vitest-affected` is designed for workflows where tests run frequently and automatically — CI pipelines, pre-commit hooks, and especially AI coding agents.
+
+**The problem:** AI agents (Claude Code, Cursor, Copilot Workspace, etc.) work best when they verify each change with tests. But on a large codebase, running the full suite after every edit makes agents slow and resource-heavy — or worse, agents skip testing entirely.
+
+**The fix:** Add `vitest-affected` to your config and tell your agents to run `npx vitest run` after every change. Each run takes seconds, not minutes. Agents test continuously without overloading your machine, even with multiple agents working in parallel.
+
+```ts
+// vitest.config.ts — set once, every agent benefits
+plugins: [vitestAffected({ verbose: true, statsFile: '.vitest-affected/stats.jsonl' })],
+```
+
+The `statsFile` option logs every decision the plugin makes, giving you full visibility into what agents are testing and why.
 
 ## Compared To
 
