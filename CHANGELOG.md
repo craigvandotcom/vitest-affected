@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-02-25
+
+### Changed
+
+- **Runtime-first architecture** — replaced static analysis pipeline (~1,500 lines) with runtime `importDurations` from Vitest. First run executes full suite and caches the reverse dependency map; subsequent runs load the cache, delta-parse only changed files (~5ms), and BFS-select affected tests.
+- v2 cache format (`{ version: 2, builtAt, reverseMap }`) with automatic v1 migration
+- `builder.ts` reduced from ~253 to ~133 lines — removed `buildFullGraph`/`buildFullGraphSync`, kept `deltaParseNewImports`
+- `cache.ts` reduced from ~834 to ~210 lines — removed all v1-only functions
+- `plugin.ts` rewritten around `configureVitest` hook with runtime reporter injection
+- Net reduction: **-2,969 lines** across source and tests
+
+### Fixed
+
+- Cache overwrite on selective runs — was replacing entire cache with edges from only the tests that ran, destroying graph data for non-running tests. Now uses per-test merge strategy.
+- Stale edge pruning — cache was grow-only (never removed edges for deleted imports). Now prunes edges for tests that ran before re-adding fresh ones.
+- `testModule.moduleId` not normalized — un-normalized paths with query strings failed `testFileSet.has()` lookup, silently dropping affected tests
+- `path.isAbsolute()` instead of `startsWith('/')` for Windows compatibility in reporter guards
+- Vite paths use `/` (reporter context) vs `path.sep` for oxc-resolver (builder context) — fixed cross-platform path handling across both domains
+- Snapshot map before `clear()` in `onEdgesCollected` callback — prevents latent data loss if callback becomes async
+- `saveCacheSync` cleanup on `renameSync` failure — temp files no longer leak on cross-device rename errors
+- Initialize `reverse` map at declaration — prevents stale state across watch-mode re-invocations
+- Hoist `rootPrefix` computation outside inner loop in `resolveFileImports`
+- Replace `require('node:fs')` with ESM import in test file
+
+### Removed
+
+- `buildFullGraph`, `buildFullGraphSync`, `GRAPH_GLOB_PATTERN`, `GRAPH_GLOB_IGNORE` from builder
+- `loadOrBuildGraph`, `loadOrBuildGraphSync`, `saveGraph`, `saveGraphSyncInternal`, `statAllFiles`, `diffGraphMtimes`, `loadCachedMtimes`, `pruneRuntimeEdges`, `entriesToMaps`, `isValidFilesObject` from cache
+- 4 obsolete v1 test files (cache.test.ts, cache-sync.test.ts, cache-robustness.test.ts, cache-new-file-discovery.test.ts)
+
 ## [0.3.0] - 2026-02-24
 
 ### Added
