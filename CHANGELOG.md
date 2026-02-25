@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-02-25
+
+### Fixed
+
+- Normalize all file paths to forward slashes for Windows compatibility — git output, oxc-resolver output, `changedFiles` option, and glob results now consistently use `/` (Vite convention), fixing silent BFS failures on Windows
+- `isUnderRootDir` in cache.ts used `path.sep` but stored paths use `/` — every cache load was a miss on Windows
+- `CONFIG_BASENAMES` missing `.cts`/`.cjs` variants — changing `vitest.config.cts` or `vite.config.cjs` would not trigger full-suite safety fallback
+- `setupFiles` comparison against changed files now resolves to absolute paths — relative setupFile paths from Vitest no longer silently bypass the full-suite trigger
+- `writeStatsLine` now logs errors in verbose mode instead of silently swallowing all failures
+
 ## [0.4.0] - 2026-02-25
 
 ### Changed

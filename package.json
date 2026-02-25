@@ -1,6 +1,6 @@
 {
   "name": "vitest-affected",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Intelligent test selection for Vitest — run only the tests affected by your changes",
   "type": "module",
   "main": "./dist/index.js",
