@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-03
+
+### Fixed
+
+- **Vitest 4 compatibility** — Vitest 4 gates `getImportDurations()` on `experimental.importDurations.limit` (default `0`), which silently disabled the runtime reverse-graph reporter. Anyone on `vitest@4` got a no-op plugin with no error. The plugin now force-enables collection in `configureVitest` by setting `limit` to `Number.MAX_SAFE_INTEGER`. Spread to a new object to avoid mutating the default reference shared across workspace projects in v4. Harmless on Vitest 3.2.x where the `limit` field is ignored.
+
+### Changed
+
+- `peerDependencies.vitest` widened from `>=3.2.0` to `>=3.2.0 <5.0.0`
+- `oxc-resolver` upgraded from `^6.0.0` to `^11.0.0` — five majors of drift; our usage (one `ResolverFactory` constructor + `.sync()` call) is unaffected by intermediate breaking changes (removed `description_files`/`modules` options in v8, manual `references` list in v11.15)
+- `oxc-parser` `^0.114.0` → `^0.128.0`
+- `tinyglobby` `^0.2.0` → `^0.2.16`
+- `@types/node` `^25.3.0` → `^25.6.0`
+- Replaced per-file "Changed file not in dependency graph" verbose warnings with a single summary count
+
+### Added
+
+- **Changed-file filtering** — irrelevant changed files (markdown, `.claude/`, `.next/`, `playwright-report/`, generated typings, etc.) are now filtered before graph analysis, removing parse warnings and "not in graph" noise for files that can never participate in the dependency graph
+- New `VitestAffectedOptions` keys:
+  - `ignoreChangedFiles?: Array<string | RegExp>` — extra path prefixes/regexes to filter
+  - `includeChangedExtensions?: string[]` — override the default code-extension allowlist
+  - `respectProvidedChangedFiles?: boolean` — opt out of filtering when caller passes `changedFiles`
+- `ignoredFiles` count added to `statsFile` JSON-line output
+- Config-file basenames (`package.json`, `tsconfig.json`, `vitest.config.*`, lockfiles) always pass through the filter so the full-suite trigger still fires
+
 ## [0.4.1] - 2026-02-25
 
 ### Fixed
