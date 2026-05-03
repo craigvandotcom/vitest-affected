@@ -11,6 +11,19 @@ import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
 
+/**
+ * Narrow shape of the Vitest 4 `experimental.importDurations` config block.
+ * Defined locally because v3.2 types don't include this field.
+ */
+interface ExperimentalImportDurations {
+  importDurations?: {
+    limit?: number;
+    print?: boolean | 'on-warn';
+    failOnDanger?: boolean;
+    thresholds?: { warn?: number; danger?: number };
+  };
+}
+
 export interface VitestAffectedOptions {
   disabled?: boolean;
   ref?: string;
@@ -206,6 +219,21 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const verbose = options.verbose ?? false;
         const statsFile = options.statsFile;
         const startMs = Date.now();
+
+        // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
+        // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
+        // cache never populates → silent full-suite fallback forever). Force-enable
+        // here. Spread to avoid mutating the default object reference, which is
+        // shared across workspace projects in v4 (cli-api: line ~10293).
+        // On Vitest 3.2.x this field is harmless: getImportDurations() ignores it.
+        const exp = (project.config as { experimental?: ExperimentalImportDurations })
+          .experimental;
+        if (exp) {
+          exp.importDurations = {
+            ...exp.importDurations,
+            limit: Number.MAX_SAFE_INTEGER,
+          };
+        }
 
         // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
         cacheDir = path.join(rootDir, '.vitest-affected');
