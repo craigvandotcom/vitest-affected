@@ -10,6 +10,7 @@ import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
 import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
+import { filterRelevantChangedFiles } from './changed-files.js';
 
 /**
  * Narrow shape of the Vitest 4 `experimental.importDurations` config block.
@@ -33,6 +34,22 @@ export interface VitestAffectedOptions {
   allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
   cache?: boolean; // Enable graph caching (default: true)
   statsFile?: string; // Path to append JSON-line stats after each run (e.g. '.vitest-affected/stats.jsonl')
+  /**
+   * Additional path prefixes or regexes to ignore from changed-file analysis.
+   * Applied on top of built-in defaults (.claude/, .git/, .next/, etc).
+   */
+  ignoreChangedFiles?: Array<string | RegExp>;
+  /**
+   * Override the default extension allowlist for relevance.
+   * Default: .ts, .tsx, .js, .jsx, .mts, .cts, .mjs, .cjs, .json
+   */
+  includeChangedExtensions?: string[];
+  /**
+   * If true, skip plugin-side filtering when the caller passes `changedFiles`
+   * explicitly. Default false — explicit changedFiles still benefit from the
+   * filter so callers don't have to reimplement the policy.
+   */
+  respectProvidedChangedFiles?: boolean;
 }
 
 /**
@@ -150,6 +167,7 @@ function writeStatsLine(
     reason?: string;
     changedFiles?: number;
     deletedFiles?: number;
+    ignoredFiles?: number;
     affectedTests?: number;
     totalTests?: number;
     graphSize?: number;
@@ -314,10 +332,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // 6. Get changed files
         let changed: string[];
         let deleted: string[];
+        const changedFromCaller = options.changedFiles !== undefined;
 
-        if (options.changedFiles !== undefined) {
+        if (changedFromCaller) {
           // Resolve relative paths to rootDir and normalize to forward slashes (Vite convention)
-          const resolved = options.changedFiles.map((f) =>
+          const resolved = options.changedFiles!.map((f) =>
             (path.isAbsolute(f) ? f : path.resolve(rootDir, f)).replaceAll('\\', '/'),
           );
           changed = resolved.filter((f) => existsSync(f));
@@ -328,11 +347,35 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           deleted = result.deleted;
         }
 
+        // 6b. Filter irrelevant changed/deleted files before any graph analysis.
+        // Caller-provided changedFiles still get filtered unless explicitly opted out.
+        let ignoredCount = 0;
+        if (!(changedFromCaller && options.respectProvidedChangedFiles)) {
+          const filtered = filterRelevantChangedFiles(
+            { changed, deleted },
+            rootDir,
+            {
+              ignoreChangedFiles: options.ignoreChangedFiles,
+              includeChangedExtensions: options.includeChangedExtensions,
+              configBasenames: CONFIG_BASENAMES,
+            },
+          );
+          ignoredCount = filtered.ignored.length;
+          changed = filtered.changed;
+          deleted = filtered.deleted;
+          if (verbose && ignoredCount > 0) {
+            console.warn(
+              `[vitest-affected] ignored ${ignoredCount} changed file(s) before graph analysis`,
+            );
+          }
+        }
+
         // 7. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-changes',
-            changedFiles: 0, deletedFiles: 0, graphSize: reverse.size,
+            changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
+            graphSize: reverse.size,
             durationMs: Date.now() - startMs,
           }, verbose);
           return;
@@ -357,6 +400,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'config-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
           }, verbose);
           return;
@@ -376,6 +420,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'setup-file-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
           }, verbose);
           return;
@@ -391,6 +436,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'cache-miss',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             graphSize: 0, cacheHit: false,
             durationMs: Date.now() - startMs,
           }, verbose);
@@ -440,6 +486,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             if (statsFile) writeStatsLine(statsFile, rootDir, {
               action: 'selective', reason: 'allow-no-tests',
               changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
             }, verbose);
@@ -451,6 +498,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-affected-tests',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           }, verbose);
@@ -466,20 +514,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'threshold-exceeded',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           }, verbose);
           return;
         }
 
-        // 15. Verbose warnings: log changed files not in graph
+        // 15. Verbose summary: count of changed files not in graph (was per-file warning)
         if (options.verbose) {
-          for (const f of changed) {
-            if (!reverse.has(f)) {
-              console.warn(
-                `[vitest-affected] Changed file not in dependency graph: ${f}`,
-              );
-            }
+          const notInGraph = changed.filter((f) => !reverse.has(f)).length;
+          if (notInGraph > 0) {
+            console.warn(
+              `[vitest-affected] ${notInGraph} changed file(s) not in dependency graph (delta-parsed for new imports)`,
+            );
           }
         }
 
@@ -500,6 +548,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'selective',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           }, verbose);
@@ -507,6 +556,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-valid-tests-on-disk',
             changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
           }, verbose);

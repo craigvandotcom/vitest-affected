@@ -103,12 +103,34 @@ vitestAffected({
   // Append JSON-line stats after each run for observability
   statsFile: '.vitest-affected/stats.jsonl',
 
+  // Extra path prefixes or regexes to ignore from changed-file analysis,
+  // on top of built-in defaults
+  ignoreChangedFiles: ['legacy/', /^scripts\/.*\.sh$/],
+
+  // Override the default code-extension allowlist
+  // Default: .ts, .tsx, .js, .jsx, .mts, .cts, .mjs, .cjs, .json
+  includeChangedExtensions: ['.ts', '.tsx', '.svelte'],
+
+  // When true, do not filter caller-provided `changedFiles`
+  // Default: false (filter still applies — callers shouldn't reimplement policy)
+  respectProvidedChangedFiles: false,
+
   // Disable the plugin entirely
   disabled: false,
 });
 ```
 
 Set `VITEST_AFFECTED_DISABLED=1` to disable without changing config.
+
+### Default ignored paths
+
+The plugin filters obviously-irrelevant changed files before graph analysis to remove noise (parse warnings, "not in graph" warnings) for files that can never participate in the dependency graph. Built-in defaults:
+
+- **Path prefixes**: `.claude/`, `.git/`, `.next/`, `.vitest-affected/`, `playwright-report/`, `test-results/`
+- **Basenames**: `.gitleaksignore`, `.prettierignore`, `next-env.d.ts`
+- **Extensions**: anything outside the code-extension allowlist (markdown, images, CSS, etc.)
+
+Config-file basenames (`package.json`, `tsconfig.json`, `vitest.config.*`, lockfiles) always pass through and trigger a full-suite run, regardless of any ignore rule.
 
 ## Caching
 
