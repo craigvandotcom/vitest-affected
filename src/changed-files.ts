@@ -46,8 +46,14 @@ function matchesPathPrefix(rel: string, prefix: string): boolean {
   return rel === prefix.replace(/\/$/, '') || rel.startsWith(prefix);
 }
 
-function isIgnoredByOption(rel: string, ignore: Array<string | RegExp>): boolean {
-  for (const rule of ignore) {
+/**
+ * Match a repo-relative path against a list of rules. A string rule matches by
+ * exact path or path-prefix (a directory); a RegExp rule matches by `.test()`.
+ * Shared by the changed-file ignore filter and the plugin's full-suite triggers
+ * so both honour identical semantics.
+ */
+export function matchesAnyRule(rel: string, rules: Array<string | RegExp>): boolean {
+  for (const rule of rules) {
     if (typeof rule === 'string') {
       if (rel === rule || matchesPathPrefix(rel, rule.endsWith('/') ? rule : rule + '/')) {
         return true;
@@ -59,23 +65,31 @@ function isIgnoredByOption(rel: string, ignore: Array<string | RegExp>): boolean
   return false;
 }
 
+/**
+ * Convert an absolute (or already-relative) path to a forward-slash,
+ * root-relative path — the form rule matching expects.
+ */
+export function toRepoRelative(filePath: string, rootDir: string): string {
+  const normalized = toForwardSlashes(filePath);
+  const root = toForwardSlashes(rootDir);
+  return normalized.startsWith(root + '/')
+    ? normalized.slice(root.length + 1)
+    : normalized;
+}
+
 function isRelevant(
   filePath: string,
   rootDir: string,
   options: ChangedFileFilterOptions,
 ): boolean {
-  const normalized = toForwardSlashes(filePath);
-  const root = toForwardSlashes(rootDir);
-  const rel = normalized.startsWith(root + '/')
-    ? normalized.slice(root.length + 1)
-    : normalized;
+  const rel = toRepoRelative(filePath, rootDir);
   const basename = path.basename(rel);
 
   // Config files are always relevant — they trigger full-suite runs downstream.
   if (options.configBasenames?.has(basename)) return true;
 
   // Caller-provided ignore patterns
-  if (options.ignoreChangedFiles && isIgnoredByOption(rel, options.ignoreChangedFiles)) {
+  if (options.ignoreChangedFiles && matchesAnyRule(rel, options.ignoreChangedFiles)) {
     return false;
   }
 

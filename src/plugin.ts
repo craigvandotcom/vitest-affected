@@ -10,7 +10,7 @@ import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
 import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
-import { filterRelevantChangedFiles } from './changed-files.js';
+import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
 
 /**
  * Narrow shape of the Vitest 4 `experimental.importDurations` config block.
@@ -50,6 +50,23 @@ export interface VitestAffectedOptions {
    * filter so callers don't have to reimplement the policy.
    */
   respectProvidedChangedFiles?: boolean;
+  /**
+   * Paths that, when changed, force a full-suite run — an escape hatch for
+   * dependencies the import graph cannot see (test fixtures read via
+   * `fs.readFile`, assets imported through Vite `assetsInclude`, generated
+   * data, etc). Without this, changing such a file selects too FEW tests
+   * (under-run / false negative) because no import edge points back to its
+   * dependents.
+   *
+   * Each rule is a string (exact path or directory prefix, e.g.
+   * `__tests__/fixtures`) or a RegExp (e.g. `/\.md$/`), matched against the
+   * repo-relative path — identical semantics to `ignoreChangedFiles`. Checked
+   * on the raw changed set BEFORE relevance filtering, so a trigger whose
+   * extension isn't in the relevance allowlist (e.g. `.md`, `.yaml`) still
+   * fires. Conservative by design: it over-runs (full suite) rather than risk
+   * an under-run. Default: none (opt-in).
+   */
+  fullSuiteTriggers?: Array<string | RegExp>;
 }
 
 /**
@@ -345,6 +362,28 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           const result = await getChangedFiles(rootDir, options.ref);
           changed = result.changed;
           deleted = result.deleted;
+        }
+
+        // 6a. Full-suite triggers — checked on the RAW changed set before the
+        // relevance filter below, since a trigger (e.g. a `.md` or `.yaml`
+        // fixture) may have an extension the filter would otherwise drop. These
+        // cover dependencies invisible to the import graph (fs-read fixtures,
+        // assets), where the safe failure mode is to over-run.
+        if (options.fullSuiteTriggers?.length) {
+          const triggerHit = [...changed, ...deleted].find((f) =>
+            matchesAnyRule(toRepoRelative(f, rootDir), options.fullSuiteTriggers!),
+          );
+          if (triggerHit) {
+            console.warn(
+              `[vitest-affected] Full-suite trigger matched (${toRepoRelative(triggerHit, rootDir)}) — running full suite`,
+            );
+            if (statsFile) writeStatsLine(statsFile, rootDir, {
+              action: 'full-suite', reason: 'full-suite-trigger',
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              graphSize: reverse.size, durationMs: Date.now() - startMs,
+            }, verbose);
+            return;
+          }
         }
 
         // 6b. Filter irrelevant changed/deleted files before any graph analysis.

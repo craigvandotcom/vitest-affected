@@ -1,5 +1,9 @@
 import { describe, test, expect } from 'vitest';
-import { filterRelevantChangedFiles } from '../src/changed-files.js';
+import {
+  filterRelevantChangedFiles,
+  matchesAnyRule,
+  toRepoRelative,
+} from '../src/changed-files.js';
 
 const ROOT = '/proj';
 
@@ -107,5 +111,40 @@ describe('filterRelevantChangedFiles', () => {
     // get classified by their absolute path's extension and basename.
     const r = call({ changed: ['/other/repo/foo.ts'] });
     expect(r.changed).toEqual(['/other/repo/foo.ts']);
+  });
+});
+
+describe('toRepoRelative', () => {
+  test('strips rootDir prefix and normalizes slashes', () => {
+    expect(toRepoRelative('/proj/src/a.ts', '/proj')).toBe('src/a.ts');
+    expect(toRepoRelative('C:\\proj\\src\\a.ts', 'C:/proj')).toBe('src/a.ts');
+  });
+
+  test('returns the path unchanged when not under rootDir', () => {
+    expect(toRepoRelative('/other/a.ts', '/proj')).toBe('/other/a.ts');
+  });
+});
+
+describe('matchesAnyRule', () => {
+  test('string rule matches an exact path', () => {
+    expect(matchesAnyRule('src/a.ts', ['src/a.ts'])).toBe(true);
+  });
+
+  test('string rule matches a directory prefix (with or without trailing slash)', () => {
+    expect(matchesAnyRule('__tests__/fixtures/data.json', ['__tests__/fixtures'])).toBe(true);
+    expect(matchesAnyRule('__tests__/fixtures/data.json', ['__tests__/fixtures/'])).toBe(true);
+  });
+
+  test('string rule does not match a sibling that merely shares a prefix substring', () => {
+    expect(matchesAnyRule('__tests__/fixtures-extra/data.json', ['__tests__/fixtures'])).toBe(false);
+  });
+
+  test('RegExp rule matches by extension', () => {
+    expect(matchesAnyRule('docs/readme.md', [/\.md$/])).toBe(true);
+    expect(matchesAnyRule('src/a.ts', [/\.md$/])).toBe(false);
+  });
+
+  test('returns false on an empty rule list', () => {
+    expect(matchesAnyRule('src/a.ts', [])).toBe(false);
   });
 });

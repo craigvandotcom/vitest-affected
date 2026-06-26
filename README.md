@@ -115,6 +115,14 @@ vitestAffected({
   // Default: false (filter still applies — callers shouldn't reimplement policy)
   respectProvidedChangedFiles: false,
 
+  // Paths that force a full-suite run when changed — an escape hatch for
+  // dependencies the import graph can't see (fixtures read via fs, assets
+  // imported through Vite `assetsInclude`, generated data). String = exact path
+  // or directory prefix; RegExp = tested against the repo-relative path. Checked
+  // BEFORE the relevance filter, so triggers on non-code files (.md, .yaml) fire.
+  // Default: none (opt-in). Conservative: over-runs rather than risk an under-run.
+  fullSuiteTriggers: ['__tests__/fixtures', /\.md$/],
+
   // Disable the plugin entirely
   disabled: false,
 });
@@ -131,6 +139,8 @@ The plugin filters obviously-irrelevant changed files before graph analysis to r
 - **Extensions**: anything outside the code-extension allowlist (markdown, images, CSS, etc.)
 
 Config-file basenames (`package.json`, `tsconfig.json`, `vitest.config.*`, lockfiles) always pass through and trigger a full-suite run, regardless of any ignore rule.
+
+> **Fixtures & assets:** the dependency graph only follows `import` edges. A test that reads a fixture via `fs.readFile`, or an asset pulled in through Vite `assetsInclude` (e.g. `.md`), has **no** edge pointing back from that file to its dependents — so changing it would select too few tests (an under-run). Declare such paths in [`fullSuiteTriggers`](#options) to force a full-suite run when they change.
 
 ## Caching
 

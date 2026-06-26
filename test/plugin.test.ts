@@ -1,7 +1,7 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
@@ -125,5 +125,90 @@ describe('allowNoTests option', () => {
 
     // Without allowNoTests, include should remain unchanged (full suite fallback)
     expect(projectConfig.include).toEqual(originalInclude);
+  });
+});
+
+describe('fullSuiteTriggers option', () => {
+  /** Run the configureVitest hook for a plugin against a mock context. */
+  async function run(
+    plugin: ReturnType<typeof vitestAffected>,
+    tmpDir: string,
+  ) {
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const hook = (plugin as Record<string, unknown>).configureVitest as (
+      ctx: { vitest: typeof vitest; project: typeof project },
+    ) => Promise<void>;
+    await hook({ vitest, project });
+    return projectConfig;
+  }
+
+  function lastStatsReason(statsFile: string): string {
+    const lines = readFileSync(statsFile, 'utf-8').trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]).reason;
+  }
+
+  test('a matching trigger forces full suite even when allowNoTests would select zero', async () => {
+    // Counterpart to the allowNoTests test above: there, orphan.ts → include []
+    // (zero tests). Here the same change matches a trigger, so the suite runs in
+    // full — include is left untouched.
+    const { tmpDir, orphanPath } = setupOrphanFixture();
+    const projectConfig = await run(
+      vitestAffected({
+        allowNoTests: true,
+        changedFiles: [orphanPath],
+        cache: true,
+        fullSuiteTriggers: ['src/orphan.ts'],
+      }),
+      tmpDir,
+    );
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+  });
+
+  test('a .md fixture (dropped by the relevance filter) still fires the trigger', async () => {
+    // .md isn't in the relevance allowlist, so WITHOUT a trigger this change is
+    // filtered to nothing → full suite for reason "no-changes". WITH a trigger,
+    // it must fire BEFORE the filter → reason "full-suite-trigger". The stats
+    // reason is what distinguishes the two (include is unchanged either way).
+    const { tmpDir } = setupOrphanFixture();
+    const mdPath = path.join(tmpDir, 'tests', 'fixtures', 'data.md');
+
+    const withTrigger = path.join(tmpDir, 'with-trigger.jsonl');
+    await run(
+      vitestAffected({
+        changedFiles: [mdPath],
+        cache: true,
+        fullSuiteTriggers: [/\.md$/],
+        statsFile: withTrigger,
+      }),
+      tmpDir,
+    );
+    expect(lastStatsReason(withTrigger)).toBe('full-suite-trigger');
+
+    const withoutTrigger = path.join(tmpDir, 'without-trigger.jsonl');
+    await run(
+      vitestAffected({
+        changedFiles: [mdPath],
+        cache: true,
+        statsFile: withoutTrigger,
+      }),
+      tmpDir,
+    );
+    expect(lastStatsReason(withoutTrigger)).toBe('no-changes');
+  });
+
+  test('no trigger match leaves normal selection intact', async () => {
+    // A relevant changed file that matches no trigger must NOT be hijacked into
+    // a full-suite run — orphan.ts has zero dependents, so allowNoTests → [].
+    const { tmpDir, orphanPath } = setupOrphanFixture();
+    const projectConfig = await run(
+      vitestAffected({
+        allowNoTests: true,
+        changedFiles: [orphanPath],
+        cache: true,
+        fullSuiteTriggers: ['__tests__/fixtures'],
+      }),
+      tmpDir,
+    );
+    expect(projectConfig.include).toEqual([]);
   });
 });
