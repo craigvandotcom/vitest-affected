@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`fullSuiteTriggers` option** — declare paths that force a full-suite run when changed, an escape hatch for dependencies the import graph can't see: fixtures read via `fs.readFile`, assets imported through Vite `assetsInclude` (e.g. `.md`), or generated data. Without it, changing such a file selects too few tests (an under-run / false negative) because no import edge points back to its dependents. Each rule is a string (exact path or directory prefix) or a `RegExp`, matched against the repo-relative path — same semantics as `ignoreChangedFiles`. Evaluated on the raw changed set *before* relevance filtering, so triggers on non-code files still fire. Opt-in; conservative by design (over-runs rather than risk an under-run).
+
 ## [0.5.0] - 2026-05-03
 
 ### Fixed
