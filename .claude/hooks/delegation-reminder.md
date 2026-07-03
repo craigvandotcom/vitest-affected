@@ -3,16 +3,15 @@
 **DO NOT respond until you complete this:**
 
 ```bash
-cm context "<task>" --workspace . --json
+qmd search "<task keywords>" --limit 5
 ```
 
-- Run command (task = 2-6 word summary)
-- Parse: `relevantBullets` + `historySnippets`
-- Integrate into working context
-- If task relates to prior work: `cass search "<keywords>" --workspace . --json --limit 5`
-- Review past session context for relevant solutions/decisions
+- Run a search (task = 2-6 word summary of what you're about to do)
+- Review results: facts, rules, decisions, recipes relevant to this task
+- Integrate into working context before acting
+- If the task touches prior work, widen the search and check hits carefully
 
-**cm context = playbook rules. cass search = raw past conversation matches. Both matter.**
+**qmd is the memory substrate — query it directly for facts, rules, decisions, recipes.**
 
 **Skip = context blindness. No exceptions.**
 
@@ -49,5 +48,4 @@ The pre-commit hook enforces this automatically on `git commit`.
 ## Navigation Lost?
 
 1. Check `CLAUDE.md` — project commands, architecture, rules
-2. Check `cm context "<task>" --workspace . --json`
-3. Search past sessions: `cass search "<keywords>" --workspace . --json`
+2. Search knowledge base: `qmd search "<task keywords>" --limit 5`
