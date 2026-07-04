@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
@@ -30,7 +31,9 @@ function createMockTestModule(
 }
 
 function makeTmpDir(): string {
-  return mkdtempSync(path.join(tmpdir(), 'vitest-runtime-test-'));
+  // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var);
+  // cache load canonicalizes keys/values, so fixture literals must be canonical.
+  return realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-runtime-test-')));
 }
 
 function writeProjectFiles(

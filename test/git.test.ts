@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -20,7 +20,11 @@ afterEach(() => {
 
 /** Create a temp directory and init a fresh git repo. */
 async function makeTempRepo(): Promise<string> {
-  const dir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-git-'));
+  // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var).
+  // getChangedFiles() canonicalizes its output (git itself also resolves the repo
+  // toplevel through symlinks), so `dir` must be canonical too or every assertion
+  // below comparing `path.join(dir, ...)` against the returned paths diverges.
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-git-')));
   tempDirs.push(dir);
   await git(['init'], dir);
   await git(['config', 'user.email', 'test@test.com'], dir);

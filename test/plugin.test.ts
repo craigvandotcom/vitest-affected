@@ -1,7 +1,7 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
@@ -210,5 +210,57 @@ describe('fullSuiteTriggers option', () => {
       tmpDir,
     );
     expect(projectConfig.include).toEqual([]);
+  });
+});
+
+describe('symlinked rootDir canonicalization', () => {
+  test('selective selection converges when rootDir and changed files arrive through a symlink alias', async () => {
+    // The production scenario behind boundary canonicalization: the project
+    // lives at a real path, but Vitest is invoked through a symlink alias
+    // (symlinked checkout dir, macOS /var temp alias, etc). The cache is keyed
+    // by CANONICAL paths (what the runtime reporter writes), while rootDir and
+    // the changed file arrive via the ALIAS. Without canonicalization at both
+    // boundaries the alias-path seed misses the canonical graph key -> zero
+    // affected tests -> silent full-suite fallback. With it, selection works.
+    const base = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-symlink-root-')));
+    tempDirs.push(base);
+
+    const realDir = path.join(base, 'real-project');
+    mkdirSync(path.join(realDir, 'src'), { recursive: true });
+    mkdirSync(path.join(realDir, 'tests'), { recursive: true });
+    writeFileSync(path.join(realDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+    writeFileSync(path.join(realDir, 'src', 'main.ts'), 'export const main = 1;\n');
+    const canonicalTest = path.join(realDir, 'tests', 'main.test.ts');
+    writeFileSync(
+      canonicalTest,
+      'import { main } from "../src/main";\nimport { test, expect } from "vitest";\ntest("main", () => expect(main).toBe(1));\n',
+    );
+
+    // Cache keyed by canonical paths, as the runtime reporter records them.
+    const reverse = new Map<string, Set<string>>();
+    reverse.set(
+      path.join(realDir, 'src', 'main.ts'),
+      new Set([canonicalTest]),
+    );
+    saveCacheSync(path.join(realDir, '.vitest-affected'), reverse);
+
+    // Everything the plugin RECEIVES goes through the alias.
+    const aliasDir = path.join(base, 'alias');
+    symlinkSync(realDir, aliasDir, 'dir');
+
+    const plugin = vitestAffected({
+      changedFiles: [path.join(aliasDir, 'src', 'main.ts')],
+      cache: true,
+    });
+    const { vitest, project, projectConfig } = createMockContext(aliasDir);
+
+    const hook = (plugin as Record<string, unknown>).configureVitest as (
+      ctx: { vitest: typeof vitest; project: typeof project },
+    ) => Promise<void>;
+    await hook({ vitest, project });
+
+    // Selection must land on the CANONICAL test path — not fall back to the
+    // full-suite include pattern, and not emit an alias-path variant.
+    expect(projectConfig.include).toEqual([canonicalTest]);
   });
 });

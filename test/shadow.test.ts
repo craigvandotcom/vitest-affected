@@ -8,6 +8,7 @@ import {
   rmSync,
   readFileSync,
   existsSync,
+  realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
@@ -55,7 +56,10 @@ function setupProject(withCache: boolean): {
   mainPath: string;
   testPath: string;
 } {
-  const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-shadow-'));
+  // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var);
+  // the plugin canonicalizes all paths, so the fixture's expected literals must be
+  // canonical too or every comparison diverges by symlink alias.
+  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-shadow-')));
   tempDirs.push(tmpDir);
 
   mkdirSync(path.join(tmpDir, 'src'), { recursive: true });

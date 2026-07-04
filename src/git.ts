@@ -2,6 +2,7 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { toCanonicalPath } from './graph/normalize.js';
 
 const execFile = promisify(execFileCb);
 
@@ -57,8 +58,12 @@ export async function getChangedFiles(
   }
 
   // Step 3: Get git root (paths from git diff are relative to git root, not rootDir)
+  // Canonicalize explicitly rather than relying on git's own realpath behavior
+  // (which resolves symlinks when locating the repo toplevel): on macOS this is
+  // exactly the /var → /private/var divergence that desyncs git-derived paths
+  // from graph keys built off a non-canonicalized rootDir.
   const { stdout: gitRootRaw } = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: rootDir });
-  const gitRoot = gitRootRaw.trim();
+  const gitRoot = toCanonicalPath(gitRootRaw.trim());
 
   // Step 4: Parallel git commands
   //
@@ -115,9 +120,12 @@ export async function getChangedFiles(
   const deleted: string[] = [];
 
   // Helper: classify and add a relative path
-  // Normalize to forward slashes so paths match Vite's convention
+  // Canonicalize so paths match Vite's forward-slash convention AND converge
+  // with graph keys even when gitRoot sits behind a symlinked alias. Deleted
+  // files (the common case for `rel` here) don't exist on disk — toCanonicalPath
+  // falls back to the nearest existing ancestor rather than throwing.
   const classify = (rel: string) => {
-    const absPath = path.resolve(gitRoot, rel).replaceAll('\\', '/');
+    const absPath = toCanonicalPath(path.resolve(gitRoot, rel));
     if (seenPaths.has(absPath)) return;
     seenPaths.add(absPath);
     if (existsSync(absPath)) {

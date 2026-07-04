@@ -7,7 +7,7 @@ import path from 'node:path';
 import { glob } from 'tinyglobby';
 import { deltaParseNewImports } from './graph/builder.js';
 import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
-import { normalizeModuleId } from './graph/normalize.js';
+import { normalizeModuleId, toCanonicalPath } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
 import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
@@ -128,24 +128,30 @@ export function createRuntimeReporter(
   }
 
   function onTestModuleEnd(testModule: TestModule): void {
-    const testPath = normalizeModuleId(testModule.moduleId);
+    const rawTestPath = normalizeModuleId(testModule.moduleId);
 
     // Guard: rootDir not yet set
     if (!rootDir) return;
 
-    // Guard: virtual module IDs are not absolute paths
-    if (!path.isAbsolute(testPath)) return;
+    // Guard: virtual module IDs are not absolute paths. Checked BEFORE
+    // canonicalizing — a non-absolute id (e.g. "virtual:mod") is not a real
+    // fs path, and realpathSync's nearest-ancestor fallback would otherwise
+    // walk it up to cwd and fabricate a bogus absolute path.
+    if (!path.isAbsolute(rawTestPath)) return;
+    const testPath = toCanonicalPath(rawTestPath);
 
     const { importDurations } = testModule.diagnostic();
-    // Vite normalizes all paths to forward slashes (even on Windows), so use '/' here.
+    // rootDir is canonicalized once at plugin init; reuse that form here.
     const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
 
     for (const rawPath of Object.keys(importDurations)) {
-      const modulePath = normalizeModuleId(rawPath);
-      // Must be absolute
-      if (!path.isAbsolute(modulePath)) continue;
-      // Skip node_modules (Vite paths always use forward slashes)
-      if (modulePath.includes('/node_modules/')) continue;
+      const rawModulePath = normalizeModuleId(rawPath);
+      // Must be absolute (see guard above for why this precedes canonicalization)
+      if (!path.isAbsolute(rawModulePath)) continue;
+      // Skip node_modules before canonicalizing — cheap substring check avoids
+      // a realpathSync syscall for the (often numerous) dependency modules.
+      if (rawModulePath.includes('/node_modules/')) continue;
+      const modulePath = toCanonicalPath(rawModulePath);
       // Must be under rootDir
       if (!modulePath.startsWith(rootPrefix)) continue;
       // Skip self-reference
@@ -299,7 +305,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        const rootDir = vitest.config.root;
+        // Canonicalize once at the source: every downstream graph key (cache
+        // load, resolver output, reporter module paths, changed-file resolution,
+        // test-file glob) is built from or compared against this rootDir. A
+        // symlinked project root (or macOS's /var → /private/var temp alias)
+        // would otherwise desync those keys from git-derived changed-file paths,
+        // which git itself resolves through symlinks when locating the repo
+        // toplevel — a silent under-selection.
+        const rootDir = toCanonicalPath(vitest.config.root);
         statsRootDir = rootDir;
 
         // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
@@ -381,9 +394,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const changedFromCaller = options.changedFiles !== undefined;
 
         if (changedFromCaller) {
-          // Resolve relative paths to rootDir and normalize to forward slashes (Vite convention)
+          // Resolve relative paths to rootDir and canonicalize so caller-provided
+          // paths converge with graph keys the same way git-derived ones do.
           const resolved = options.changedFiles!.map((f) =>
-            (path.isAbsolute(f) ? f : path.resolve(rootDir, f)).replaceAll('\\', '/'),
+            toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
           );
           changed = resolved.filter((f) => existsSync(f));
           deleted = resolved.filter((f) => !existsSync(f));
@@ -477,7 +491,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const setupFilesRaw = project.config.setupFiles ?? [];
         const setupFileSet = new Set(
           (Array.isArray(setupFilesRaw) ? setupFilesRaw : [setupFilesRaw]).map(
-            (f) => (path.isAbsolute(f) ? f : path.resolve(rootDir, f)).replaceAll('\\', '/'),
+            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
           ),
         );
         const hasSetupFileChange = allChangedFiles.some((f) => setupFileSet.has(f));
@@ -530,12 +544,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // Normalize glob results to forward slashes (Vite convention) for Windows compat
+        // Canonicalize glob results so they converge with graph keys built off
+        // the same (canonicalized) rootDir. rootDir is already canonical, so
+        // for the common (non-symlinked) layout each realpath memo-hits or
+        // resolves to itself.
         const testFiles = (await glob(includePatterns, {
           cwd: rootDir,
           absolute: true,
           ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
-        })).map((f) => f.replaceAll('\\', '/'));
+        })).map((f) => toCanonicalPath(f));
 
         if (testFiles.length === 0) {
           console.warn(

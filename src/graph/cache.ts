@@ -8,6 +8,7 @@ import {
   existsSync,
 } from 'node:fs';
 import path from 'node:path';
+import { toCanonicalPath } from './normalize.js';
 
 const GRAPH_FILE = 'graph.json';
 
@@ -55,6 +56,38 @@ function isUnderRootDir(filePath: string, rootDir: string): boolean {
   // Cache paths are Vite-normalized (always forward slashes), so use '/' not path.sep
   const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
   return filePath === rootDir || filePath.startsWith(rootPrefix);
+}
+
+/**
+ * Build the in-memory reverse map from a raw source→tests object, canonicalizing
+ * every key and value (toCanonicalPath) and confining entries to the
+ * already-canonicalized rootDir. Canonicalizing on LOAD is what lets a cache
+ * written before canonicalization existed — or through a different path alias
+ * (macOS /var vs /private/var, a symlinked project root) — converge with
+ * today's canonical graph keys instead of silently orphaning. Distinct raw
+ * keys that canonicalize to the same path are merged, not overwritten.
+ * Shared by the v2 load path and the v1 migration path.
+ */
+function toConfinedReverseMap(
+  rawMap: Record<string, string[]>,
+  canonicalRoot: string,
+): Map<string, Set<string>> {
+  const reverse = new Map<string, Set<string>>();
+  for (const [file, tests] of Object.entries(rawMap)) {
+    const canonicalFile = toCanonicalPath(file);
+    if (!isUnderRootDir(canonicalFile, canonicalRoot)) continue;
+    const confinedTests = tests
+      .map((t) => toCanonicalPath(t))
+      .filter((t) => isUnderRootDir(t, canonicalRoot));
+    if (confinedTests.length === 0) continue;
+    const existing = reverse.get(canonicalFile);
+    if (existing) {
+      for (const t of confinedTests) existing.add(t);
+    } else {
+      reverse.set(canonicalFile, new Set(confinedTests));
+    }
+  }
+  return reverse;
 }
 
 /**
@@ -107,6 +140,10 @@ export function loadCachedReverseMap(
 ): { reverse: Map<string, Set<string>>; hit: boolean } {
   cleanupOrphanedTmp(cacheDir);
 
+  // Canonicalize the confinement boundary itself; keys/values are
+  // canonicalized entry-by-entry in toConfinedReverseMap.
+  const canonicalRoot = toCanonicalPath(rootDir);
+
   const cachePath = path.join(cacheDir, GRAPH_FILE);
   let raw: string;
   try {
@@ -138,14 +175,7 @@ export function loadCachedReverseMap(
       return { reverse: new Map(), hit: false };
     }
 
-    const reverse = new Map<string, Set<string>>();
-    for (const [file, tests] of Object.entries(reverseMapRaw)) {
-      if (!isUnderRootDir(file, rootDir)) continue;
-      const confinedTests = (tests as string[]).filter((t) => isUnderRootDir(t, rootDir));
-      if (confinedTests.length > 0) {
-        reverse.set(file, new Set(confinedTests));
-      }
-    }
+    const reverse = toConfinedReverseMap(reverseMapRaw, canonicalRoot);
 
     if (verbose) console.warn(`[vitest-affected] v2 cache hit — ${reverse.size} entries`);
     return { reverse, hit: true };
@@ -160,14 +190,7 @@ export function loadCachedReverseMap(
     }
 
     // Migrate v1 runtimeEdges → v2 reverse map
-    const reverse = new Map<string, Set<string>>();
-    for (const [file, tests] of Object.entries(runtimeEdges)) {
-      if (!isUnderRootDir(file, rootDir)) continue;
-      const confinedTests = (tests as string[]).filter((t) => isUnderRootDir(t, rootDir));
-      if (confinedTests.length > 0) {
-        reverse.set(file, new Set(confinedTests));
-      }
-    }
+    const reverse = toConfinedReverseMap(runtimeEdges, canonicalRoot);
 
     if (verbose) console.warn(`[vitest-affected] v1→v2 migration — ${reverse.size} entries`);
     return { reverse, hit: true };
@@ -181,6 +204,11 @@ export function loadCachedReverseMap(
 /**
  * Persist a reverse map to disk in v2 format.
  * Atomic write: temp file → renameSync.
+ *
+ * Keys/values are written as given: in the plugin's flow they arrive already
+ * canonicalized (reporter + mergeRuntimeEdges operate on canonical paths), and
+ * loadCachedReverseMap canonicalizes on read anyway — so save-side
+ * canonicalization would be redundant work on every test run's hot path.
  */
 export function saveCacheSync(
   cacheDir: string,

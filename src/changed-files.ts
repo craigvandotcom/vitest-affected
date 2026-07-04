@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { toCanonicalPath } from './graph/normalize.js';
 
 const DEFAULT_RELEVANT_EXTENSIONS = new Set([
   '.ts', '.tsx', '.js', '.jsx',
@@ -38,10 +39,6 @@ export interface ChangedFileFilterOptions {
   configBasenames?: ReadonlySet<string>;
 }
 
-function toForwardSlashes(p: string): string {
-  return p.replaceAll('\\', '/');
-}
-
 function matchesPathPrefix(rel: string, prefix: string): boolean {
   return rel === prefix.replace(/\/$/, '') || rel.startsWith(prefix);
 }
@@ -67,11 +64,13 @@ export function matchesAnyRule(rel: string, rules: Array<string | RegExp>): bool
 
 /**
  * Convert an absolute (or already-relative) path to a forward-slash,
- * root-relative path — the form rule matching expects.
+ * root-relative path — the form rule matching expects. Both sides are routed
+ * through toCanonicalPath so a filePath/rootDir pair that differ only by a
+ * symlink alias (or Windows separators) still compare correctly.
  */
 export function toRepoRelative(filePath: string, rootDir: string): string {
-  const normalized = toForwardSlashes(filePath);
-  const root = toForwardSlashes(rootDir);
+  const normalized = toCanonicalPath(filePath);
+  const root = toCanonicalPath(rootDir);
   return normalized.startsWith(root + '/')
     ? normalized.slice(root.length + 1)
     : normalized;

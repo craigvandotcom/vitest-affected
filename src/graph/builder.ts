@@ -2,6 +2,7 @@ import { ResolverFactory } from 'oxc-resolver';
 import { parseSync } from 'oxc-parser';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { toCanonicalPath } from './normalize.js';
 
 const BINARY_EXTENSIONS = new Set([
   '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.tiff',
@@ -81,17 +82,20 @@ export function resolveFileImports(
   const dir = path.dirname(file);
   const resolved: string[] = [];
   // Path boundary: rootDir=/project/foo must not match /project/foo-bar/
-  // rootDir comes from Vite (always forward slashes), so use '/' not path.sep
-  const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
+  // Canonicalize BOTH sides of the boundary check — the resolver may return
+  // paths through a symlink alias while rootDir is canonical (or vice versa);
+  // comparing mixed representations silently drops legitimate in-project edges.
+  const canonicalRoot = toCanonicalPath(rootDir);
+  const rootPrefix = canonicalRoot.endsWith('/') ? canonicalRoot : canonicalRoot + '/';
 
   for (const specifier of specifiers) {
     const result = resolver.sync(dir, specifier);
     if (result.error) continue;
     if (!result.path) continue;
-    // Normalize resolver output to forward slashes (Vite convention)
-    const resolvedPath = result.path.replaceAll('\\', '/');
+    // Canonicalize resolver output (memoized — repeated deps cost one realpath)
+    const resolvedPath = toCanonicalPath(result.path);
     if (resolvedPath.includes('/node_modules/')) continue;
-    if (!resolvedPath.startsWith(rootPrefix) && resolvedPath !== rootDir) continue;
+    if (!resolvedPath.startsWith(rootPrefix) && resolvedPath !== canonicalRoot) continue;
     resolved.push(resolvedPath);
   }
 

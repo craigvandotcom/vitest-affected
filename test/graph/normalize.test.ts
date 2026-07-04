@@ -1,5 +1,8 @@
-import { describe, test, expect } from 'vitest';
-import { normalizeModuleId } from '../../src/graph/normalize.js';
+import { describe, test, expect, afterEach } from 'vitest';
+import path from 'node:path';
+import { mkdtempSync, writeFileSync, symlinkSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { normalizeModuleId, toCanonicalPath } from '../../src/graph/normalize.js';
 
 describe('normalizeModuleId', () => {
   test('strips \\0 prefix (Vite virtual module marker)', () => {
@@ -29,5 +32,76 @@ describe('normalizeModuleId', () => {
 
   test('passes through clean absolute paths unchanged', () => {
     expect(normalizeModuleId('/home/user/src/a.ts')).toBe('/home/user/src/a.ts');
+  });
+});
+
+describe('toCanonicalPath', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    tempDirs.length = 0;
+  });
+
+  test('resolves a path reached through a symlinked directory to its real location', () => {
+    const realDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-normalize-real-'));
+    tempDirs.push(realDir);
+    const linkParent = mkdtempSync(path.join(tmpdir(), 'vitest-affected-normalize-link-'));
+    tempDirs.push(linkParent);
+
+    writeFileSync(path.join(realDir, 'file.ts'), 'export const x = 1;\n');
+    const linkPath = path.join(linkParent, 'link');
+    symlinkSync(realDir, linkPath, 'dir');
+
+    const viaSymlink = path.join(linkPath, 'file.ts');
+    const expected = realpathSync(path.join(realDir, 'file.ts')).replaceAll('\\', '/');
+
+    expect(toCanonicalPath(viaSymlink)).toBe(expected);
+    // The symlinked route must not equal the raw (unresolved) input.
+    expect(toCanonicalPath(viaSymlink)).not.toBe(viaSymlink.replaceAll('\\', '/'));
+  });
+
+  test('normalizes Windows backslash separators without attempting realpath', () => {
+    // A drive-letter path is absolute on win32 but NOT on POSIX (no leading '/'),
+    // so realpathSync must never be attempted against it here — only separators
+    // are normalized.
+    expect(toCanonicalPath('C:\\Users\\foo\\bar.ts')).toBe('C:/Users/foo/bar.ts');
+  });
+
+  test('canonicalizes a macOS-style /var temp path to its /private/var real location', () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'vitest-affected-normalize-var-'));
+    tempDirs.push(tmp);
+
+    const canonical = toCanonicalPath(tmp);
+    expect(canonical).toBe(realpathSync(tmp).replaceAll('\\', '/'));
+    if (process.platform === 'darwin') {
+      // On macOS, os.tmpdir() sits behind the /var -> /private/var symlink —
+      // the whole point of this bead's fix is that this diverges from the raw input.
+      expect(canonical).not.toBe(tmp.replaceAll('\\', '/'));
+    }
+  });
+
+  test('handles a deleted/non-existent file by canonicalizing the nearest existing ancestor', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-normalize-deleted-'));
+    tempDirs.push(dir);
+
+    const deletedFile = path.join(dir, 'gone.ts');
+    const expectedDir = realpathSync(dir).replaceAll('\\', '/');
+
+    expect(toCanonicalPath(deletedFile)).toBe(`${expectedDir}/gone.ts`);
+  });
+
+  test('returns a fake absolute path unchanged when no ancestor exists on disk', () => {
+    expect(toCanonicalPath('/proj/src/a.ts')).toBe('/proj/src/a.ts');
+  });
+
+  test('memoizes repeated calls (same result on second call)', () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'vitest-affected-normalize-memo-'));
+    tempDirs.push(tmp);
+    const first = toCanonicalPath(tmp);
+    const second = toCanonicalPath(tmp);
+    expect(second).toBe(first);
   });
 });
