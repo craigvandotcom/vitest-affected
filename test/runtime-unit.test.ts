@@ -3,6 +3,7 @@ import { describe, test, expect } from 'vitest';
 import type { TestModule } from 'vitest/node';
 import type { TestRunEndReason } from 'vitest/reporters';
 import { createRuntimeReporter } from '../src/plugin.js';
+import { mergeRuntimeEdges, type ReverseMap } from '../src/runtime-merge.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -198,5 +199,137 @@ describe('createRuntimeReporter', () => {
 
     // Empty map — should NOT call onEdgesCollected
     expect(collected).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mergeRuntimeEdges
+// ---------------------------------------------------------------------------
+
+/** Build a ReverseMap from a plain source→tests object literal. */
+function rmap(obj: Record<string, string[]>): ReverseMap {
+  const m: ReverseMap = new Map();
+  for (const [file, tests] of Object.entries(obj)) {
+    m.set(file, new Set(tests));
+  }
+  return m;
+}
+
+/** Serialize a ReverseMap to a comparable plain object (sets → sorted arrays). */
+function plain(m: ReverseMap): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [file, tests] of m) out[file] = [...tests].sort();
+  return out;
+}
+
+describe('mergeRuntimeEdges', () => {
+  test("scope='all' replaces edges for every fresh test", () => {
+    // src/a.ts used to be imported by a.test.ts; now a.test.ts imports src/b.ts
+    // instead. scope='all' must strip the stale a.ts→a.test.ts edge.
+    const base = rmap({
+      '/p/src/a.ts': ['/p/a.test.ts'],
+    });
+    const fresh = rmap({
+      '/p/src/b.ts': ['/p/a.test.ts'],
+    });
+
+    const merged = mergeRuntimeEdges(base, fresh, 'all');
+
+    expect(plain(merged)).toEqual({
+      '/p/src/b.ts': ['/p/a.test.ts'],
+    });
+    // a.ts had its only edge stripped → dropped entirely
+    expect(merged.has('/p/src/a.ts')).toBe(false);
+  });
+
+  test("scope='all' preserves edges for tests that did not run this cycle", () => {
+    // b.test.ts is not present in fresh, so its edge in base must survive.
+    const base = rmap({
+      '/p/src/shared.ts': ['/p/a.test.ts', '/p/b.test.ts'],
+    });
+    const fresh = rmap({
+      '/p/src/shared.ts': ['/p/a.test.ts'],
+    });
+
+    const merged = mergeRuntimeEdges(base, fresh, 'all');
+
+    // a.test.ts overwritten (still present), b.test.ts preserved untouched
+    expect(plain(merged)).toEqual({
+      '/p/src/shared.ts': ['/p/a.test.ts', '/p/b.test.ts'],
+    });
+  });
+
+  test('scope=Set restricts the overwrite to listed tests', () => {
+    // Only a.test.ts is in scope. Its stale edge (a.ts) is stripped and its
+    // fresh edge (b.ts) applied. c.test.ts is NOT in scope: its base edge
+    // survives and its fresh edge is ignored.
+    const base = rmap({
+      '/p/src/a.ts': ['/p/a.test.ts'],
+      '/p/src/c.ts': ['/p/c.test.ts'],
+    });
+    const fresh = rmap({
+      '/p/src/b.ts': ['/p/a.test.ts'],
+      '/p/src/d.ts': ['/p/c.test.ts'],
+    });
+
+    const merged = mergeRuntimeEdges(base, fresh, new Set(['/p/a.test.ts']));
+
+    expect(plain(merged)).toEqual({
+      // a.test.ts overwrite applied: a.ts stripped, b.ts added
+      '/p/src/b.ts': ['/p/a.test.ts'],
+      // c.test.ts untouched: base edge preserved, fresh d.ts edge ignored
+      '/p/src/c.ts': ['/p/c.test.ts'],
+    });
+    expect(merged.has('/p/src/a.ts')).toBe(false);
+    expect(merged.has('/p/src/d.ts')).toBe(false);
+  });
+
+  test('does not mutate the base or fresh inputs (pure)', () => {
+    const base = rmap({ '/p/src/a.ts': ['/p/a.test.ts'] });
+    const fresh = rmap({ '/p/src/b.ts': ['/p/a.test.ts'] });
+    const baseBefore = plain(base);
+    const freshBefore = plain(fresh);
+
+    mergeRuntimeEdges(base, fresh, 'all');
+
+    expect(plain(base)).toEqual(baseBefore);
+    expect(plain(fresh)).toEqual(freshBefore);
+  });
+
+  test('scope=Set with an empty set is a no-op copy of base', () => {
+    const base = rmap({ '/p/src/a.ts': ['/p/a.test.ts'] });
+    const fresh = rmap({ '/p/src/b.ts': ['/p/a.test.ts'] });
+
+    const merged = mergeRuntimeEdges(base, fresh, new Set());
+
+    expect(plain(merged)).toEqual(plain(base));
+    // still a fresh map, not the same reference
+    expect(merged).not.toBe(base);
+  });
+
+  test('structural sharing: untouched entries reuse base Set identity; affected entries are new', () => {
+    // shared.ts loses a.test.ts (in scope) → affected → NEW Set.
+    // untouched.ts has only b.test.ts (out of scope) → UNTOUCHED → SAME Set.
+    const base = rmap({
+      '/p/src/shared.ts': ['/p/a.test.ts'],
+      '/p/src/untouched.ts': ['/p/b.test.ts'],
+    });
+    const fresh = rmap({
+      '/p/src/moved.ts': ['/p/a.test.ts'],
+    });
+
+    const merged = mergeRuntimeEdges(base, fresh, 'all');
+
+    // Untouched entry: exact same Set instance (no clone).
+    expect(merged.get('/p/src/untouched.ts')).toBe(base.get('/p/src/untouched.ts'));
+    // Affected entry: shared.ts lost its only edge → dropped; moved.ts is new.
+    expect(merged.has('/p/src/shared.ts')).toBe(false);
+    expect(merged.get('/p/src/moved.ts')).not.toBe(base.get('/p/src/moved.ts'));
+    expect(merged.get('/p/src/moved.ts')).toEqual(new Set(['/p/a.test.ts']));
+    // Inputs untouched.
+    expect(plain(base)).toEqual({
+      '/p/src/shared.ts': ['/p/a.test.ts'],
+      '/p/src/untouched.ts': ['/p/b.test.ts'],
+    });
   });
 });

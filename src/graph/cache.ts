@@ -8,6 +8,7 @@ import {
   existsSync,
 } from 'node:fs';
 import path from 'node:path';
+import { toCanonicalPath } from './normalize.js';
 
 const GRAPH_FILE = 'graph.json';
 
@@ -55,6 +56,55 @@ function isUnderRootDir(filePath: string, rootDir: string): boolean {
   // Cache paths are Vite-normalized (always forward slashes), so use '/' not path.sep
   const rootPrefix = rootDir.endsWith('/') ? rootDir : rootDir + '/';
   return filePath === rootDir || filePath.startsWith(rootPrefix);
+}
+
+/**
+ * Build the in-memory reverse map from a raw source→tests object, canonicalizing
+ * every key and value (toCanonicalPath) and confining entries to the
+ * already-canonicalized rootDir. Canonicalizing on LOAD is what lets a cache
+ * written before canonicalization existed — or through a different path alias
+ * (macOS /var vs /private/var, a symlinked project root) — converge with
+ * today's canonical graph keys instead of silently orphaning. Distinct raw
+ * keys that canonicalize to the same path are merged, not overwritten.
+ * Shared by the v2 load path and the v1 migration path.
+ *
+ * Realpath-storm avoidance: `saveCacheSync` writes canonical paths (the reporter
+ * + mergeRuntimeEdges operate on canonical paths), so any entry already prefixed
+ * by `canonicalRoot + '/'` was written canonically by this plugin and is trusted
+ * as-is — skipping a `toCanonicalPath` (hence a `realpathSync` syscall) per key
+ * AND per value on every cache load. INVARIANT: prefix-matching entries are
+ * already canonical. Entries written by an older version or through a different
+ * alias (e.g. `/var` vs `/private/var`) do NOT match the prefix and still get
+ * canonicalized, so the alias-convergence guarantee is preserved. A stale entry
+ * that somehow slips through the prefix trusted-as-is simply orphans (misses its
+ * graph key) and self-heals on the next full-suite run that re-records it.
+ */
+function toConfinedReverseMap(
+  rawMap: Record<string, string[]>,
+  canonicalRoot: string,
+): Map<string, Set<string>> {
+  const rootPrefix = canonicalRoot.endsWith('/') ? canonicalRoot : canonicalRoot + '/';
+  // Paths already under the canonical root were written canonically on save →
+  // trust them; only alias/legacy paths pay the realpath cost.
+  const canonicalize = (p: string): string =>
+    p.startsWith(rootPrefix) ? p : toCanonicalPath(p);
+
+  const reverse = new Map<string, Set<string>>();
+  for (const [file, tests] of Object.entries(rawMap)) {
+    const canonicalFile = canonicalize(file);
+    if (!isUnderRootDir(canonicalFile, canonicalRoot)) continue;
+    const confinedTests = tests
+      .map((t) => canonicalize(t))
+      .filter((t) => isUnderRootDir(t, canonicalRoot));
+    if (confinedTests.length === 0) continue;
+    const existing = reverse.get(canonicalFile);
+    if (existing) {
+      for (const t of confinedTests) existing.add(t);
+    } else {
+      reverse.set(canonicalFile, new Set(confinedTests));
+    }
+  }
+  return reverse;
 }
 
 /**
@@ -107,6 +157,10 @@ export function loadCachedReverseMap(
 ): { reverse: Map<string, Set<string>>; hit: boolean } {
   cleanupOrphanedTmp(cacheDir);
 
+  // Canonicalize the confinement boundary itself; keys/values are
+  // canonicalized entry-by-entry in toConfinedReverseMap.
+  const canonicalRoot = toCanonicalPath(rootDir);
+
   const cachePath = path.join(cacheDir, GRAPH_FILE);
   let raw: string;
   try {
@@ -138,14 +192,7 @@ export function loadCachedReverseMap(
       return { reverse: new Map(), hit: false };
     }
 
-    const reverse = new Map<string, Set<string>>();
-    for (const [file, tests] of Object.entries(reverseMapRaw)) {
-      if (!isUnderRootDir(file, rootDir)) continue;
-      const confinedTests = (tests as string[]).filter((t) => isUnderRootDir(t, rootDir));
-      if (confinedTests.length > 0) {
-        reverse.set(file, new Set(confinedTests));
-      }
-    }
+    const reverse = toConfinedReverseMap(reverseMapRaw, canonicalRoot);
 
     if (verbose) console.warn(`[vitest-affected] v2 cache hit — ${reverse.size} entries`);
     return { reverse, hit: true };
@@ -160,14 +207,7 @@ export function loadCachedReverseMap(
     }
 
     // Migrate v1 runtimeEdges → v2 reverse map
-    const reverse = new Map<string, Set<string>>();
-    for (const [file, tests] of Object.entries(runtimeEdges)) {
-      if (!isUnderRootDir(file, rootDir)) continue;
-      const confinedTests = (tests as string[]).filter((t) => isUnderRootDir(t, rootDir));
-      if (confinedTests.length > 0) {
-        reverse.set(file, new Set(confinedTests));
-      }
-    }
+    const reverse = toConfinedReverseMap(runtimeEdges, canonicalRoot);
 
     if (verbose) console.warn(`[vitest-affected] v1→v2 migration — ${reverse.size} entries`);
     return { reverse, hit: true };
@@ -181,6 +221,11 @@ export function loadCachedReverseMap(
 /**
  * Persist a reverse map to disk in v2 format.
  * Atomic write: temp file → renameSync.
+ *
+ * Keys/values are written as given: in the plugin's flow they arrive already
+ * canonicalized (reporter + mergeRuntimeEdges operate on canonical paths), and
+ * loadCachedReverseMap canonicalizes on read anyway — so save-side
+ * canonicalization would be redundant work on every test run's hot path.
  */
 export function saveCacheSync(
   cacheDir: string,
