@@ -1,3 +1,4 @@
+<!-- ARCHIVED 2026-07-04 (reliability-v1 bead-refine r2): IMPLEMENTED. Verified fully landed in src/changed-files.ts + plugin.ts wiring + test/changed-files.test.ts + README; bead va-1ij.4 builds on this landed code. -->
 # Plan: Changed File Filtering in `vitest-affected`
 
 **Date:** 2026-03-11  

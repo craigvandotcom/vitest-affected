@@ -1,3 +1,4 @@
+<!-- ARCHIVED 2026-07-04: misplaced content — this is an agent-compounds command plan (prompt-enhance), not a vitest-affected plan. Kept for reference only. -->
 # Plan: Create `prompt-enhance` Command
 
 ## Context

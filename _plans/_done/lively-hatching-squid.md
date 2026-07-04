@@ -1,3 +1,4 @@
+<!-- ARCHIVED 2026-07-04 (reliability-v1 bead-refine): SUPERSEDED. The runtime-first architecture shipped (importDurations reverse map, v2 cache); the full deletion of oxc-parser/oxc-resolver/delta-parse proposed here was deliberately NOT taken — delta-parse is retained by design (CLAUDE.md Key Technical Decisions) and Track-2 beads va-woi.1/va-woi.2 invest in it. Do not implement from this document. -->
 # Runtime-First Architecture Refactor
 
 ## Context
