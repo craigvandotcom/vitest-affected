@@ -4,6 +4,7 @@ import {
   matchesAnyRule,
   toRepoRelative,
 } from '../src/changed-files.js';
+import { bfsAffectedTests } from '../src/selector.js';
 
 const ROOT = '/proj';
 
@@ -114,14 +115,111 @@ describe('filterRelevantChangedFiles', () => {
   });
 });
 
+describe('filterRelevantChangedFiles — graphMembership override (CSS relevance fix)', () => {
+  test('changed .css present as a reverse-map key survives the filter', () => {
+    const cssPath = abs('src/button.module.css');
+    const reverse = new Map<string, Set<string>>([
+      [cssPath, new Set([abs('src/button.test.ts')])],
+    ]);
+    const r = call(
+      { changed: [cssPath, abs('src/other.ts')] },
+      { graphMembership: reverse },
+    );
+    expect(r.changed).toEqual([cssPath, abs('src/other.ts')]);
+    expect(r.ignored).toEqual([]);
+  });
+
+  test('changed .css NOT in the map is still filtered (conservative default preserved)', () => {
+    const cssPath = abs('src/untracked.css');
+    const reverse = new Map<string, Set<string>>([
+      [abs('src/button.module.css'), new Set([abs('src/button.test.ts')])],
+    ]);
+    const r = call(
+      { changed: [cssPath] },
+      { graphMembership: reverse },
+    );
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([cssPath]);
+  });
+
+  test('deleted asset present as a reverse-map key survives the filter', () => {
+    const cssPath = abs('src/removed.module.css');
+    const reverse = new Map<string, Set<string>>([
+      [cssPath, new Set([abs('src/removed.test.ts')])],
+    ]);
+    const r = call(
+      { changed: [], deleted: [cssPath] },
+      { graphMembership: reverse },
+    );
+    expect(r.deleted).toEqual([cssPath]);
+    expect(r.ignored).toEqual([]);
+  });
+
+  test('without graphMembership option, a graph-tracked .css is still filtered (no regression / opt-in)', () => {
+    const cssPath = abs('src/button.module.css');
+    const r = call({ changed: [cssPath] });
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([cssPath]);
+  });
+
+  test('explicit ignoreChangedFiles rule still wins over graph membership', () => {
+    const cssPath = abs('src/ignored-dir/button.module.css');
+    const reverse = new Map<string, Set<string>>([
+      [cssPath, new Set([abs('src/button.test.ts')])],
+    ]);
+    const r = call(
+      { changed: [cssPath] },
+      { graphMembership: reverse, ignoreChangedFiles: ['src/ignored-dir/'] },
+    );
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([cssPath]);
+  });
+
+  test('fixture-level: a CSS edit selects its dependent test with a warm cache (filter → BFS composition)', () => {
+    // Simulates a warm cache: the runtime reporter previously recorded a CSS
+    // edge (importDurations carries no extension filter), so the reverse map
+    // already has the CSS module as a key pointing at its dependent test.
+    const cssPath = abs('src/components/Button/button.module.css');
+    const testPath = abs('src/components/Button/button.test.ts');
+    const reverse = new Map<string, Set<string>>([
+      [cssPath, new Set([testPath])],
+    ]);
+
+    // 1. Relevance filter: without graphMembership, the CSS change would be
+    // dropped before BFS ever runs (the bug this bead fixes).
+    const filtered = call({ changed: [cssPath] }, { graphMembership: reverse });
+    expect(filtered.changed).toEqual([cssPath]);
+
+    // 2. BFS over the (warm) reverse graph using the surviving seed.
+    const affected = bfsAffectedTests(
+      filtered.changed,
+      reverse,
+      (f) => f === testPath,
+    );
+    expect(affected).toEqual([testPath]);
+  });
+});
+
 describe('toRepoRelative', () => {
   test('strips rootDir prefix and normalizes slashes', () => {
     expect(toRepoRelative('/proj/src/a.ts', '/proj')).toBe('src/a.ts');
     expect(toRepoRelative('C:\\proj\\src\\a.ts', 'C:/proj')).toBe('src/a.ts');
   });
 
-  test('returns the path unchanged when not under rootDir', () => {
-    expect(toRepoRelative('/other/a.ts', '/proj')).toBe('/other/a.ts');
+  test('returns an honest ../-prefixed relative for POSIX paths above rootDir', () => {
+    expect(toRepoRelative('/other/a.ts', '/proj')).toBe('../other/a.ts');
+    expect(toRepoRelative('/repo/vitest.workspace.ts', '/repo/packages/app')).toBe(
+      '../../vitest.workspace.ts',
+    );
+  });
+
+  test('an above-rootDir file becomes matchable by a ../-prefixed rule', () => {
+    const rel = toRepoRelative('/repo/shared/fixtures/data.json', '/repo/packages/app');
+    expect(matchesAnyRule(rel, ['../../shared/fixtures/'])).toBe(true);
+  });
+
+  test('non-POSIX-absolute inputs above root are returned unchanged', () => {
+    expect(toRepoRelative('C:/other/a.ts', 'C:/proj')).toBe('C:/other/a.ts');
   });
 });
 
