@@ -11,6 +11,7 @@ import { normalizeModuleId } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTests } from './selector.js';
 import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
+import { mergeRuntimeEdges } from './runtime-merge.js';
 
 /**
  * Narrow shape of the Vitest 4 `experimental.importDurations` config block.
@@ -27,6 +28,14 @@ interface ExperimentalImportDurations {
 
 export interface VitestAffectedOptions {
   disabled?: boolean;
+  /**
+   * Shadow-verification mode: run the FULL decision pipeline but never mutate
+   * `project.config.include`, so a single `vitest run` yields ground truth (all
+   * tests) alongside the would-be selection in the stats line. The env var
+   * `VITEST_AFFECTED_SHADOW=1` activates shadow regardless of this option.
+   * `VITEST_AFFECTED_DISABLED=1` still wins over shadow (fully inert).
+   */
+  shadow?: boolean;
   ref?: string;
   changedFiles?: string[];
   verbose?: boolean;
@@ -190,13 +199,31 @@ function writeStatsLine(
     graphSize?: number;
     cacheHit?: boolean;
     durationMs?: number;
+    selectedFiles?: string[] | null;
   },
   verbose = false,
+  shadow = false,
 ): void {
   try {
     const filePath = path.isAbsolute(statsFile) ? statsFile : path.resolve(rootDir, statsFile);
     mkdirSync(path.dirname(filePath), { recursive: true });
-    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...data });
+    // Strip selectedFiles from the base payload; it only surfaces under shadow.
+    const { selectedFiles, ...rest } = data;
+    let payload: Record<string, unknown>;
+    if (shadow) {
+      // Remap the action into the shadow namespace, retaining the ORIGINAL
+      // reason so downstream fallback-frequency segmentation still works.
+      // shadow-selective carries the would-be selection; shadow-full-suite
+      // carries null (meaning "all tests").
+      const shadowAction =
+        rest.action === 'selective' ? 'shadow-selective' : 'shadow-full-suite';
+      const shadowSelected =
+        rest.action === 'selective' ? (selectedFiles ?? []) : null;
+      payload = { ...rest, action: shadowAction, selectedFiles: shadowSelected };
+    } else {
+      payload = { ...rest };
+    }
+    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...payload });
     appendFileSync(filePath, line + '\n');
   } catch (err) {
     // Best-effort — never crash on stats writing
@@ -217,14 +244,28 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
     name: 'vitest-affected',
 
     async configureVitest({ vitest, project }) {
-      try {
-        // 1. Env override
-        let { disabled = false } = options;
-        if (process.env.VITEST_AFFECTED_DISABLED === '1') {
-          disabled = true;
-        }
+      // 1. Env overrides + mode resolution — hoisted ABOVE the try so the
+      // catch-all and every early return can emit a stats line.
+      let { disabled = false } = options;
+      if (process.env.VITEST_AFFECTED_DISABLED === '1') {
+        disabled = true;
+      }
+      let { shadow = false } = options;
+      if (process.env.VITEST_AFFECTED_SHADOW === '1') {
+        shadow = true;
+      }
+      const verbose = options.verbose ?? false;
+      const startMs = Date.now();
 
-        // 2. Disabled check
+      // Stats path: the env override wins over config so historical consumer
+      // configs cannot starve emission. Resolved here (before rootDir is known)
+      // so the catch-all can still emit; rootDir starts at cwd and is refined
+      // once vitest.config.root resolves.
+      const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
+      let statsRootDir = process.cwd();
+
+      try {
+        // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
         if (disabled) {
           return;
         }
@@ -234,6 +275,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, statsRootDir, {
+            action: 'full-suite', reason: 'workspace',
+            durationMs: Date.now() - startMs,
+          }, verbose, shadow);
           return;
         }
 
@@ -247,13 +292,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Unexpected config shape — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, statsRootDir, {
+            action: 'full-suite', reason: 'config-shape',
+            durationMs: Date.now() - startMs,
+          }, verbose, shadow);
           return;
         }
 
         const rootDir = vitest.config.root;
-        const verbose = options.verbose ?? false;
-        const statsFile = options.statsFile;
-        const startMs = Date.now();
+        statsRootDir = rootDir;
 
         // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
         // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
@@ -288,28 +335,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const { reporter, setRootDir } = createRuntimeReporter((edges) => {
           if (!cacheDir) return;
           try {
-            // Per-test overwrite: collect which tests ran this cycle, then
-            // remove their stale edges before adding new ones. This ensures
-            // removed imports are reflected (not just accumulated forever).
-            const ranTests = new Set<string>();
-            for (const tests of edges.values()) {
-              for (const t of tests) ranTests.add(t);
-            }
-            // Strip stale edges for tests that ran
-            for (const [file, tests] of reverse) {
-              for (const t of ranTests) tests.delete(t);
-              if (tests.size === 0) reverse.delete(file);
-            }
-            // Add fresh edges from this run
-            for (const [file, tests] of edges) {
-              if (!reverse.has(file)) {
-                reverse.set(file, new Set(tests));
-              } else {
-                for (const t of tests) {
-                  reverse.get(file)!.add(t);
-                }
-              }
-            }
+            // Per-test overwrite for every test that ran this cycle: strip
+            // stale edges, merge fresh ones (so removed imports are reflected,
+            // not accumulated forever). Persistence stays here at the call-site.
+            reverse = mergeRuntimeEdges(reverse, edges, 'all');
             saveCacheSync(cacheDir, reverse);
           } catch {
             // Best-effort: runtime edge persistence failed — cache will be stale next run
@@ -381,7 +410,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               action: 'full-suite', reason: 'full-suite-trigger',
               changedFiles: changed.length, deletedFiles: deleted.length,
               graphSize: reverse.size, durationMs: Date.now() - startMs,
-            }, verbose);
+            }, verbose, shadow);
             return;
           }
         }
@@ -416,7 +445,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
             graphSize: reverse.size,
             durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -441,7 +470,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -461,7 +490,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -478,7 +507,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             ignoredFiles: ignoredCount,
             graphSize: 0, cacheHit: false,
             durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -492,6 +521,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No include patterns configured — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'no-include-patterns',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+          }, verbose, shadow);
           return;
         }
 
@@ -506,6 +541,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No test files matched include patterns — running full suite',
           );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'no-test-files',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
+            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+          }, verbose, shadow);
           return;
         }
 
@@ -521,14 +562,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // 14. Threshold check
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
-            project.config.include = [];
+            // Shadow guards the mutation site: compute the decision, never apply it.
+            if (!shadow) project.config.include = [];
             if (statsFile) writeStatsLine(statsFile, rootDir, {
               action: 'selective', reason: 'allow-no-tests',
               changedFiles: changed.length, deletedFiles: deleted.length,
               ignoredFiles: ignoredCount,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            }, verbose);
+              selectedFiles: [],
+            }, verbose, shadow);
             return;
           }
           console.warn(
@@ -540,7 +583,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -556,7 +599,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             ignoredFiles: ignoredCount,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
           return;
         }
 
@@ -583,14 +626,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 17. Apply results
         if (validTests.length > 0) {
-          project.config.include = validTests;
+          // Shadow guards the mutation site: compute the selection, never apply it.
+          if (!shadow) project.config.include = validTests;
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'selective',
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose);
+            selectedFiles: validTests,
+          }, verbose, shadow);
         } else if (statsFile) {
           writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'no-valid-tests-on-disk',
@@ -598,13 +643,18 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose);
+          }, verbose, shadow);
         }
       } catch (err) {
-        // 18. Catch-all: safety invariant — never crash, never skip silently
+        // 18. Catch-all: safety invariant — never crash, never skip silently.
+        // Stats path was resolved above the try so this exit still emits.
         console.warn(
           `[vitest-affected] Unexpected error — running full suite: ${err instanceof Error ? err.message : String(err)}`,
         );
+        if (statsFile) writeStatsLine(statsFile, statsRootDir, {
+          action: 'full-suite', reason: 'error',
+          durationMs: Date.now() - startMs,
+        }, verbose, shadow);
       }
     },
   };
