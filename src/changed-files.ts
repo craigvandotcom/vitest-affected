@@ -101,9 +101,21 @@ export function matchesAnyRule(rel: string, rules: Array<string | RegExp>): bool
 export function toRepoRelative(filePath: string, rootDir: string): string {
   const normalized = toCanonicalPath(filePath);
   const root = toCanonicalPath(rootDir);
-  return normalized.startsWith(root + '/')
-    ? normalized.slice(root.length + 1)
-    : normalized;
+  if (normalized.startsWith(root + '/')) {
+    return normalized.slice(root.length + 1);
+  }
+  // Above-rootDir files (gitRoot !== rootDir topologies: git reports paths
+  // for the whole repo while rules are written rootDir-relative) get an
+  // honest '../'-prefixed relative path instead of the raw absolute — an
+  // absolute string can never match a string/prefix rule, which silently
+  // disabled fullSuiteTriggers/ignoreChangedFiles for exactly the files the
+  // escape hatch exists for. Only computed when both sides are true POSIX
+  // absolutes; anything else (e.g. a Windows drive path examined on POSIX)
+  // is returned unchanged, preserving prior behavior.
+  if (normalized.startsWith('/') && root.startsWith('/')) {
+    return path.posix.relative(root, normalized);
+  }
+  return normalized;
 }
 
 function isRelevant(

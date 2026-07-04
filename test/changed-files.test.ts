@@ -206,8 +206,20 @@ describe('toRepoRelative', () => {
     expect(toRepoRelative('C:\\proj\\src\\a.ts', 'C:/proj')).toBe('src/a.ts');
   });
 
-  test('returns the path unchanged when not under rootDir', () => {
-    expect(toRepoRelative('/other/a.ts', '/proj')).toBe('/other/a.ts');
+  test('returns an honest ../-prefixed relative for POSIX paths above rootDir', () => {
+    expect(toRepoRelative('/other/a.ts', '/proj')).toBe('../other/a.ts');
+    expect(toRepoRelative('/repo/vitest.workspace.ts', '/repo/packages/app')).toBe(
+      '../../vitest.workspace.ts',
+    );
+  });
+
+  test('an above-rootDir file becomes matchable by a ../-prefixed rule', () => {
+    const rel = toRepoRelative('/repo/shared/fixtures/data.json', '/repo/packages/app');
+    expect(matchesAnyRule(rel, ['../../shared/fixtures/'])).toBe(true);
+  });
+
+  test('non-POSIX-absolute inputs above root are returned unchanged', () => {
+    expect(toRepoRelative('C:/other/a.ts', 'C:/proj')).toBe('C:/other/a.ts');
   });
 });
 
