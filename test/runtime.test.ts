@@ -8,13 +8,16 @@ import {
   writeFileSync,
   readFileSync,
   realpathSync,
+  symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execa } from 'execa';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
 import { createRuntimeReporter, vitestAffected } from '../src/plugin.js';
 import { saveCacheSync, loadCachedReverseMap } from '../src/graph/cache.js';
 import * as cacheModule from '../src/graph/cache.js';
+import { normalizeModuleId } from '../src/graph/normalize.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,6 +48,113 @@ function writeProjectFiles(
     mkdirSync(path.dirname(abs), { recursive: true });
     writeFileSync(abs, content, 'utf-8');
   }
+}
+
+/** One record per test module: its moduleId and the raw importDurations keys observed. */
+interface DiagnosticRecord {
+  moduleId: string;
+  importedModules: string[];
+}
+
+/**
+ * Spawns a REAL nested `vitest run` (via execa/npx — same pattern as
+ * test/integration.test.ts) against a tiny fixture project, using a
+ * self-contained custom reporter (embedded directly in the generated
+ * vitest.config.ts) that dumps `testModule.diagnostic().importDurations`
+ * to a JSON file. This observes Vitest's OWN import-tracking behavior
+ * directly — not our reporter's filtering logic (already covered by the
+ * mock-based scenarios above) — which is exactly what's in question for
+ * the vi.mock/importActual boundary: does the real dep module actually
+ * get loaded (and therefore show up in importDurations) or not.
+ *
+ * `mockDeclaration` is spliced verbatim into the generated test file, after
+ * the test imports `getDep` from a `service.ts` that statically imports
+ * `dep.ts` — the test file itself never imports `dep` directly, matching
+ * the real-world "factory vi.mock decouples the test from the real module"
+ * pattern (mock declared relative to a consumer, not statically imported).
+ */
+async function runDiagnosticFixture(
+  mockDeclaration: string,
+): Promise<{ depPath: string; records: DiagnosticRecord[] }> {
+  const tmpDir = makeTmpDir();
+  tempDirs.push(tmpDir);
+
+  const projectRoot = path.resolve(import.meta.dirname, '..');
+  symlinkSync(
+    path.join(projectRoot, 'node_modules'),
+    path.join(tmpDir, 'node_modules'),
+  );
+
+  const outputFile = path.join(tmpDir, 'diagnostic.json');
+  const depPath = path.join(tmpDir, 'src', 'dep.ts');
+
+  writeProjectFiles(tmpDir, {
+    'package.json': '{"type":"module"}\n',
+    'src/dep.ts': 'export const dep = "real";\n',
+    'src/service.ts':
+      'import { dep } from "./dep";\nexport function getDep(): string {\n  return dep;\n}\n',
+    'tests/consumer.test.ts': [
+      "import { describe, test, expect, vi } from 'vitest';",
+      "import { getDep } from '../src/service';",
+      '',
+      mockDeclaration,
+      '',
+      "describe('mock boundary', () => {",
+      "  test('resolves getDep()', () => {",
+      "    expect(typeof getDep()).toBe('string');",
+      '  });',
+      '});',
+      '',
+    ].join('\n'),
+    'vitest.config.ts': `import { defineConfig } from 'vitest/config';
+import { writeFileSync } from 'node:fs';
+
+const records = [];
+
+export default defineConfig({
+  test: {
+    include: ['tests/**/*.test.ts'],
+    reporters: [
+      'default',
+      {
+        onTestModuleEnd(testModule) {
+          const diag = testModule.diagnostic();
+          records.push({
+            moduleId: testModule.moduleId,
+            importedModules: Object.keys(diag.importDurations ?? {}),
+          });
+        },
+        onTestRunEnd() {
+          writeFileSync(${JSON.stringify(outputFile)}, JSON.stringify(records, null, 2));
+        },
+      },
+    ],
+  },
+});
+`,
+  });
+
+  const result = await execa('npx', ['vitest', 'run'], {
+    cwd: tmpDir,
+    reject: false,
+  });
+
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Nested vitest run failed (exit ${String(result.exitCode)}).\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    );
+  }
+
+  const records = JSON.parse(readFileSync(outputFile, 'utf-8')) as DiagnosticRecord[];
+
+  return { depPath, records };
+}
+
+/** Whether any test module's importDurations include the given (real) file path. */
+function hasImportEdgeTo(records: DiagnosticRecord[], targetAbsolutePath: string): boolean {
+  return records.some((r) =>
+    r.importedModules.some((m) => normalizeModuleId(m) === targetAbsolutePath),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -461,4 +571,46 @@ describe('Cache persistence: ENOENT on fresh install', () => {
     expect(parsed.version).toBe(2);
     expect(typeof parsed.reverseMap).toBe('object');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 11: vi.mock/importActual BY-DESIGN boundary (va-1ij.5)
+//
+// VERDICT: fully-mocked modules are intentionally edge-free; partial mocks
+// via importActual are runtime-tracked. See src/runtime-merge.ts module
+// docstring for the full rationale. These two cases pin exactly that
+// boundary against Vitest's real importDurations diagnostic (not our own
+// filtering logic, which is agnostic to mocks — it just processes whatever
+// importDurations reports).
+// ---------------------------------------------------------------------------
+
+describe('vi.mock / vi.importActual boundary: BY-DESIGN edge presence', () => {
+  test(
+    'factory vi.mock with no static import of dep: dep.ts is NEVER loaded, so it has NO edge (by design)',
+    async () => {
+      const { depPath, records } = await runDiagnosticFixture(
+        "vi.mock('../src/dep', () => ({ dep: 'mocked' }));",
+      );
+
+      expect(hasImportEdgeTo(records, depPath)).toBe(false);
+    },
+    30_000,
+  );
+
+  test(
+    'factory using vi.importActual loads the real dep.ts: it DOES have an edge (runtime coverage works)',
+    async () => {
+      const { depPath, records } = await runDiagnosticFixture(
+        [
+          "vi.mock('../src/dep', async () => {",
+          "  const actual = await vi.importActual('../src/dep');",
+          "  return { ...actual, dep: `${actual.dep}-partial` };",
+          '});',
+        ].join('\n'),
+      );
+
+      expect(hasImportEdgeTo(records, depPath)).toBe(true);
+    },
+    30_000,
+  );
 });
