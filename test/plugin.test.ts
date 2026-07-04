@@ -68,11 +68,12 @@ function setupOrphanFixture(): { tmpDir: string; orphanPath: string } {
  * Create a mock vitest/project context for direct plugin testing.
  * Returns the project.config object so tests can assert mutations.
  */
-function createMockContext(rootDir: string) {
+function createMockContext(rootDir: string, globalSetup?: string | string[]) {
   const projectConfig = {
     include: ['tests/**/*.test.ts'],
     exclude: [] as string[],
     setupFiles: [] as string[],
+    globalSetup,
   };
   const mockProject = { config: projectConfig };
   const mockVitest = {
@@ -210,6 +211,97 @@ describe('fullSuiteTriggers option', () => {
       tmpDir,
     );
     expect(projectConfig.include).toEqual([]);
+  });
+});
+
+describe('globalSetup full-suite trigger', () => {
+  /** Run the configureVitest hook against a mock context whose project.config.globalSetup is set. */
+  async function run(
+    plugin: ReturnType<typeof vitestAffected>,
+    tmpDir: string,
+    globalSetup: string | string[],
+  ) {
+    const { vitest, project, projectConfig } = createMockContext(tmpDir, globalSetup);
+    const hook = (plugin as Record<string, unknown>).configureVitest as (
+      ctx: { vitest: typeof vitest; project: typeof project },
+    ) => Promise<void>;
+    await hook({ vitest, project });
+    return projectConfig;
+  }
+
+  function lastStatsReason(statsFile: string): string {
+    const lines = readFileSync(statsFile, 'utf-8').trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]).reason;
+  }
+
+  test('a changed globalSetup file (string form) forces full suite, reason=global-setup-change', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const globalSetupPath = path.join(tmpDir, 'global-setup.ts');
+    writeFileSync(globalSetupPath, 'export function setup() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({ changedFiles: [globalSetupPath], cache: true, statsFile }),
+      tmpDir,
+      globalSetupPath,
+    );
+
+    // Full suite: include is left untouched (never narrowed to a subset).
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('global-setup-change');
+  });
+
+  test('a changed globalSetup file (array form) forces full suite, reason=global-setup-change', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const globalSetupA = path.join(tmpDir, 'global-setup-a.ts');
+    const globalSetupB = path.join(tmpDir, 'global-setup-b.ts');
+    writeFileSync(globalSetupA, 'export function setupA() {}\n');
+    writeFileSync(globalSetupB, 'export function setupB() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({ changedFiles: [globalSetupB], cache: true, statsFile }),
+      tmpDir,
+      [globalSetupA, globalSetupB],
+    );
+
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('global-setup-change');
+  });
+
+  test('a globalSetup declared as a relative path still matches the resolved absolute changed file', async () => {
+    // Regression guard for the setupFiles relative-path bug from 0.4.1: a
+    // resolved config's globalSetup can be relative to rootDir. If the plugin
+    // compared it as-is against absolute changed-file paths, it would never
+    // match and the trigger would silently miss.
+    const { tmpDir } = setupOrphanFixture();
+    const globalSetupPath = path.join(tmpDir, 'global-setup.ts');
+    writeFileSync(globalSetupPath, 'export function setup() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({ changedFiles: [globalSetupPath], cache: true, statsFile }),
+      tmpDir,
+      'global-setup.ts', // relative to rootDir
+    );
+
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('global-setup-change');
+  });
+
+  test('a change unrelated to globalSetup does not fire the trigger', async () => {
+    const { tmpDir, orphanPath } = setupOrphanFixture();
+    const globalSetupPath = path.join(tmpDir, 'global-setup.ts');
+    writeFileSync(globalSetupPath, 'export function setup() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    await run(
+      vitestAffected({ changedFiles: [orphanPath], cache: true, statsFile }),
+      tmpDir,
+      globalSetupPath,
+    );
+
+    expect(lastStatsReason(statsFile)).not.toBe('global-setup-change');
   });
 });
 

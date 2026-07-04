@@ -508,6 +508,29 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
+        // globalSetup is a sibling of setupFiles on the resolved config — same
+        // string | string[] shape, same relative-path-resolution requirement,
+        // same "invisible to the import graph" reasoning. Mirrored exactly.
+        const globalSetupRaw = project.config.globalSetup ?? [];
+        const globalSetupSet = new Set(
+          (Array.isArray(globalSetupRaw) ? globalSetupRaw : [globalSetupRaw]).map(
+            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+          ),
+        );
+        const hasGlobalSetupChange = allChangedFiles.some((f) => globalSetupSet.has(f));
+        if (hasGlobalSetupChange) {
+          console.warn(
+            '[vitest-affected] Global setup file change detected — running full suite',
+          );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'global-setup-change',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            ignoredFiles: ignoredCount,
+            graphSize: reverse.size, durationMs: Date.now() - startMs,
+          }, verbose, shadow);
+          return;
+        }
+
         // 10. Cache miss → full suite (first run collects runtime data)
         if (!cacheHit) {
           if (verbose) {
