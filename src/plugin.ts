@@ -377,6 +377,30 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       // path-identity boundary every other path in the plugin routes through.
       let statsRootDir = toCanonicalPath(process.cwd());
 
+      // Shared stats-emission closure — replaces every `if (statsFile)
+      // writeStatsLine(...)` call site below. Reads `statsRootDir` (mutable —
+      // starts at cwd, reassigned to the canonical rootDir once resolved at
+      // step 4) so early exits and later ones both get the right root without
+      // duplicating the two-phase logic per call site. `shadowFlag` defaults
+      // to the ambient `shadow` mode but the post-run reporter diagnostics
+      // (heartbeat lines) pass `false` explicitly — they are never remapped
+      // into the shadow-selective/shadow-full-suite namespace.
+      function emitStats(
+        action: string,
+        reason?: string,
+        extra?: Record<string, unknown>,
+        shadowFlag: boolean = shadow,
+      ): void {
+        if (!statsFile) return;
+        writeStatsLine(
+          statsFile,
+          statsRootDir,
+          { action, reason, ...extra },
+          verbose,
+          shadowFlag,
+        );
+      }
+
       try {
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
         if (disabled) {
@@ -388,10 +412,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, statsRootDir, {
-            action: 'full-suite', reason: 'workspace',
+          emitStats('full-suite', 'workspace', {
             durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -405,10 +428,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Unexpected config shape — running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, statsRootDir, {
-            action: 'full-suite', reason: 'config-shape',
+          emitStats('full-suite', 'config-shape', {
             durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -450,10 +472,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
             );
-            if (statsFile) writeStatsLine(statsFile, rootDir, {
-              action: 'full-suite', reason: 'import-durations-shape',
+            emitStats('full-suite', 'import-durations-shape', {
               graphSize: reverse.size, durationMs: Date.now() - startMs,
-            }, verbose, shadow);
+            });
             return;
           }
         }
@@ -511,19 +532,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
                     "that Vitest's importDurations collection is enabled and its API is intact.",
                 );
               }
-              if (statsFile) writeStatsLine(statsFile, rootDir, {
-                action: 'heartbeat', reason: 'zero-edges',
-              }, verbose, false);
+              emitStats('heartbeat', 'zero-edges', undefined, false);
             },
             // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
             onSelectionMismatch: (strays) => {
               console.warn(
                 `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
               );
-              if (statsFile) writeStatsLine(statsFile, rootDir, {
-                action: 'heartbeat', reason: 'selection-mismatch',
+              emitStats('heartbeat', 'selection-mismatch', {
                 strayCount: strays.length,
-              }, verbose, false);
+              }, false);
             },
           },
         );
@@ -590,11 +608,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               `[vitest-affected] Full-suite trigger matched (${toRepoRelative(triggerHit, rootDir)}) — running full suite`,
             );
-            if (statsFile) writeStatsLine(statsFile, rootDir, {
-              action: 'full-suite', reason: 'full-suite-trigger',
+            emitStats('full-suite', 'full-suite-trigger', {
               changedFiles: changed.length, deletedFiles: deleted.length,
               graphSize: reverse.size, durationMs: Date.now() - startMs,
-            }, verbose, shadow);
+            });
             return;
           }
         }
@@ -608,42 +625,52 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // matching 6a's behavior.
         const rawChangedForSetup = [...changed, ...deleted];
 
-        const setupFilesRaw = project.config.setupFiles ?? [];
-        const setupFileSet = new Set(
-          (Array.isArray(setupFilesRaw) ? setupFilesRaw : [setupFilesRaw]).map(
-            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-          ),
-        );
-        if (rawChangedForSetup.some((f) => setupFileSet.has(f))) {
-          console.warn(
-            '[vitest-affected] Setup file change detected — running full suite',
+        // Shared twin-block helper: resolve a `string | string[]` config
+        // field (setupFiles/globalSetup) into a canonicalized Set, check it
+        // against the RAW changed+deleted set, and on a hit warn + emit the
+        // full-suite stats line. Returns true so the caller can early-return.
+        function checkFullSuiteConfigField(
+          rawField: string | string[] | undefined,
+          warnMessage: string,
+          reason: string,
+        ): boolean {
+          const fieldRaw = rawField ?? [];
+          const fieldSet = new Set(
+            (Array.isArray(fieldRaw) ? fieldRaw : [fieldRaw]).map((f) =>
+              toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+            ),
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'setup-file-change',
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          if (rawChangedForSetup.some((f) => fieldSet.has(f))) {
+            console.warn(warnMessage);
+            emitStats('full-suite', reason, {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              graphSize: reverse.size, durationMs: Date.now() - startMs,
+            });
+            return true;
+          }
+          return false;
+        }
+
+        if (
+          checkFullSuiteConfigField(
+            project.config.setupFiles,
+            '[vitest-affected] Setup file change detected — running full suite',
+            'setup-file-change',
+          )
+        ) {
           return;
         }
 
         // globalSetup is a sibling of setupFiles on the resolved config — same
         // string | string[] shape, same relative-path-resolution requirement,
         // same "invisible to the import graph" reasoning. Mirrored exactly.
-        const globalSetupRaw = project.config.globalSetup ?? [];
-        const globalSetupSet = new Set(
-          (Array.isArray(globalSetupRaw) ? globalSetupRaw : [globalSetupRaw]).map(
-            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-          ),
-        );
-        if (rawChangedForSetup.some((f) => globalSetupSet.has(f))) {
-          console.warn(
+        if (
+          checkFullSuiteConfigField(
+            project.config.globalSetup,
             '[vitest-affected] Global setup file change detected — running full suite',
-          );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'global-setup-change',
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+            'global-setup-change',
+          )
+        ) {
           return;
         }
 
@@ -678,12 +705,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 7. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'no-changes',
+          emitStats('full-suite', 'no-changes', {
             changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
             graphSize: reverse.size,
             durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -703,12 +729,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Config file change detected — running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'config-change',
+          emitStats('full-suite', 'config-change', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -719,13 +744,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
             );
           }
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'cache-miss',
+          emitStats('full-suite', 'cache-miss', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: 0, cacheHit: false,
             durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -739,12 +763,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No include patterns configured — running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'no-include-patterns',
+          emitStats('full-suite', 'no-include-patterns', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -762,12 +785,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No test files matched include patterns — running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'no-test-files',
+          emitStats('full-suite', 'no-test-files', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -790,26 +812,24 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               // Vitest that runs everything on an empty include.
               setSelectedTests([]);
             }
-            if (statsFile) writeStatsLine(statsFile, rootDir, {
-              action: 'selective', reason: 'allow-no-tests',
+            emitStats('selective', 'allow-no-tests', {
               changedFiles: changed.length, deletedFiles: deleted.length,
               ignoredFiles: ignoredCount,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
               selectedFiles: [],
-            }, verbose, shadow);
+            });
             return;
           }
           console.warn(
             '[vitest-affected] No affected tests found — running full suite',
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'no-affected-tests',
+          emitStats('full-suite', 'no-affected-tests', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -819,13 +839,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
           );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'threshold-exceeded',
+          emitStats('full-suite', 'threshold-exceeded', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
           return;
         }
 
@@ -858,22 +877,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             // Record the selected set for the reporter's post-run self-verify.
             setSelectedTests(validTests);
           }
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'selective',
+          emitStats('selective', undefined, {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
             selectedFiles: validTests,
-          }, verbose, shadow);
-        } else if (statsFile) {
-          writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'no-valid-tests-on-disk',
+          });
+        } else {
+          emitStats('full-suite', 'no-valid-tests-on-disk', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
+          });
         }
       } catch (err) {
         // 18. Catch-all: safety invariant — never crash, never skip silently.
@@ -881,10 +898,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         console.warn(
           `[vitest-affected] Unexpected error — running full suite: ${err instanceof Error ? err.message : String(err)}`,
         );
-        if (statsFile) writeStatsLine(statsFile, statsRootDir, {
-          action: 'full-suite', reason: 'error',
+        emitStats('full-suite', 'error', {
           durationMs: Date.now() - startMs,
-        }, verbose, shadow);
+        });
       }
     },
   };
