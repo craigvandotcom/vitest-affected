@@ -210,9 +210,16 @@ export function classifyChannel(file: string): string {
  * silent all-full-suite walk is list-only degeneration in disguise — every
  * commit is miss-exempt, the miss-rate is vacuously 0, and the per-commit
  * BROKEN guard cannot catch it. The run must fail loudly instead.
+ *
+ * Carries the ledger's decision segmentation so the failure DIAGNOSIS can be
+ * written into the run dir (analysis.md) before the process exits — walk data
+ * is expensive (~320s/commit); diagnosing must never require a re-walk.
  */
 export class NoSelectiveDecisionsError extends Error {
-  constructor(okCommits: number) {
+  /** Ledger segmentation: '<status> [<action> (<reason>)]' → commit count. */
+  readonly segmentation: Record<string, number>;
+
+  constructor(okCommits: number, segmentation: Record<string, number> = {}) {
     super(
       `degeneration guard: 0 shadow-selective decisions across ${okCommits} ` +
         'ok commit(s) — an all-full-suite walk measures nothing (list-only ' +
@@ -220,7 +227,32 @@ export class NoSelectiveDecisionsError extends Error {
         'would be vacuously clean',
     );
     this.name = 'NoSelectiveDecisionsError';
+    this.segmentation = segmentation;
   }
+}
+
+/**
+ * Segment a ledger by terminal status and (for ok commits) decision
+ * action + reason — the degeneration-diagnosis table.
+ */
+export function segmentLedger(
+  entries: readonly LedgerEntry[],
+): Record<string, number> {
+  const seg: Record<string, number> = {};
+  for (const e of entries) {
+    let key: string;
+    if (e.status !== 'ok') {
+      key = e.status;
+    } else if (e.decision) {
+      key = `ok ${e.decision.action}${
+        e.decision.reason !== undefined ? ` (${e.decision.reason})` : ''
+      }`;
+    } else {
+      key = 'ok (no decision)';
+    }
+    seg[key] = (seg[key] ?? 0) + 1;
+  }
+  return seg;
 }
 
 /** Count ok commits whose shadow decision was selective. */
@@ -243,5 +275,5 @@ export function assertSelectiveDecisions(
 ): void {
   if (countSelectiveDecisions(entries) > 0) return;
   const okCommits = entries.filter((e) => e.status === 'ok').length;
-  throw new NoSelectiveDecisionsError(okCommits);
+  throw new NoSelectiveDecisionsError(okCommits, segmentLedger(entries));
 }

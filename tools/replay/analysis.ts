@@ -10,12 +10,14 @@
  *   - freshMap_C  = graphs/<sha>.json — the ground-truth full runtime edge map
  *     captured at C (the harness ran the full suite). Used for the REQUIRED set.
  *   - cacheBefore_C = the simulated live selective cache (see evolution.ts) —
- *     what a live plugin would have LOADED at C. Used to simulate the live
- *     selection. cacheAfter_C = mergeRuntimeEdges(cacheBefore_C, freshMap_C,
- *     scopeForDecision(decision_C)) threads into C+1. The harness never writes
- *     the live repo's cache — this evolution exists only in analysis memory.
+ *     what a live plugin would have LOADED at C. evolveStep yields both the
+ *     SIMULATED live selection at C (detection input AND — for selective /
+ *     cache-dependent decisions — the persistence scope; recorded
+ *     selectedFiles are never fed back, preserving the drift feedback loop)
+ *     and cacheAfter_C, which threads into C+1. The harness never writes the
+ *     live repo's cache — this evolution exists only in analysis memory.
  *   - misses_C (shadow-selective commits only) = required(freshMap_C, changed)
- *     minus simulateLiveSelection(cacheBefore_C, changed, tests(freshMap_C)).
+ *     minus the simulated live selection at C.
  *
  * DENOMINATOR & EXEMPTIONS (the honesty rules)
  *   - Miss-rates are computed over shadow-selective decisions ONLY. Designed
@@ -42,13 +44,12 @@ import path from 'node:path';
 import { execa } from 'execa';
 import type { ReverseMap } from '../../dist/index.js';
 import type { LedgerEntry } from './types.js';
-import { scopeForDecision, reconstructCacheEvolution } from './evolution.js';
+import { evolveStep } from './evolution.js';
 import {
-  simulateLiveSelection,
-  testsOf,
   detectStructuralMisses,
   detectOutcomeConfirmed,
   assertSelectiveDecisions,
+  NoSelectiveDecisionsError,
 } from './detector.js';
 import { renderReport } from './report.js';
 import type {
@@ -146,6 +147,8 @@ export interface FlakeCheckResult {
   flaky: string[];
   /** Whether a re-run was actually spawned. */
   reran: boolean;
+  /** True when this commit established the baseline (no prior outcomes). */
+  baseline: boolean;
 }
 
 /**
@@ -154,13 +157,28 @@ export interface FlakeCheckResult {
  * The re-runner is injected so tests never spawn vitest; production wiring
  * uses `spawnDisabledRerun` (plugin fully inert → no cache/stats side
  * effects). No new failures → no re-run at all.
+ *
+ * BASELINE RULE: `prevOutcomes === null` marks the FIRST measurable commit —
+ * there is nothing to compare against, so every failure would spuriously look
+ * "new" (spurious re-runs, and a baseline-broken test could get laundered
+ * into 'flaky'). No re-run; the commit's outcomes simply become the baseline.
  */
 export async function flakeCheckCommit(
   sha: string,
-  prevOutcomes: ReadonlyMap<string, string>,
+  prevOutcomes: ReadonlyMap<string, string> | null,
   curOutcomes: ReadonlyMap<string, string>,
   rerun: () => Promise<Map<string, string>>,
 ): Promise<FlakeCheckResult> {
+  if (prevOutcomes === null) {
+    return {
+      sha,
+      newFailures: [],
+      confirmed: [],
+      flaky: [],
+      reran: false,
+      baseline: true,
+    };
+  }
   const newFailures: string[] = [];
   for (const [test, status] of curOutcomes) {
     if (status !== 'failed') continue;
@@ -169,7 +187,14 @@ export async function flakeCheckCommit(
   }
   newFailures.sort();
   if (newFailures.length === 0) {
-    return { sha, newFailures, confirmed: [], flaky: [], reran: false };
+    return {
+      sha,
+      newFailures,
+      confirmed: [],
+      flaky: [],
+      reran: false,
+      baseline: false,
+    };
   }
   const rerunOutcomes = await rerun();
   const confirmed: string[] = [];
@@ -180,7 +205,7 @@ export async function flakeCheckCommit(
     if (rerunOutcomes.get(test) === 'passed') flaky.push(test);
     else confirmed.push(test);
   }
-  return { sha, newFailures, confirmed, flaky, reran: true };
+  return { sha, newFailures, confirmed, flaky, reran: true, baseline: false };
 }
 
 /**
@@ -291,6 +316,10 @@ export async function analyzeRun(
   let commitsWithOutcomeConfirmedMiss = 0;
   let totalStructuralMisses = 0;
   let totalOutcomeConfirmedMisses = 0;
+  // Outcome-join guard: how many structurally-missed tests were FOUND in the
+  // commit's outcome map. Structural misses with ZERO joins across the whole
+  // walk means the outcome-confirmed tier is likely path-broken, not clean.
+  let outcomeJoinMatches = 0;
 
   // The simulated live selective cache, threaded commit → commit.
   let cache: ReverseMap = new Map();
@@ -324,17 +353,39 @@ export async function analyzeRun(
       ? parseGraphReverseMap(await readFile(graphPath, 'utf-8'))
       : null;
     const outcomesPath = path.join(runDir, 'outcomes', `${entry.sha}.json`);
+    // Outcome test names are normalized into the graphs' canonical path space
+    // (path.resolve against the canonical rootDir — same realpath'd cloneDir)
+    // so the C-1→C outcome join uses the same file-path identity as the edge
+    // maps. A mismatch here would silently zero the outcome-confirmed tier;
+    // the join guard below catches whatever normalization cannot.
     const outcomes = existsSync(outcomesPath)
-      ? parseOutcomes(await readFile(outcomesPath, 'utf-8'))
+      ? normalizeOutcomePaths(
+          parseOutcomes(await readFile(outcomesPath, 'utf-8')),
+          rootDir,
+        )
       : new Map<string, string>();
 
     const changedRel = entry.changedFiles ?? null;
-    const changedAbs = (changedRel ?? []).map((f) =>
-      path.isAbsolute(f) ? f : path.join(rootDir, f),
-    );
+    const changedAbs = (changedRel ?? []).map((f) => path.resolve(rootDir, f));
 
     const selective = decision.action === 'shadow-selective';
     if (selective && !warmupDone) warmupDone = true;
+
+    // Evolution step — computed ONCE per commit with a graph artifact, for
+    // EVERY segment (warm-up 'all' warming, fallbacks, selective): it yields
+    // both the simulated live selection (detection) and the persisted
+    // cacheAfter (threaded into C+1). See evolution.ts for the scope rules —
+    // the recorded selectedFiles are never fed back into the cache (that
+    // would break the drift feedback loop).
+    const step =
+      freshMap !== null
+        ? evolveStep(cache, {
+            sha: entry.sha,
+            freshMap,
+            decision,
+            changedFiles: changedAbs,
+          })
+        : null;
 
     let segment: CommitAnalysis['segment'];
     let structuralMisses: CommitAnalysis['structuralMisses'] = [];
@@ -368,11 +419,8 @@ export async function analyzeRun(
         // Simulated LIVE selection from the evolved (drifted) cache — the
         // recorded shadow selection was computed against a fully-fresh cache
         // (the harness full-runs every commit) and would erase the drift.
-        const selection = simulateLiveSelection(
-          cache,
-          changedAbs,
-          testsOf(freshMap),
-        );
+        // step is non-null here (freshMap !== null in this branch).
+        const selection = (step as NonNullable<typeof step>).simulatedSelection;
         simulatedSelected = selection.size;
         structuralMisses = detectStructuralMisses({
           sha: entry.sha,
@@ -381,6 +429,10 @@ export async function analyzeRun(
           selection,
           outcomes,
         });
+        // Join guard bookkeeping: count missed tests present in the outcomes.
+        for (const miss of structuralMisses) {
+          if (outcomes.has(miss.test)) outcomeJoinMatches++;
+        }
         const flaky = flakyBySha.get(entry.sha) ?? new Set<string>();
         outcomeConfirmed = detectOutcomeConfirmed(
           structuralMisses,
@@ -415,16 +467,23 @@ export async function analyzeRun(
       outcomeConfirmed,
     });
 
-    // Evolve the simulated cache exactly as a live run would persist it:
-    // selective → only the recorded selected set's edges; full-suite → the
-    // whole fresh map (also how commit #1 warms the cold cache).
-    if (freshMap !== null) {
-      cache = reconstructCacheEvolution(
-        [{ sha: entry.sha, freshMap, decision }],
-        cache,
-      )[0].cacheAfter;
-    }
+    // Thread the evolved cache into the next commit (see evolution.ts for the
+    // live-persistence scope rules).
+    if (step !== null) cache = step.cacheAfter;
     if (outcomes.size > 0) prevOutcomes = outcomes;
+  }
+
+  // OUTCOME-JOIN GUARD: structural misses exist but not a single missed test
+  // was found in any commit's outcome map — the C-1→C join is likely
+  // path-broken (normalization mismatch), so an outcome-confirmed tier of 0
+  // must NOT be read as clean. Warn loudly in the report.
+  const warnings: string[] = [];
+  if (totalStructuralMisses > 0 && outcomeJoinMatches === 0) {
+    warnings.push(
+      'outcome tier may be broken — the C-1→C outcome path-join produced no ' +
+        'matches across ALL commits despite structural misses; treat the ' +
+        'outcome-confirmed miss-rate as unknown, not zero',
+    );
   }
 
   const measurable = selectiveDecisions - unmeasurableCommits.length;
@@ -448,7 +507,25 @@ export async function analyzeRun(
     brokenCommits,
     skippedCommits,
     commits,
+    warnings,
   };
+}
+
+/**
+ * Remap outcome test names into the canonical absolute path space the graph
+ * keys live in. `path.resolve` against the canonical rootDir absolutizes
+ * relative reporter names and normalizes already-absolute ones — mirroring
+ * how the graphs' keys arrive (canonical paths under the realpath'd clone).
+ */
+function normalizeOutcomePaths(
+  outcomes: Map<string, string>,
+  rootDir: string,
+): Map<string, string> {
+  const normalized = new Map<string, string>();
+  for (const [name, status] of outcomes) {
+    normalized.set(path.resolve(rootDir, name), status);
+  }
+  return normalized;
 }
 
 /** Render + write <runDir>/analysis.md; returns the report path. */
@@ -459,6 +536,60 @@ export async function writeReport(
   const reportPath = path.join(runDir, 'analysis.md');
   await writeFile(reportPath, renderReport(analysis), 'utf-8');
   return reportPath;
+}
+
+/**
+ * Degeneration diagnosis report — written into the run dir when the
+ * degeneration guard trips, so the expensive walk data stays diagnosable
+ * without a re-walk. Returns the report path.
+ */
+export async function writeDegenerationReport(
+  runDir: string,
+  err: NoSelectiveDecisionsError,
+): Promise<string> {
+  const lines: string[] = [
+    '# Replay analysis — DEGENERATE RUN (no measurement)',
+    '',
+    `**${err.message}**`,
+    '',
+    '## Decision segmentation (why every commit was full-suite)',
+    '',
+    '| segment | count |',
+    '| --- | --- |',
+  ];
+  for (const key of Object.keys(err.segmentation).sort()) {
+    lines.push(`| ${key} | ${err.segmentation[key]} |`);
+  }
+  lines.push(
+    '',
+    'Fix the cause (see segmentation reasons above), then re-analyze without',
+    're-walking: `npx tsx tools/replay/run.ts --analyze-only <runDir>`.',
+    '',
+  );
+  const reportPath = path.join(runDir, 'analysis.md');
+  await writeFile(reportPath, lines.join('\n'), 'utf-8');
+  return reportPath;
+}
+
+/**
+ * The report-path entry: analyze and write analysis.md. On degeneration the
+ * DIAGNOSIS is still written into the run dir before the error is rethrown
+ * (the CLI then exits non-zero) — failing loudly must not mean failing
+ * blindly. Returns the report path.
+ */
+export async function analyzeAndReport(
+  opts: AnalyzeRunOptions,
+): Promise<string> {
+  let analysis: RunAnalysis;
+  try {
+    analysis = await analyzeRun(opts);
+  } catch (err) {
+    if (err instanceof NoSelectiveDecisionsError) {
+      await writeDegenerationReport(opts.runDir, err);
+    }
+    throw err;
+  }
+  return writeReport(opts.runDir, analysis);
 }
 
 // Re-export the guard error so run.ts (and tests) reach it via one module.

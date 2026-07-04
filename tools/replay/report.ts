@@ -61,6 +61,12 @@ export interface RunAnalysis {
   brokenCommits: InventoriedCommit[];
   skippedCommits: InventoriedCommit[];
   commits: CommitAnalysis[];
+  /**
+   * Measurement-integrity warnings (e.g. the outcome-join guard: structural
+   * misses exist but the C-1→C outcome join matched nothing — the
+   * outcome-confirmed tier may be broken, not genuinely zero).
+   */
+  warnings: string[];
 }
 
 function pct(rate: number | null): string {
@@ -97,6 +103,14 @@ export function renderReport(analysis: RunAnalysis): string {
     '',
     `Run dir: \`${analysis.runDir}\``,
     '',
+    ...(analysis.warnings.length > 0
+      ? [
+          '## ⚠ Warnings (measurement integrity)',
+          '',
+          ...analysis.warnings.map((w) => `- **${w}**`),
+          '',
+        ]
+      : []),
     '## Denominator',
     '',
     `- Commits walked: ${analysis.totalCommits} (ok: ${analysis.okCommits}, ` +

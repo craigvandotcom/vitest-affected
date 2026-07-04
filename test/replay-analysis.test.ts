@@ -5,15 +5,17 @@ import {
   mkdtempSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   rmSync,
   realpathSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import type { ReverseMap } from '../dist/index.js';
 import type { LedgerEntry, ShadowDecision } from '../tools/replay/types.js';
 import {
-  scopeForDecision,
+  evolutionScope,
   reconstructCacheEvolution,
 } from '../tools/replay/evolution.js';
 import {
@@ -31,10 +33,12 @@ import {
   parseGraphReverseMap,
   parseOutcomes,
   analyzeRun,
+  analyzeAndReport,
   writeReport,
   flakeCheckCommit,
 } from '../tools/replay/analysis.js';
 import { renderReport } from '../tools/replay/report.js';
+import { parseArgs } from '../tools/replay/run.js';
 
 // ---------------------------------------------------------------------------
 // Temp-dir bookkeeping (mirrors replay-core.test.ts).
@@ -84,103 +88,224 @@ function fullSuite(reason: string): ShadowDecision {
 // ===========================================================================
 // evolution — simulated selective cache reconstruction
 // ===========================================================================
-describe('evolution: scopeForDecision', () => {
-  test('shadow-selective → Set of selectedFiles', () => {
-    const scope = scopeForDecision(selective(['t/a.test.ts', 't/b.test.ts']));
+describe('evolution: evolutionScope', () => {
+  test('shadow-selective → the SIMULATED selection, never the recorded set', () => {
+    // Recorded selection says a+b; the drifted-cache simulation says only a.
+    const sim = new Set(['t/a.test.ts']);
+    const scope = evolutionScope(
+      selective(['t/a.test.ts', 't/b.test.ts']),
+      sim,
+    );
     expect(scope).toBeInstanceOf(Set);
-    expect([...(scope as Set<string>)].sort()).toEqual([
-      't/a.test.ts',
-      't/b.test.ts',
-    ]);
+    expect([...(scope as Set<string>)]).toEqual(['t/a.test.ts']);
   });
 
-  test('shadow-full-suite → "all"', () => {
-    expect(scopeForDecision(fullSuite('cache-miss'))).toBe('all');
+  test('cache-INDEPENDENT full-suite reason → "all" (live would also full-suite)', () => {
+    expect(
+      evolutionScope(fullSuite('config-change'), new Set(['t/a.test.ts'])),
+    ).toBe('all');
+    expect(evolutionScope(fullSuite('no-changes'), new Set())).toBe('all');
+    expect(evolutionScope(fullSuite('full-suite-trigger'), new Set())).toBe(
+      'all',
+    );
   });
 
-  test('shadow-selective with null selection → empty Set (not "all")', () => {
-    const scope = scopeForDecision({
-      action: 'shadow-selective',
-      selectedFiles: null,
-    });
-    expect(scope).toBeInstanceOf(Set);
-    expect((scope as Set<string>).size).toBe(0);
+  test('cache-DEPENDENT full-suite reason → simulated selection (live would have been selective)', () => {
+    const sim = new Set(['t/a.test.ts']);
+    const miss = evolutionScope(fullSuite('cache-miss'), sim);
+    expect([...(miss as Set<string>)]).toEqual(['t/a.test.ts']);
+    const threshold = evolutionScope(fullSuite('threshold-exceeded'), sim);
+    expect([...(threshold as Set<string>)]).toEqual(['t/a.test.ts']);
+    // Unlisted reasons default to cache-dependent (never optimistically
+    // refresh the drifted cache).
+    const unknown = evolutionScope(fullSuite('some-future-reason'), sim);
+    expect([...(unknown as Set<string>)]).toEqual(['t/a.test.ts']);
+  });
+
+  test('EMPTY simulated selection → "all" (live no-affected-tests fallback self-heals)', () => {
+    expect(evolutionScope(selective(['t/x.test.ts']), new Set())).toBe('all');
+    expect(evolutionScope(fullSuite('no-affected-tests'), new Set())).toBe(
+      'all',
+    );
   });
 });
 
 describe('evolution: reconstructCacheEvolution (drives real mergeRuntimeEdges)', () => {
-  test('selective merge preserves prior edges for UNSELECTED tests', () => {
-    // Warm start: testA depends on src/x.ts (recorded on some earlier full run).
-    const initial = rm({ 'src/x.ts': ['t/a.test.ts'] });
+  test('selective evolution persists the SIMULATED selection, preserving prior edges for unselected tests', () => {
+    // Warm start: testA on x.ts, testB on y.ts.
+    const initial = rm({
+      '/r/src/x.ts': ['/r/t/a.test.ts'],
+      '/r/src/y.ts': ['/r/t/b.test.ts'],
+    });
 
-    // Commit C1: selective run picks only testB. Fresh (ground-truth) map at C1
-    // records testB's edges on src/y.ts. testA was NOT selected, so a live
-    // selective run would NOT re-record it — its stale edge must survive.
+    // C1 changes y.ts → simulated selection = {testB}. Fresh ground truth
+    // says testB now ALSO depends on z.ts. testA was not selected: its stale
+    // edge must survive untouched.
     const steps = reconstructCacheEvolution(
       [
         {
           sha: 'c1',
-          freshMap: rm({ 'src/y.ts': ['t/b.test.ts'] }),
-          decision: selective(['t/b.test.ts']),
+          freshMap: rm({
+            '/r/src/y.ts': ['/r/t/b.test.ts'],
+            '/r/src/z.ts': ['/r/t/b.test.ts'],
+          }),
+          decision: selective(['/r/t/b.test.ts']),
+          changedFiles: ['/r/src/y.ts'],
         },
       ],
       initial,
     );
 
     expect(steps).toHaveLength(1);
+    expect([...steps[0].simulatedSelection]).toEqual(['/r/t/b.test.ts']);
     const after = steps[0].cacheAfter;
-    // Preserved: testA's edge on src/x.ts (unselected → untouched).
-    expect(edges(after, 'src/x.ts')).toEqual(['t/a.test.ts']);
-    // Merged: testB's fresh edge on src/y.ts.
-    expect(edges(after, 'src/y.ts')).toEqual(['t/b.test.ts']);
+    // Preserved: testA's edge on x.ts (unselected → untouched).
+    expect(edges(after, '/r/src/x.ts')).toEqual(['/r/t/a.test.ts']);
+    // Refreshed: testB's edges (y.ts kept, z.ts learned).
+    expect(edges(after, '/r/src/y.ts')).toEqual(['/r/t/b.test.ts']);
+    expect(edges(after, '/r/src/z.ts')).toEqual(['/r/t/b.test.ts']);
     // cacheBefore is the pre-run snapshot (== initial).
-    expect(edges(steps[0].cacheBefore, 'src/x.ts')).toEqual(['t/a.test.ts']);
-    expect(steps[0].cacheBefore.has('src/y.ts')).toBe(false);
+    expect(steps[0].cacheBefore.has('/r/src/z.ts')).toBe(false);
   });
 
-  test('full-suite merge replaces edges for every test present in fresh', () => {
-    // Stale: testA on src/x.ts (an edge that no longer exists at ground truth).
-    const initial = rm({ 'src/x.ts': ['t/a.test.ts'] });
+  test('cache-independent full-suite replaces edges for every test present in fresh', () => {
+    // Stale: testA on x.ts (an edge that no longer exists at ground truth).
+    const initial = rm({ '/r/src/x.ts': ['/r/t/a.test.ts'] });
 
-    // Commit C1: full-suite run re-records ALL tests. Fresh says testA now
-    // depends on src/z.ts (not src/x.ts). scope='all' overwrites testA's edges.
+    // config-change (cache-independent) → live also full-suites → scope 'all'
+    // overwrites testA's edges with the fresh truth (z.ts, not x.ts).
     const steps = reconstructCacheEvolution(
       [
         {
           sha: 'c1',
-          freshMap: rm({ 'src/z.ts': ['t/a.test.ts'] }),
-          decision: fullSuite('cache-miss'),
+          freshMap: rm({ '/r/src/z.ts': ['/r/t/a.test.ts'] }),
+          decision: fullSuite('config-change'),
+          changedFiles: [],
         },
       ],
       initial,
     );
 
     const after = steps[0].cacheAfter;
-    // Stale edge dropped: testA no longer on src/x.ts.
-    expect(after.has('src/x.ts')).toBe(false);
-    // Replaced with the fresh edge.
-    expect(edges(after, 'src/z.ts')).toEqual(['t/a.test.ts']);
+    expect(after.has('/r/src/x.ts')).toBe(false);
+    expect(edges(after, '/r/src/z.ts')).toEqual(['/r/t/a.test.ts']);
   });
 
-  test('threads cacheAfter of C into cacheBefore of C+1', () => {
+  test('cold cache (commit #1) warms with "all" regardless of the recorded decision', () => {
+    // Even a changed test file (which self-selects into a non-empty simulated
+    // set) cannot make a COLD live plugin selective — no cache file exists.
     const steps = reconstructCacheEvolution([
       {
         sha: 'c1',
-        freshMap: rm({ 'src/a.ts': ['t/a.test.ts'] }),
+        freshMap: rm({
+          '/r/src/a.ts': ['/r/t/a.test.ts'],
+          '/r/t/n.test.ts': ['/r/t/n.test.ts'],
+        }),
+        decision: selective(['/r/t/n.test.ts']),
+        changedFiles: ['/r/t/n.test.ts'],
+      },
+    ]);
+    expect(steps[0].scope).toBe('all');
+    // The whole fresh map warmed in.
+    expect(edges(steps[0].cacheAfter, '/r/src/a.ts')).toEqual([
+      '/r/t/a.test.ts',
+    ]);
+    expect(edges(steps[0].cacheAfter, '/r/t/n.test.ts')).toEqual([
+      '/r/t/n.test.ts',
+    ]);
+  });
+
+  test('threads cacheAfter of C into cacheBefore of C+1 and scopes C+1 by ITS simulation', () => {
+    const steps = reconstructCacheEvolution([
+      {
+        sha: 'c1',
+        freshMap: rm({ '/r/src/a.ts': ['/r/t/a.test.ts'] }),
         decision: fullSuite('cache-miss'),
+        changedFiles: ['/r/src/a.ts'],
       },
       {
         sha: 'c2',
-        freshMap: rm({ 'src/b.ts': ['t/b.test.ts'] }),
-        decision: selective(['t/b.test.ts']),
+        freshMap: rm({
+          '/r/src/a.ts': ['/r/t/a.test.ts'],
+          '/r/src/b.ts': ['/r/t/b.test.ts'],
+        }),
+        decision: selective(['/r/t/a.test.ts']),
+        changedFiles: ['/r/src/a.ts'],
       },
     ]);
     expect(steps).toHaveLength(2);
-    // C2's before == C1's after (edge for testA carried forward).
-    expect(edges(steps[1].cacheBefore, 'src/a.ts')).toEqual(['t/a.test.ts']);
-    // C2 selective adds testB, preserves testA.
-    expect(edges(steps[1].cacheAfter, 'src/a.ts')).toEqual(['t/a.test.ts']);
-    expect(edges(steps[1].cacheAfter, 'src/b.ts')).toEqual(['t/b.test.ts']);
+    // C2's before == C1's after (cold-warmed).
+    expect(edges(steps[1].cacheBefore, '/r/src/a.ts')).toEqual([
+      '/r/t/a.test.ts',
+    ]);
+    // C2's simulated selection = lookup of a.ts in the evolved cache.
+    expect([...steps[1].simulatedSelection]).toEqual(['/r/t/a.test.ts']);
+    // testB was NOT selected → its fresh edge on b.ts is NOT persisted.
+    expect(steps[1].cacheAfter.has('/r/src/b.ts')).toBe(false);
+    expect(edges(steps[1].cacheAfter, '/r/src/a.ts')).toEqual([
+      '/r/t/a.test.ts',
+    ]);
+  });
+
+  test('DRIFT FEEDBACK LOOP: edges drifted out stay missing from simulated selections until a full-suite reason refreshes them', () => {
+    const tA = '/r/t/a.test.ts';
+    const tB = '/r/t/b.test.ts';
+    const steps = reconstructCacheEvolution([
+      // c1: cold warm-up ('all') — cache learns a.ts→tA, b.ts→tB.
+      {
+        sha: 'c1',
+        freshMap: rm({ '/r/src/a.ts': [tA], '/r/src/b.ts': [tB] }),
+        decision: fullSuite('cache-miss'),
+        changedFiles: ['/r/src/a.ts'],
+      },
+      // c2: ground truth moves tB's dependency b.ts → c.ts, but only a.ts
+      // changed → simulated selection = {tA} → tB's fresh edge is NOT
+      // persisted: the live cache never learns c.ts→tB (drift).
+      {
+        sha: 'c2',
+        freshMap: rm({ '/r/src/a.ts': [tA], '/r/src/c.ts': [tB] }),
+        decision: selective([tA]),
+        changedFiles: ['/r/src/a.ts'],
+      },
+      // c3: c.ts changes — ground truth says tB is required, but the drifted
+      // cache has no c.ts edge → tB STAYS MISSING from the simulated
+      // selection (the drift-caused miss persists; this is the pin).
+      {
+        sha: 'c3',
+        freshMap: rm({ '/r/src/a.ts': [tA], '/r/src/c.ts': [tB] }),
+        decision: selective([tA, tB]),
+        changedFiles: ['/r/src/a.ts', '/r/src/c.ts'],
+      },
+      // c4: config-change (cache-independent full-suite) → 'all' refresh
+      // heals the drift: c.ts→tB learned, stale b.ts→tB dropped.
+      {
+        sha: 'c4',
+        freshMap: rm({ '/r/src/a.ts': [tA], '/r/src/c.ts': [tB] }),
+        decision: fullSuite('config-change'),
+        changedFiles: [],
+      },
+      // c5: c.ts changes again — NOW the simulation selects tB.
+      {
+        sha: 'c5',
+        freshMap: rm({ '/r/src/a.ts': [tA], '/r/src/c.ts': [tB] }),
+        decision: selective([tB]),
+        changedFiles: ['/r/src/c.ts'],
+      },
+    ]);
+
+    // c2 persisted only tA's edges: stale b.ts→tB kept, c.ts→tB never learned.
+    expect(edges(steps[1].cacheAfter, '/r/src/b.ts')).toEqual([tB]);
+    expect(steps[1].cacheAfter.has('/r/src/c.ts')).toBe(false);
+    // THE PIN: at c3 the drifted simulation still misses tB — the recorded
+    // selection (which included tB) must NOT leak back into the loop.
+    expect(steps[2].simulatedSelection.has(tB)).toBe(false);
+    expect(steps[2].simulatedSelection.has(tA)).toBe(true);
+    expect(steps[2].cacheAfter.has('/r/src/c.ts')).toBe(false);
+    // c4 full-suite refresh heals the cache.
+    expect(edges(steps[3].cacheAfter, '/r/src/c.ts')).toEqual([tB]);
+    expect(steps[3].cacheAfter.has('/r/src/b.ts')).toBe(false);
+    // c5: recovered — the simulation selects tB again.
+    expect(steps[4].simulatedSelection.has(tB)).toBe(true);
   });
 });
 
@@ -549,6 +674,77 @@ describe('analysis: analyzeRun over a synthetic run dir', () => {
     // Inventories.
     expect(analysis.brokenCommits.map((b) => b.sha)).toEqual(['brk1']);
     expect(analysis.skippedCommits.map((s) => s.sha)).toEqual(['skip1']);
+    // Healthy outcome join → no integrity warnings.
+    expect(analysis.warnings).toEqual([]);
+  });
+
+  test('normalizes RELATIVE outcome paths into the graph path space (outcome tier joins)', async () => {
+    const abs = (p: string): string => `/repo/${p}`;
+    const { runDir } = buildRunDir([
+      {
+        sha: 'w1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { [abs('src/a.ts')]: [abs('t/a.test.ts')] },
+        // Relative reporter names — must resolve against rootDir to join.
+        outcomes: { 't/a.test.ts': 'passed' },
+      },
+      {
+        sha: 's1',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: {
+          [abs('src/a.ts')]: [abs('t/a.test.ts')],
+          [abs('src/style.css')]: [abs('t/style.test.ts')],
+        },
+        outcomes: { 't/a.test.ts': 'passed', 't/style.test.ts': 'failed' },
+      },
+    ]);
+    const analysis = await analyzeRun({ runDir, rootDir: '/repo' });
+    // The miss joined its outcome (failed, no prior entry) → confirmed.
+    expect(analysis.totalStructuralMisses).toBe(1);
+    expect(analysis.totalOutcomeConfirmedMisses).toBe(1);
+    expect(analysis.warnings).toEqual([]);
+  });
+
+  test('LOUD GUARD: structural misses with a zero outcome join warn instead of silently reporting 0', async () => {
+    const abs = (p: string): string => `/repo/${p}`;
+    const { runDir } = buildRunDir([
+      {
+        sha: 'w1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { [abs('src/a.ts')]: [abs('t/a.test.ts')] },
+        outcomes: { '/elsewhere/t/a.test.ts': 'passed' },
+      },
+      {
+        sha: 's1',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: {
+          [abs('src/a.ts')]: [abs('t/a.test.ts')],
+          [abs('src/style.css')]: [abs('t/style.test.ts')],
+        },
+        // Outcome names live in a DIFFERENT path space — the join finds
+        // nothing for the missed test.
+        outcomes: {
+          '/elsewhere/t/a.test.ts': 'passed',
+          '/elsewhere/t/style.test.ts': 'failed',
+        },
+      },
+    ]);
+    const analysis = await analyzeRun({ runDir, rootDir: '/repo' });
+    expect(analysis.totalStructuralMisses).toBe(1);
+    // The flip existed but the join is broken → 0 confirmed + a LOUD warning.
+    expect(analysis.totalOutcomeConfirmedMisses).toBe(0);
+    expect(analysis.warnings).toHaveLength(1);
+    expect(analysis.warnings[0]).toMatch(/outcome tier may be broken/);
+    // The warning is rendered into the report.
+    expect(renderReport(analysis)).toMatch(/outcome tier may be broken/);
   });
 
   test('all-full-suite walk fails loudly (degeneration guard)', async () => {
@@ -565,6 +761,31 @@ describe('analysis: analyzeRun over a synthetic run dir', () => {
     await expect(analyzeRun({ runDir, rootDir: '/repo' })).rejects.toThrow(
       NoSelectiveDecisionsError,
     );
+  });
+
+  test('degeneration still writes a diagnosis analysis.md (analyzeAndReport) before rethrowing', async () => {
+    const { runDir } = buildRunDir([
+      {
+        sha: 'f1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { '/repo/src/a.ts': ['/repo/t/a.test.ts'] },
+        outcomes: { '/repo/t/a.test.ts': 'passed' },
+      },
+      { sha: 'brk1', status: 'BROKEN', reason: 'install failed' },
+    ]);
+    await expect(
+      analyzeAndReport({ runDir, rootDir: '/repo' }),
+    ).rejects.toThrow(NoSelectiveDecisionsError);
+    // The walk data stays diagnosable without a ~320s/commit re-walk.
+    const reportPath = path.join(runDir, 'analysis.md');
+    expect(existsSync(reportPath)).toBe(true);
+    const md = readFileSync(reportPath, 'utf-8');
+    expect(md).toMatch(/DEGENERATE/);
+    expect(md).toMatch(/shadow-full-suite \(cache-miss\)/); // segmentation table
+    expect(md).toMatch(/BROKEN/);
+    expect(md).toMatch(/--analyze-only/); // recovery instruction
   });
 
   test('writeReport emits analysis.md into the run dir', async () => {
@@ -607,6 +828,7 @@ describe('report: renderReport smoke', () => {
       brokenCommits: [{ sha: 'brk1', reason: 'no shadow stats line emitted' }],
       skippedCommits: [{ sha: 'skip1', reason: 'lockfile touched' }],
       commits: [],
+      warnings: ['outcome tier may be broken — example warning'],
     });
     // Both tiers labeled — never a bare "miss-rate".
     expect(md).toMatch(/structural miss-rate/i);
@@ -616,6 +838,9 @@ describe('report: renderReport smoke', () => {
     expect(md).toMatch(/style/);
     expect(md).toMatch(/brk1/);
     expect(md).toMatch(/warm-?up/i);
+    // Integrity warnings render loudly.
+    expect(md).toMatch(/Warnings/);
+    expect(md).toMatch(/outcome tier may be broken/);
   });
 });
 
@@ -659,5 +884,54 @@ describe('flake guard: flakeCheckCommit', () => {
     const clean = await flakeCheckCommit('c2', prev, prev, rerun2);
     expect(calls2).toBe(0);
     expect(clean.newFailures).toEqual([]);
+    expect(clean.baseline).toBe(false);
+  });
+
+  test('first measurable commit (null baseline) never re-runs — failures become the baseline, not flakes', async () => {
+    // With an empty prior map every failure would look "new": spurious
+    // DISABLED re-runs, and a baseline-broken test laundered into 'flaky'.
+    // A null baseline marks commit #1: no comparison, no re-run.
+    let calls = 0;
+    const rerun = async (): Promise<Map<string, string>> => {
+      calls++;
+      return new Map<string, string>([['/repo/t/broken.test.ts', 'passed']]);
+    };
+    const cur = new Map<string, string>([
+      ['/repo/t/broken.test.ts', 'failed'], // baseline-broken test
+      ['/repo/t/a.test.ts', 'passed'],
+    ]);
+    const result = await flakeCheckCommit('c0', null, cur, rerun);
+    expect(calls).toBe(0);
+    expect(result.baseline).toBe(true);
+    expect(result.reran).toBe(false);
+    expect(result.newFailures).toEqual([]);
+    expect(result.confirmed).toEqual([]);
+    expect(result.flaky).toEqual([]); // never laundered into 'flaky'
+  });
+});
+
+// ===========================================================================
+// run — --analyze-only CLI mode (analysis iterates fast on expensive walks)
+// ===========================================================================
+describe('run: --analyze-only arg parsing', () => {
+  test('parseArgs accepts --analyze-only without --repo/--range', () => {
+    const args = parseArgs(['--analyze-only', '/work/runs/2026-07-04']);
+    expect(args.analyzeOnly).toBe('/work/runs/2026-07-04');
+    expect(args.help).toBe(false);
+  });
+
+  test('parseArgs accepts --root alongside --analyze-only', () => {
+    const args = parseArgs([
+      '--analyze-only',
+      '/work/runs/x',
+      '--root',
+      '/work/body-compass-app',
+    ]);
+    expect(args.analyzeOnly).toBe('/work/runs/x');
+    expect(args.root).toBe('/work/body-compass-app');
+  });
+
+  test('parseArgs still requires --repo/--range when --analyze-only is absent', () => {
+    expect(() => parseArgs(['--root', '/x'])).toThrow(/--repo is required/);
   });
 });
