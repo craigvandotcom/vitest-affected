@@ -40,6 +40,15 @@ export async function setRefToParent(
  * Build the per-commit run environment: clear CI signals, force shadow mode,
  * and point the plugin's stats output at the per-commit file. Pure — returns a
  * fresh env object, never mutates the input.
+ *
+ * The `delete`s below are only effective if the child process is spawned with
+ * `extendEnv: false` (see runCommit): execa's DEFAULT is to merge `process.env`
+ * OVER nothing but UNDER the provided env — so a key merely deleted from this
+ * object is re-introduced from the parent `process.env` at spawn time (a key
+ * that is absent does not override the parent's value). Running the harness in a
+ * shell with `CI=1` / `GITHUB_ACTIONS` / `VITEST_AFFECTED_DISABLED=1` would then
+ * silently defeat this hygiene (retry masking, or an all-BROKEN walk). The child
+ * is therefore given EXACTLY this env, not an extension of the parent's.
  */
 export function buildRunEnv(
   baseEnv: NodeJS.ProcessEnv,
@@ -160,7 +169,12 @@ export async function runCommit(
     const result = await execa(
       'npx',
       ['vitest', 'run', '--reporter=json'],
-      { cwd: cloneDir, env, reject: false },
+      // extendEnv:false — the child gets EXACTLY buildRunEnv's env, never an
+      // extension of the parent process.env (which would re-introduce the CI /
+      // GITHUB_ACTIONS / VITEST_AFFECTED_DISABLED keys buildRunEnv deletes; see
+      // its doc comment). `env` is a full copy of the base env, so PATH etc. are
+      // carried through.
+      { cwd: cloneDir, env, reject: false, extendEnv: false },
     );
     stdout = result.stdout;
   } catch (err) {

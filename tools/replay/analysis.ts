@@ -228,6 +228,12 @@ export async function spawnDisabledRerun(
     cwd: cloneDir,
     env,
     reject: false,
+    // Same trap as runCommit (see exec.ts): execa's default extendEnv re-merges
+    // the parent process.env, re-introducing the CI / GITHUB_ACTIONS keys
+    // deleted above — an inherited CI=1 would enable retry masking in exactly
+    // the re-run whose job is to confirm a failure. The env above is a full
+    // copy of the base env, so PATH etc. carry through.
+    extendEnv: false,
   });
   return parseOutcomes(result.stdout);
 }
