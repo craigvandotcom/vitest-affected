@@ -1,8 +1,8 @@
-import { describe, test, expect, afterEach } from 'vitest';
+import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
 import { mkdtempSync, writeFileSync, symlinkSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { normalizeModuleId, toCanonicalPath } from '../../src/graph/normalize.js';
+import { normalizeModuleId, toCanonicalPath, clearCanonicalPathCache } from '../../src/graph/normalize.js';
 
 describe('normalizeModuleId', () => {
   test('strips \\0 prefix (Vite virtual module marker)', () => {
@@ -37,6 +37,12 @@ describe('normalizeModuleId', () => {
 
 describe('toCanonicalPath', () => {
   const tempDirs: string[] = [];
+
+  // Fixtures create then delete symlinked dirs; clear the module-scope memo so a
+  // symlink resolved in one test cannot serve a stale canonical result to the next.
+  beforeEach(() => {
+    clearCanonicalPathCache();
+  });
 
   afterEach(() => {
     for (const dir of tempDirs) {

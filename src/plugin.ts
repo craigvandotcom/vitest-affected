@@ -42,7 +42,25 @@ export interface VitestAffectedOptions {
   threshold?: number;
   allowNoTests?: boolean; // If true, allow selecting 0 tests (default: false — runs full suite instead)
   cache?: boolean; // Enable graph caching (default: true)
-  statsFile?: string; // Path to append JSON-line stats after each run (e.g. '.vitest-affected/stats.jsonl')
+  /**
+   * Path to append JSON-line stats after each run (e.g.
+   * '.vitest-affected/stats.jsonl'). Consumers/harnesses filter by `action`.
+   *
+   * TWO LINE CLASSES:
+   * - DECISION lines — exactly ONE per `configureVitest` exit when a stats path
+   *   is known. `action` is `selective` / `full-suite` (or under shadow mode,
+   *   `shadow-selective` / `shadow-full-suite`). These carry the decision fields
+   *   (`reason`, `changedFiles`, `deletedFiles`, `ignoredFiles`, `affectedTests`,
+   *   `totalTests`, `graphSize`, `cacheHit`, `durationMs`, and under shadow
+   *   `selectedFiles`).
+   * - DIAGNOSTIC lines — 0..n post-run, always `action: "heartbeat"`. Emitted by
+   *   the runtime reporter AFTER the run, so they carry ONLY fields meaningful
+   *   there: `timestamp`, `action`, `reason`, plus `strayCount` on
+   *   `reason: "selection-mismatch"`. They deliberately do NOT reuse decision
+   *   fields (`graphSize` / `affectedTests` / `changedFiles` / `cacheHit`) — that
+   *   semantics does not transfer to a post-run diagnostic.
+   */
+  statsFile?: string;
   /**
    * Additional path prefixes or regexes to ignore from changed-file analysis.
    * Applied on top of built-in defaults (.claude/, .git/, .next/, etc).
@@ -110,6 +128,17 @@ const CONFIG_BASENAMES = new Set([
 ]);
 
 /**
+ * Above this many test modules, a zero-edge run is treated as real starvation
+ * and warned loudly on the console. A full-suite-scale run (many modules) that
+ * collects ZERO in-project edges is the v0.5.0 `importDurations` regression
+ * signature. A small selective run (1..N modules) can legitimately yield zero
+ * in-project edges when its tests import only third-party modules — that stays
+ * quiet on the console (the stats line is always emitted regardless, so the
+ * machine signal is never lost).
+ */
+const ZERO_EDGE_STARVATION_MODULE_THRESHOLD = 5;
+
+/**
  * @internal
  * Creates a Vitest reporter that collects runtime dependency edges
  * by reading importDurations from each TestModule after it runs.
@@ -131,8 +160,12 @@ export function createRuntimeReporter(
      * observable rather than silently swallowed. Subsumes the spec's runtime
      * "importDurations presence/shape on first module" check: any shape drift
      * that breaks edge collection lands here as a zero-edge run.
+     *
+     * `testModuleCount` is the number of test modules that ran — the callback
+     * uses it to distinguish a full-suite-scale starvation (loud) from a small
+     * selective run that legitimately imports only third-party modules (quiet).
      */
-    onZeroEdgeRun?: () => void;
+    onZeroEdgeRun?: (testModuleCount: number) => void;
     /**
      * Called after a SELECTIVE run when one or more test modules ran that were
      * NOT in the selected set (ran-tests ⊄ selected). Signals the include
@@ -225,6 +258,12 @@ export function createRuntimeReporter(
       const strays = [...ranTests].filter((t) => !selectedSet.has(t));
       if (strays.length > 0) diagnostics.onSelectionMismatch(strays);
     }
+    // ONE-SHOT self-verify: the selection this run was checked against covers
+    // exactly this run. Reset so a later watch re-run — which Vitest may
+    // legitimately re-scope to a different set — is not checked against a stale
+    // selection and does not fire a false 'selection-mismatch'. A fresh
+    // selective decision re-arms it via setSelectedTests().
+    selectedTests = null;
 
     if (runtimeReverse.size > 0) {
       // Snapshot: pass a copy so clear() doesn't affect the callback's data
@@ -240,7 +279,7 @@ export function createRuntimeReporter(
       // ZERO-EDGE HEARTBEAT: tests ran to completion (modules present, no
       // unhandled errors) yet produced no edges. Distinct from an empty
       // selection (testModules.length === 0), which is a legitimate no-run.
-      diagnostics.onZeroEdgeRun();
+      diagnostics.onZeroEdgeRun(testModules.length);
     }
 
     runtimeReverse.clear();
@@ -269,6 +308,7 @@ function writeStatsLine(
     graphSize?: number;
     cacheHit?: boolean;
     durationMs?: number;
+    strayCount?: number;
     selectedFiles?: string[] | null;
   },
   verbose = false,
@@ -332,7 +372,10 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       // so the catch-all can still emit; rootDir starts at cwd and is refined
       // once vitest.config.root resolves.
       const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
-      let statsRootDir = process.cwd();
+      // Canonicalize the cwd fallback so the workspace/config-shape early-exit
+      // emissions resolve relative stats paths from a canonical base — the same
+      // path-identity boundary every other path in the plugin routes through.
+      let statsRootDir = toCanonicalPath(process.cwd());
 
       try {
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
@@ -455,17 +498,21 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             // configureVitest returns. Emitted with shadow=false: this is a
             // post-run diagnostic, not a selection decision, so it must NOT be
             // remapped into the shadow-selective/shadow-full-suite namespace.
-            onZeroEdgeRun: () => {
-              console.warn(
-                '[vitest-affected] HEARTBEAT: a completed test run collected ZERO ' +
-                  'dependency edges from importDurations across all modules. The reverse ' +
-                  'graph cannot be built or updated, so selection will fall back to the ' +
-                  'full suite indefinitely. This is the silent-starvation signal — verify ' +
-                  "that Vitest's importDurations collection is enabled and its API is intact.",
-              );
+            onZeroEdgeRun: (testModuleCount) => {
+              // Machine signal ALWAYS emitted; the loud console.warn is scoped to
+              // starvation-scale runs so a small third-party-only selective run
+              // stays quiet on the console.
+              if (testModuleCount > ZERO_EDGE_STARVATION_MODULE_THRESHOLD) {
+                console.warn(
+                  '[vitest-affected] HEARTBEAT: a completed test run collected ZERO ' +
+                    'dependency edges from importDurations across all modules. The reverse ' +
+                    'graph cannot be built or updated, so selection will fall back to the ' +
+                    'full suite indefinitely. This is the silent-starvation signal — verify ' +
+                    "that Vitest's importDurations collection is enabled and its API is intact.",
+                );
+              }
               if (statsFile) writeStatsLine(statsFile, rootDir, {
                 action: 'heartbeat', reason: 'zero-edges',
-                graphSize: 0, cacheHit,
               }, verbose, false);
             },
             // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
@@ -475,7 +522,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               );
               if (statsFile) writeStatsLine(statsFile, rootDir, {
                 action: 'heartbeat', reason: 'selection-mismatch',
-                affectedTests: strays.length,
+                strayCount: strays.length,
               }, verbose, false);
             },
           },
@@ -552,6 +599,54 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           }
         }
 
+        // 6a-bis. setupFiles / globalSetup changes → full suite, evaluated on
+        // the RAW changed+deleted set BEFORE relevance filtering — identical
+        // placement and reasoning to 6a. A setup or globalSetup file feeds every
+        // test, so an ignoreChangedFiles rule (or an irrelevant-extension drop)
+        // matching one must NOT silently under-select; the safe failure mode is
+        // to over-run. changedFiles/deletedFiles counts are the raw counts here,
+        // matching 6a's behavior.
+        const rawChangedForSetup = [...changed, ...deleted];
+
+        const setupFilesRaw = project.config.setupFiles ?? [];
+        const setupFileSet = new Set(
+          (Array.isArray(setupFilesRaw) ? setupFilesRaw : [setupFilesRaw]).map(
+            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+          ),
+        );
+        if (rawChangedForSetup.some((f) => setupFileSet.has(f))) {
+          console.warn(
+            '[vitest-affected] Setup file change detected — running full suite',
+          );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'setup-file-change',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            graphSize: reverse.size, durationMs: Date.now() - startMs,
+          }, verbose, shadow);
+          return;
+        }
+
+        // globalSetup is a sibling of setupFiles on the resolved config — same
+        // string | string[] shape, same relative-path-resolution requirement,
+        // same "invisible to the import graph" reasoning. Mirrored exactly.
+        const globalSetupRaw = project.config.globalSetup ?? [];
+        const globalSetupSet = new Set(
+          (Array.isArray(globalSetupRaw) ? globalSetupRaw : [globalSetupRaw]).map(
+            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+          ),
+        );
+        if (rawChangedForSetup.some((f) => globalSetupSet.has(f))) {
+          console.warn(
+            '[vitest-affected] Global setup file change detected — running full suite',
+          );
+          if (statsFile) writeStatsLine(statsFile, rootDir, {
+            action: 'full-suite', reason: 'global-setup-change',
+            changedFiles: changed.length, deletedFiles: deleted.length,
+            graphSize: reverse.size, durationMs: Date.now() - startMs,
+          }, verbose, shadow);
+          return;
+        }
+
         // 6b. Filter irrelevant changed/deleted files before any graph analysis.
         // Caller-provided changedFiles still get filtered unless explicitly opted out.
         let ignoredCount = 0;
@@ -604,49 +699,6 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           );
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'full-suite', reason: 'config-change',
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
-          return;
-        }
-
-        const setupFilesRaw = project.config.setupFiles ?? [];
-        const setupFileSet = new Set(
-          (Array.isArray(setupFilesRaw) ? setupFilesRaw : [setupFilesRaw]).map(
-            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-          ),
-        );
-        const hasSetupFileChange = allChangedFiles.some((f) => setupFileSet.has(f));
-        if (hasSetupFileChange) {
-          console.warn(
-            '[vitest-affected] Setup file change detected — running full suite',
-          );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'setup-file-change',
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: reverse.size, durationMs: Date.now() - startMs,
-          }, verbose, shadow);
-          return;
-        }
-
-        // globalSetup is a sibling of setupFiles on the resolved config — same
-        // string | string[] shape, same relative-path-resolution requirement,
-        // same "invisible to the import graph" reasoning. Mirrored exactly.
-        const globalSetupRaw = project.config.globalSetup ?? [];
-        const globalSetupSet = new Set(
-          (Array.isArray(globalSetupRaw) ? globalSetupRaw : [globalSetupRaw]).map(
-            (f) => toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-          ),
-        );
-        const hasGlobalSetupChange = allChangedFiles.some((f) => globalSetupSet.has(f));
-        if (hasGlobalSetupChange) {
-          console.warn(
-            '[vitest-affected] Global setup file change detected — running full suite',
-          );
-          if (statsFile) writeStatsLine(statsFile, rootDir, {
-            action: 'full-suite', reason: 'global-setup-change',
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,

@@ -32,8 +32,35 @@ export function normalizeModuleId(id: string): string {
 // should route through it rather than reimplementing `replaceAll('\\', '/')`
 // locally.
 
+/**
+ * Upper bound on the memo. On reaching it the whole Map is cleared and growth
+ * restarts — re-derivation is cheap (a realpathSync), and unbounded growth in a
+ * long-lived watch-mode process is the harm being bounded, not lookup misses.
+ */
+const MAX_CANONICAL_CACHE = 10_000;
+
 /** Memoizes toCanonicalPath results for the lifetime of the module (one process). */
 const canonicalPathCache = new Map<string, string>();
+
+/**
+ * Clear the module-scope canonicalization memo. Intended for TESTS whose
+ * fixtures create then delete symlinked directories: a symlink resolved and
+ * cached in one test could otherwise serve a stale canonical result to a later
+ * test that reuses a path string. Production code relies on the automatic
+ * cap-clear (MAX_CANONICAL_CACHE) and process lifetime instead.
+ */
+export function clearCanonicalPathCache(): void {
+  canonicalPathCache.clear();
+}
+
+/** Memoized set with the size cap: clear-and-continue on overflow. */
+function memoSet(key: string, value: string): string {
+  if (canonicalPathCache.size >= MAX_CANONICAL_CACHE) {
+    canonicalPathCache.clear();
+  }
+  canonicalPathCache.set(key, value);
+  return value;
+}
 
 /** Separator normalization only — the realpath-free half of toCanonicalPath. */
 function toForwardSlashes(p: string): string {
@@ -62,14 +89,20 @@ function toForwardSlashes(p: string): string {
  * of git-reported paths and reporter module paths, and repeated realpathSync
  * calls on the same string are wasted syscalls. The cache is an internal
  * performance detail — callers see a pure function.
+ *
+ * DELIBERATE LIMITATION: because results are memoized for the process lifetime,
+ * a symlink retargeted mid-process (e.g. during a long watch-mode session)
+ * continues to serve the previously-resolved canonical path until the memo is
+ * cleared (the MAX_CANONICAL_CACHE cap-clear) or the process restarts. This is
+ * fail-safe: a stale canonical path merely orphans its graph entry, and the
+ * cache-miss / full-suite fallback re-records it canonically on the next run.
  */
 export function toCanonicalPath(inputPath: string): string {
   const cached = canonicalPathCache.get(inputPath);
   if (cached !== undefined) return cached;
 
   const result = computeCanonicalPath(inputPath);
-  canonicalPathCache.set(inputPath, result);
-  return result;
+  return memoSet(inputPath, result);
 }
 
 function computeCanonicalPath(inputPath: string): string {
@@ -84,12 +117,26 @@ function realpathOrNearestAncestor(absolutePath: string): string {
   let current = absolutePath;
   const missingSuffix: string[] = [];
 
+  const withSuffix = (real: string): string => {
+    if (missingSuffix.length === 0) return real;
+    const suffix = [...missingSuffix].reverse().join('/');
+    return real.endsWith('/') ? `${real}${suffix}` : `${real}/${suffix}`;
+  };
+
   while (true) {
+    // Consult the memo for the current ancestor first: sibling deleted paths
+    // (e.g. /dir/gone1.ts and /dir/gone2.ts) both walk up to the same existing
+    // ancestor, so caching the ancestor's own resolution lets them share the
+    // realpathSync lookup rather than each re-syscalling it.
+    const memoized = canonicalPathCache.get(current);
+    if (memoized !== undefined) return withSuffix(memoized);
+
     try {
       const real = toForwardSlashes(realpathSync(current));
-      if (missingSuffix.length === 0) return real;
-      const suffix = [...missingSuffix].reverse().join('/');
-      return real.endsWith('/') ? `${real}${suffix}` : `${real}/${suffix}`;
+      // Cache the ancestor's own canonical resolution (keyed by the ancestor
+      // path) so subsequent siblings hit the memo above.
+      memoSet(current, real);
+      return withSuffix(real);
     } catch {
       const parent = path.dirname(current);
       if (parent === current) {

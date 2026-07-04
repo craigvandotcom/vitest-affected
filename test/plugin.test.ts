@@ -305,6 +305,84 @@ describe('globalSetup full-suite trigger', () => {
   });
 });
 
+describe('setup/globalSetup triggers evaluate the RAW changed set (pre-filter)', () => {
+  function lastStatsReason(statsFile: string): string {
+    const lines = readFileSync(statsFile, 'utf-8').trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]).reason;
+  }
+
+  /** Build a context with explicit setupFiles / globalSetup and run the hook. */
+  async function run(
+    plugin: ReturnType<typeof vitestAffected>,
+    tmpDir: string,
+    extra: { setupFiles?: string[]; globalSetup?: string | string[] },
+  ) {
+    const projectConfig = {
+      include: ['tests/**/*.test.ts'],
+      exclude: [] as string[],
+      setupFiles: extra.setupFiles ?? [],
+      globalSetup: extra.globalSetup,
+    };
+    const project = { config: projectConfig };
+    const vitest = {
+      config: { root: tmpDir, watch: false },
+      projects: [project],
+      reporters: [] as unknown[],
+      onFilterWatchedSpecification: () => {},
+    };
+    const hook = (plugin as Record<string, unknown>).configureVitest as (
+      ctx: { vitest: typeof vitest; project: typeof project },
+    ) => Promise<void>;
+    await hook({ vitest, project });
+    return projectConfig;
+  }
+
+  test('a setupFiles entry listed in ignoreChangedFiles STILL forces full suite (reason=setup-file-change)', async () => {
+    // Before the fix, the setup check ran on the relevance-FILTERED set, so an
+    // ignoreChangedFiles rule matching the setup file dropped it → under-select.
+    // Now the check runs on the raw set, so it fires regardless of the ignore.
+    const { tmpDir } = setupOrphanFixture();
+    const setupPath = path.join(tmpDir, 'setup.ts');
+    writeFileSync(setupPath, 'export function setup() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({
+        changedFiles: [setupPath],
+        cache: true,
+        statsFile,
+        ignoreChangedFiles: ['setup.ts'], // would otherwise filter it out
+      }),
+      tmpDir,
+      { setupFiles: [setupPath] },
+    );
+
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('setup-file-change');
+  });
+
+  test('a globalSetup entry listed in ignoreChangedFiles STILL forces full suite (reason=global-setup-change)', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const globalSetupPath = path.join(tmpDir, 'global-setup.ts');
+    writeFileSync(globalSetupPath, 'export function setup() {}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({
+        changedFiles: [globalSetupPath],
+        cache: true,
+        statsFile,
+        ignoreChangedFiles: ['global-setup.ts'],
+      }),
+      tmpDir,
+      { globalSetup: globalSetupPath },
+    );
+
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('global-setup-change');
+  });
+});
+
 describe('symlinked rootDir canonicalization', () => {
   test('selective selection converges when rootDir and changed files arrive through a symlink alias', async () => {
     // The production scenario behind boundary canonicalization: the project

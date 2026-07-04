@@ -306,4 +306,30 @@ describe('mergeRuntimeEdges', () => {
     // still a fresh map, not the same reference
     expect(merged).not.toBe(base);
   });
+
+  test('structural sharing: untouched entries reuse base Set identity; affected entries are new', () => {
+    // shared.ts loses a.test.ts (in scope) → affected → NEW Set.
+    // untouched.ts has only b.test.ts (out of scope) → UNTOUCHED → SAME Set.
+    const base = rmap({
+      '/p/src/shared.ts': ['/p/a.test.ts'],
+      '/p/src/untouched.ts': ['/p/b.test.ts'],
+    });
+    const fresh = rmap({
+      '/p/src/moved.ts': ['/p/a.test.ts'],
+    });
+
+    const merged = mergeRuntimeEdges(base, fresh, 'all');
+
+    // Untouched entry: exact same Set instance (no clone).
+    expect(merged.get('/p/src/untouched.ts')).toBe(base.get('/p/src/untouched.ts'));
+    // Affected entry: shared.ts lost its only edge → dropped; moved.ts is new.
+    expect(merged.has('/p/src/shared.ts')).toBe(false);
+    expect(merged.get('/p/src/moved.ts')).not.toBe(base.get('/p/src/moved.ts'));
+    expect(merged.get('/p/src/moved.ts')).toEqual(new Set(['/p/a.test.ts']));
+    // Inputs untouched.
+    expect(plain(base)).toEqual({
+      '/p/src/shared.ts': ['/p/a.test.ts'],
+      '/p/src/untouched.ts': ['/p/b.test.ts'],
+    });
+  });
 });

@@ -75,6 +75,38 @@ function setupProject(): { tmpDir: string; mainPath: string; testPath: string } 
   return { tmpDir, mainPath, testPath };
 }
 
+/**
+ * Temp project WITHOUT a warm cache — the plugin takes the cache-miss
+ * full-suite path, so no selective decision is applied and selectedTests stays
+ * null (self-verify is skipped). Lets a zero-edge test feed many modules
+ * without tripping the selection self-verify.
+ */
+function setupProjectNoCache(): { tmpDir: string; mainPath: string } {
+  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-heartbeat-nc-')));
+  tempDirs.push(tmpDir);
+
+  mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+  mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
+  writeFileSync(path.join(tmpDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+  writeFileSync(path.join(tmpDir, 'src', 'main.ts'), 'export const main = 1;\n');
+  writeFileSync(
+    path.join(tmpDir, 'tests', 'main.test.ts'),
+    'import { main } from "../src/main";\nimport { test, expect } from "vitest";\ntest("main", () => expect(main).toBe(1));\n',
+  );
+
+  return { tmpDir, mainPath: path.join(tmpDir, 'src', 'main.ts') };
+}
+
+/** Count stats lines by their `action` field. */
+function countByAction(statsFile: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const line of readStats(statsFile)) {
+    const a = String(line.action);
+    out[a] = (out[a] ?? 0) + 1;
+  }
+  return out;
+}
+
 interface MockProjectConfig {
   include: string[];
   exclude: string[];
@@ -152,7 +184,7 @@ function mockModule(
 // ===========================================================================
 
 describe('zero-edge heartbeat', () => {
-  test('completed run whose modules yield no importDurations warns loudly + emits reason=zero-edges', async () => {
+  test('a SMALL selective zero-edge run (<=5 modules) emits the line but stays QUIET on the console', async () => {
     const { tmpDir, mainPath, testPath } = setupProject();
     const statsFile = path.join(tmpDir, 'stats.jsonl');
     const { vitest, project } = createMockContext(tmpDir);
@@ -165,15 +197,56 @@ describe('zero-edge heartbeat', () => {
     const reporter = wiredReporter(vitest);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    // A test module ran but importDurations is empty (the starvation symptom).
+    // A single selected test module ran but importDurations is empty — a small
+    // run that legitimately imports only third-party modules. Line, no warn.
     const mod = mockModule(testPath, {});
     reporter.onTestModuleEnd!(mod);
     reporter.onTestRunEnd!([mod], [], 'passed' as TestRunEndReason);
+
+    expect(warn).not.toHaveBeenCalled();
+    const line = lastStat(statsFile);
+    expect(line.action).toBe('heartbeat');
+    expect(line.reason).toBe('zero-edges');
+    // Slimmed diagnostic payload: no decision-line fields leak through.
+    expect(line.graphSize).toBeUndefined();
+    expect(line.cacheHit).toBeUndefined();
+
+    // Decision (selective) + diagnostic (heartbeat) sequence: exactly 2 lines.
+    expect(readStats(statsFile)).toHaveLength(2);
+    expect(countByAction(statsFile)).toEqual({ selective: 1, heartbeat: 1 });
+  });
+
+  test('a FULL-SUITE-scale zero-edge run (>5 modules) warns loudly + emits reason=zero-edges', async () => {
+    // No cache → cache-miss full-suite decision, selectedTests stays null, so
+    // feeding many modules does not trip the selection self-verify.
+    const { tmpDir, mainPath } = setupProjectNoCache();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const reporter = wiredReporter(vitest);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // Six test modules ran (full-suite-scale) yet produced zero edges — the
+    // v0.5.0 starvation signature.
+    const mods = Array.from({ length: 6 }, (_, i) =>
+      mockModule(path.join(tmpDir, 'tests', `m${i}.test.ts`), {}),
+    );
+    for (const m of mods) reporter.onTestModuleEnd!(m);
+    reporter.onTestRunEnd!(mods, [], 'passed' as TestRunEndReason);
 
     expect(warn).toHaveBeenCalled();
     const line = lastStat(statsFile);
     expect(line.action).toBe('heartbeat');
     expect(line.reason).toBe('zero-edges');
+
+    // Decision (full-suite/cache-miss) + diagnostic (heartbeat): exactly 2 lines.
+    expect(readStats(statsFile)).toHaveLength(2);
+    expect(countByAction(statsFile)).toEqual({ 'full-suite': 1, heartbeat: 1 });
   });
 
   test('an INTERRUPTED empty run does NOT fire the heartbeat (no false positive)', async () => {
@@ -309,7 +382,47 @@ describe('selection self-verify', () => {
     reporter.onTestRunEnd!([strayMod], [], 'passed' as TestRunEndReason);
 
     expect(warn).toHaveBeenCalled();
-    expect(lastStat(statsFile).reason).toBe('selection-mismatch');
+    const line = lastStat(statsFile);
+    expect(line.reason).toBe('selection-mismatch');
+    // Slimmed diagnostic payload: strayCount, not the decision-line affectedTests.
+    expect(line.strayCount).toBe(1);
+    expect(line.affectedTests).toBeUndefined();
+
+    // Decision (selective) + diagnostic (selection-mismatch heartbeat): 2 lines.
+    expect(readStats(statsFile)).toHaveLength(2);
+    expect(countByAction(statsFile)).toEqual({ selective: 1, heartbeat: 1 });
+  });
+
+  test('a SECOND run does not re-fire selection-mismatch (one-shot self-verify reset)', async () => {
+    // selectedTests is reset to null after each run-end verification, so a later
+    // watch re-run Vitest legitimately re-scopes must NOT raise a false alarm.
+    const { tmpDir, mainPath, testPath } = setupProject();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const reporter = wiredReporter(vitest);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // First run: only the selected test runs (with a real edge) → no mismatch,
+    // and selectedTests is reset to null.
+    const mod = mockModule(testPath, { [mainPath]: { selfTime: 1, totalTime: 2 } });
+    reporter.onTestModuleEnd!(mod);
+    reporter.onTestRunEnd!([mod], [], 'passed' as TestRunEndReason);
+
+    // Second run: an EXTRA (stray) test runs. Because selectedTests was reset,
+    // self-verify does not fire again.
+    const strayPath = path.join(tmpDir, 'tests', 'stray.test.ts');
+    const strayMod = mockModule(strayPath, { [mainPath]: { selfTime: 1, totalTime: 2 } });
+    reporter.onTestModuleEnd!(strayMod);
+    reporter.onTestRunEnd!([strayMod], [], 'passed' as TestRunEndReason);
+
+    const mismatches = readStats(statsFile).filter((l) => l.reason === 'selection-mismatch');
+    expect(mismatches).toHaveLength(0);
   });
 
   test('ran-tests ⊆ selected → no self-verify warning', async () => {
