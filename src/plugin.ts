@@ -658,6 +658,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               ignoreChangedFiles: options.ignoreChangedFiles,
               includeChangedExtensions: options.includeChangedExtensions,
               configBasenames: CONFIG_BASENAMES,
+              // The cache is already loaded (step 5) by this point — pass the
+              // reverse map so a changed/deleted file already tracked as a
+              // graph key (e.g. a CSS-module edge the runtime reporter
+              // recorded) survives the extension allowlist. See
+              // ChangedFileFilterOptions.graphMembership.
+              graphMembership: reverse,
             },
           );
           ignoredCount = filtered.ignored.length;

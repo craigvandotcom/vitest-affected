@@ -28,6 +28,16 @@ export interface ChangedFileFilterResult {
   ignored: string[];
 }
 
+/**
+ * Minimal membership check — satisfied by `Map<string, unknown>`,
+ * `Set<string>`, or any object exposing a compatible `has`. Lets callers pass
+ * the loaded reverse dependency-graph map directly without this module
+ * depending on its value type.
+ */
+export interface GraphMembership {
+  has(key: string): boolean;
+}
+
 export interface ChangedFileFilterOptions {
   ignoreChangedFiles?: Array<string | RegExp>;
   includeChangedExtensions?: string[];
@@ -37,6 +47,26 @@ export interface ChangedFileFilterOptions {
    * these even if extension/path rules would otherwise ignore them.
    */
   configBasenames?: ReadonlySet<string>;
+  /**
+   * Membership check over the loaded reverse dependency-graph keys (the
+   * `reverse` map itself works — only `.has` is used). A changed/deleted file
+   * that is already a KEY in the graph is relevant regardless of extension:
+   * graph membership overrides the extension allowlist. This is what lets a
+   * CSS(-module) edit seed BFS even though its extension isn't in
+   * DEFAULT_RELEVANT_EXTENSIONS — the runtime reporter (importDurations)
+   * records edges for any module Vitest imports, with no extension filter of
+   * its own, so the seed may already be a graph node before this filter ever
+   * runs. Does NOT override an explicit `ignoreChangedFiles` rule or a
+   * built-in path/basename ignore — those reflect explicit exclusion intent
+   * and still win over graph membership.
+   *
+   * INVARIANT: keys (and the `filePath` compared against them) must already
+   * be canonical paths (`toCanonicalPath`'d) — the form changed/deleted files
+   * arrive in from git.ts / plugin.ts, matching how graph keys are built
+   * (see graph/builder.ts, graph/normalize.ts). This filter does not
+   * re-canonicalize; it compares the given path as-is.
+   */
+  graphMembership?: GraphMembership;
 }
 
 function matchesPathPrefix(rel: string, prefix: string): boolean {
@@ -105,7 +135,17 @@ function isRelevant(
     ? new Set(options.includeChangedExtensions.map((e) => (e.startsWith('.') ? e : '.' + e)))
     : DEFAULT_RELEVANT_EXTENSIONS;
   const ext = path.extname(basename).toLowerCase();
-  return allowed.has(ext);
+  if (allowed.has(ext)) return true;
+
+  // Graph-membership override: extension didn't match, but the file may
+  // already be a node in the loaded reverse dependency graph (e.g. a CSS
+  // module edge recorded by the runtime reporter, which has no extension
+  // filter of its own). Compared against `filePath` (not `rel`) — graph keys
+  // are absolute canonical paths, matching the invariant documented on
+  // `ChangedFileFilterOptions.graphMembership`.
+  if (options.graphMembership?.has(filePath)) return true;
+
+  return false;
 }
 
 /**
@@ -114,7 +154,9 @@ function isRelevant(
  * for files that can never participate in the graph (markdown, .claude/, etc).
  *
  * Config-file basenames in `options.configBasenames` are always preserved so
- * the plugin's full-suite trigger still fires.
+ * the plugin's full-suite trigger still fires. `options.graphMembership`, when
+ * provided, similarly preserves any file already tracked as a graph key
+ * regardless of extension (see its doc comment).
  */
 export function filterRelevantChangedFiles(
   files: { changed: string[]; deleted: string[] },
