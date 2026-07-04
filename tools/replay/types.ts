@@ -48,4 +48,10 @@ export interface LedgerEntry {
   timings: { totalMs: number };
   /** Present for status 'ok': the parsed shadow decision. */
   decision?: ShadowDecision;
+  /**
+   * Step-diff file list vs the commit's first parent (repo-relative). Recorded
+   * so the analysis layer can compute the per-commit required-test set without
+   * re-walking git — the run dir stays self-contained.
+   */
+  changedFiles?: string[];
 }

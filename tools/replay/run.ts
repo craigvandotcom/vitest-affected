@@ -6,9 +6,10 @@
  * Devtool only: NOT part of the published package (absent from package.json
  * files/exports and the tsup entries). It drives the plugin through the
  * consumer's OWN vitest config — it imports nothing from src/. The analysis
- * layer (a later bead) imports mergeRuntimeEdges from dist.
+ * layer (analysis.ts / evolution.ts / detector.ts / report.ts) runs after the
+ * walk and imports mergeRuntimeEdges from dist (never src).
  */
-import { appendFile } from 'node:fs/promises';
+import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,9 +26,17 @@ import {
   symlinkDist,
   cloneConsumer,
   createRunDir,
+  CONSUMER_DIRNAME,
 } from './workdir.js';
 import { runCommit } from './exec.js';
 import { runGit } from './git-cmd.js';
+import {
+  analyzeAndReport,
+  flakeCheckCommit,
+  spawnDisabledRerun,
+  parseOutcomes,
+} from './analysis.js';
+import type { FlakeLogEntry } from './analysis.js';
 import type { LedgerEntry } from './types.js';
 
 export interface CliArgs {
@@ -35,6 +44,10 @@ export interface CliArgs {
   repo?: string;
   range?: string;
   sample?: number;
+  /** Re-run ONLY the analysis + report over an existing run dir. */
+  analyzeOnly?: string;
+  /** Clone root override for --analyze-only path resolution. */
+  root?: string;
 }
 
 export const USAGE = `vitest-affected replay harness
@@ -44,11 +57,16 @@ consumer's own vitest config) to measure the plugin's true miss-rate.
 
 Usage:
   npx tsx tools/replay/run.ts --repo <path> --range <from>..<to> [--sample <n>]
+  npx tsx tools/replay/run.ts --analyze-only <runDir> [--root <cloneDir>]
 
 Options:
   --repo <path>        Path to the consumer repo to clone (e.g. body-compass-app).
   --range <from>..<to> Commit range to walk (first-parent chain of main).
   --sample <n>         Replay only the most recent <n> commits of the range.
+  --analyze-only <dir> Skip the walk: re-run analysis + report over an existing
+                       run dir (walks are ~320s/commit; analysis iterates fast).
+  --root <path>        Clone root for --analyze-only path resolution (defaults
+                       to <runDir>/../../${CONSUMER_DIRNAME}, the A2a layout).
   -h, --help           Show this help.
 
 Notes:
@@ -85,11 +103,24 @@ export function parseArgs(argv: string[]): CliArgs {
         args.sample = n;
         break;
       }
+      case '--analyze-only':
+        args.analyzeOnly = argv[++i];
+        break;
+      case '--root':
+        args.root = argv[++i];
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
   }
   if (args.help) return args;
+  if (args.analyzeOnly !== undefined) {
+    if (!args.analyzeOnly) {
+      throw new Error('--analyze-only requires a run dir path');
+    }
+    // Analysis-only mode needs no walk arguments.
+    return args;
+  }
   if (!args.repo) throw new Error('--repo is required');
   if (!args.range) throw new Error('--range is required');
   if (!/^.+\.\..+$/.test(args.range)) {
@@ -115,6 +146,19 @@ export async function main(argv: string[]): Promise<string> {
     process.stdout.write(USAGE);
     return '';
   }
+
+  // ANALYZE-ONLY: re-run the analysis + report over an existing run dir —
+  // analysis must iterate fast on expensive walk data (~320s/commit).
+  if (args.analyzeOnly !== undefined) {
+    const runDir = path.resolve(args.analyzeOnly);
+    const rootDir = args.root
+      ? path.resolve(args.root)
+      : path.resolve(runDir, '..', '..', CONSUMER_DIRNAME);
+    const reportPath = await analyzeAndReport({ runDir, rootDir });
+    process.stdout.write(`[replay] analysis report: ${reportPath}\n`);
+    return runDir;
+  }
+
   const repo = args.repo as string;
   const range = args.range as string;
 
@@ -140,6 +184,11 @@ export async function main(argv: string[]): Promise<string> {
   );
 
   let prevLockHash: string | null = null;
+  // Outcomes at the previous ok commit — the C-1 side of the flake guard.
+  // null = no baseline yet: the FIRST measurable commit must NOT flake-check
+  // (every failure would spuriously look "new" and a baseline-broken test
+  // would be laundered into 'flaky'); its outcomes become the baseline.
+  let prevOutcomes: Map<string, string> | null = null;
   for (const sha of chain) {
     const changedFiles = await getCommitChangedFiles(cloneDir, sha);
     const cls = classifyCommit(sha, changedFiles);
@@ -149,6 +198,7 @@ export async function main(argv: string[]): Promise<string> {
         status: 'skipped',
         reason: `config/lockfile touched: ${cls.skipTriggers.join(', ')}`,
         timings: { totalMs: 0 },
+        changedFiles,
       });
       process.stdout.write(`[replay] ${sha} SKIPPED (${cls.skipTriggers.join(', ')})\n`);
       continue;
@@ -166,6 +216,7 @@ export async function main(argv: string[]): Promise<string> {
         status: 'BROKEN',
         reason: `install failed: ${err instanceof Error ? err.message : String(err)}`,
         timings: { totalMs: 0 },
+        changedFiles,
       });
       process.stdout.write(`[replay] ${sha} BROKEN (install)\n`);
       continue;
@@ -184,9 +235,54 @@ export async function main(argv: string[]): Promise<string> {
       reason: result.reason,
       timings: { totalMs: result.totalMs },
       ...(result.decision ? { decision: result.decision } : {}),
+      changedFiles,
     });
     process.stdout.write(`[replay] ${sha} ${result.status} (${result.reason})\n`);
+
+    // FLAKE GUARD — wired here, where per-commit outcomes are first available:
+    // a NEW failure (failed at C, not at C-1) is re-run ONCE with the plugin
+    // fully disabled (no cache/stats side effects). Re-runs are logged to
+    // flake-log.jsonl; the analysis excludes logged flakes from the
+    // outcome-confirmed tier.
+    if (result.status === 'ok' && result.outcomesPath) {
+      const curOutcomes = parseOutcomes(
+        await readFile(result.outcomesPath, 'utf-8'),
+      );
+      const flake = await flakeCheckCommit(sha, prevOutcomes, curOutcomes, () =>
+        spawnDisabledRerun(cloneDir),
+      );
+      if (flake.reran) {
+        const logEntry: FlakeLogEntry = {
+          sha,
+          newFailures: flake.newFailures,
+          confirmed: flake.confirmed,
+          flaky: flake.flaky,
+        };
+        await appendFile(
+          path.join(dirs.runDir, 'flake-log.jsonl'),
+          JSON.stringify(logEntry) + '\n',
+          'utf-8',
+        );
+        process.stdout.write(
+          `[replay] ${sha} flake-guard re-run: ${flake.newFailures.length} new failure(s), ` +
+            `${flake.confirmed.length} confirmed, ${flake.flaky.length} flaky\n`,
+        );
+      }
+      if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
+    }
   }
+
+  // ANALYSIS (A2b) — turn the raw artifacts into the honest measurement. The
+  // degeneration guard (zero selective decisions across the walk) throws here,
+  // surfacing on the report path (CLI exits non-zero) — but only AFTER the
+  // diagnosis analysis.md has been written into the run dir (analyzeAndReport),
+  // so the expensive walk stays diagnosable and re-analyzable without a
+  // re-walk (--analyze-only).
+  const reportPath = await analyzeAndReport({
+    runDir: dirs.runDir,
+    rootDir: cloneDir,
+  });
+  process.stdout.write(`[replay] analysis report: ${reportPath}\n`);
 
   return dirs.runDir;
 }
