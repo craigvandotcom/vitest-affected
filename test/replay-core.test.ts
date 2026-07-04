@@ -261,10 +261,14 @@ describe('exec: environment hygiene', () => {
       PATH: '/usr/bin',
       CI: '1',
       GITHUB_ACTIONS: 'true',
+      // An inherited kill-switch would suppress the plugin silently — the walk
+      // fails closed (all BROKEN) but tells you nothing. Must be cleared.
+      VITEST_AFFECTED_DISABLED: '1',
     };
     const env = buildRunEnv(base, '/run/stats/abc.jsonl');
     expect(env.CI).toBeUndefined();
     expect(env.GITHUB_ACTIONS).toBeUndefined();
+    expect(env.VITEST_AFFECTED_DISABLED).toBeUndefined();
     expect(env.VITEST_AFFECTED_SHADOW).toBe('1');
     expect(env.VITEST_AFFECTED_STATS_FILE).toBe('/run/stats/abc.jsonl');
     // PATH preserved.

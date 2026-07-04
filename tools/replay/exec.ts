@@ -48,6 +48,11 @@ export function buildRunEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.CI;
   delete env.GITHUB_ACTIONS;
+  // An inherited VITEST_AFFECTED_DISABLED=1 would suppress the plugin entirely:
+  // fail-closed (every commit BROKEN via the missing-shadow-line guard), but a
+  // uselessly misleading walk. The disabled early-return deliberately emits
+  // nothing, so it is indistinguishable from a broken harness — clear it.
+  delete env.VITEST_AFFECTED_DISABLED;
   env.VITEST_AFFECTED_SHADOW = '1';
   env.VITEST_AFFECTED_STATS_FILE = statsFilePath;
   return env;
