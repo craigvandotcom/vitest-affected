@@ -119,12 +119,50 @@ const CONFIG_BASENAMES = new Set([
  */
 export function createRuntimeReporter(
   onEdgesCollected: (edges: Map<string, Set<string>>) => void,
-): { reporter: Reporter; setRootDir: (dir: string) => void } {
+  diagnostics: {
+    /**
+     * Called on a COMPLETED run (reason !== 'interrupted', no unhandled errors)
+     * where test modules actually ran (testModules.length > 0) yet the reporter
+     * collected ZERO dependency edges across every module. The universal
+     * silent-starvation net: whatever the cause — importDurations disabled
+     * (Vitest 4's `limit` default 0, the v0.5.0 regression), the reporter
+     * detached, config gating, or the importDurations API drifting to a shape
+     * we can't read — the symptom is always the same (no edges), and it must be
+     * observable rather than silently swallowed. Subsumes the spec's runtime
+     * "importDurations presence/shape on first module" check: any shape drift
+     * that breaks edge collection lands here as a zero-edge run.
+     */
+    onZeroEdgeRun?: () => void;
+    /**
+     * Called after a SELECTIVE run when one or more test modules ran that were
+     * NOT in the selected set (ran-tests ⊄ selected). Signals the include
+     * mutation silently lost effect (e.g. a future Vitest ignoring
+     * `project.config.include`). `strays` are canonical paths of the offenders.
+     */
+    onSelectionMismatch?: (strays: string[]) => void;
+  } = {},
+): {
+  reporter: Reporter;
+  setRootDir: (dir: string) => void;
+  setSelectedTests: (tests: string[]) => void;
+} {
   let rootDir: string | null = null;
   const runtimeReverse = new Map<string, Set<string>>();
+  // Canonical paths of every test module observed this run — the ran-tests set
+  // for selection self-verify. Reset at each (non-interrupted) run end,
+  // mirroring runtimeReverse.
+  const ranTests = new Set<string>();
+  // The selected set the plugin applied to project.config.include (canonical
+  // paths). `null` = no selective decision was applied this run (full-suite,
+  // shadow mode, or not yet decided) → self-verify is skipped.
+  let selectedTests: string[] | null = null;
 
   function setRootDir(dir: string): void {
     rootDir = dir;
+  }
+
+  function setSelectedTests(tests: string[]): void {
+    selectedTests = tests;
   }
 
   function onTestModuleEnd(testModule: TestModule): void {
@@ -139,6 +177,9 @@ export function createRuntimeReporter(
     // walk it up to cwd and fabricate a bogus absolute path.
     if (!path.isAbsolute(rawTestPath)) return;
     const testPath = toCanonicalPath(rawTestPath);
+    // Record every real test module that ran — the ran-tests set consumed by
+    // selection self-verify at run end.
+    ranTests.add(testPath);
 
     const { importDurations } = testModule.diagnostic();
     // rootDir is canonicalized once at plugin init; reuse that form here.
@@ -166,12 +207,24 @@ export function createRuntimeReporter(
   }
 
   function onTestRunEnd(
-    _testModules: ReadonlyArray<TestModule>,
-    _errors: ReadonlyArray<unknown>,
+    testModules: ReadonlyArray<TestModule>,
+    errors: ReadonlyArray<unknown>,
     reason: TestRunEndReason,
   ): void {
-    // Interrupt: skip both persistence and clear
+    // Interrupt: skip persistence, diagnostics, and clear. `vitest list`
+    // constructs the reporter but never calls onTestRunEnd, so it cannot
+    // produce a false-positive heartbeat here either.
     if (reason === 'interrupted') return;
+
+    // SELECTION SELF-VERIFY: a selective decision was applied this run, so
+    // every test that ran must be in the selected set. A stray means the
+    // include mutation silently lost effect (Vitest ran tests we did not
+    // select) — surface it loudly rather than trust a selection Vitest ignored.
+    if (selectedTests !== null && diagnostics.onSelectionMismatch) {
+      const selectedSet = new Set(selectedTests);
+      const strays = [...ranTests].filter((t) => !selectedSet.has(t));
+      if (strays.length > 0) diagnostics.onSelectionMismatch(strays);
+    }
 
     if (runtimeReverse.size > 0) {
       // Snapshot: pass a copy so clear() doesn't affect the callback's data
@@ -179,8 +232,19 @@ export function createRuntimeReporter(
         [...runtimeReverse].map(([k, v]) => [k, new Set(v)]),
       );
       onEdgesCollected(snapshot);
+    } else if (
+      testModules.length > 0 &&
+      errors.length === 0 &&
+      diagnostics.onZeroEdgeRun
+    ) {
+      // ZERO-EDGE HEARTBEAT: tests ran to completion (modules present, no
+      // unhandled errors) yet produced no edges. Distinct from an empty
+      // selection (testModules.length === 0), which is a legitimate no-run.
+      diagnostics.onZeroEdgeRun();
     }
+
     runtimeReverse.clear();
+    ranTests.clear();
   }
 
   const reporter: Reporter = {
@@ -188,7 +252,7 @@ export function createRuntimeReporter(
     onTestRunEnd,
   };
 
-  return { reporter, setRootDir };
+  return { reporter, setRootDir, setSelectedTests };
 }
 
 function writeStatsLine(
@@ -323,6 +387,33 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // On Vitest 3.2.x this field is harmless: getImportDurations() ignores it.
         const exp = (project.config as { experimental?: ExperimentalImportDurations })
           .experimental;
+        if (exp && exp.importDurations !== undefined) {
+          // IMPORTDURATIONS SHAPE-CHECK. importDurations is explicitly
+          // experimental upstream and was recently expanded (print/failOnDanger/
+          // thresholds) — shape drift is expected, not hypothetical. We tolerate
+          // ADDITIVE drift (unknown/new fields) but bail loudly on STRUCTURAL
+          // drift that would break the force-enable write below: importDurations
+          // must be a plain object, and if `limit` is present it must be a
+          // number (we overwrite it). Anything else means we cannot trust the
+          // runtime import data → full-suite fallback, never a silent no-op.
+          const id: unknown = exp.importDurations;
+          const isPlainObject =
+            typeof id === 'object' && id !== null && !Array.isArray(id);
+          const limitOk =
+            isPlainObject &&
+            (!('limit' in (id as object)) ||
+              typeof (id as { limit?: unknown }).limit === 'number');
+          if (!isPlainObject || !limitOk) {
+            console.warn(
+              '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
+            );
+            if (statsFile) writeStatsLine(statsFile, rootDir, {
+              action: 'full-suite', reason: 'import-durations-shape',
+              graphSize: reverse.size, durationMs: Date.now() - startMs,
+            }, verbose, shadow);
+            return;
+          }
+        }
         if (exp) {
           exp.importDurations = {
             ...exp.importDurations,
@@ -345,18 +436,50 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // On selective runs only a subset of tests execute, so we merge new edges
         // into the existing cache rather than replacing it (which would destroy
         // graph data for tests that didn't run this time).
-        const { reporter, setRootDir } = createRuntimeReporter((edges) => {
-          if (!cacheDir) return;
-          try {
-            // Per-test overwrite for every test that ran this cycle: strip
-            // stale edges, merge fresh ones (so removed imports are reflected,
-            // not accumulated forever). Persistence stays here at the call-site.
-            reverse = mergeRuntimeEdges(reverse, edges, 'all');
-            saveCacheSync(cacheDir, reverse);
-          } catch {
-            // Best-effort: runtime edge persistence failed — cache will be stale next run
-          }
-        });
+        const { reporter, setRootDir, setSelectedTests } = createRuntimeReporter(
+          (edges) => {
+            if (!cacheDir) return;
+            try {
+              // Per-test overwrite for every test that ran this cycle: strip
+              // stale edges, merge fresh ones (so removed imports are reflected,
+              // not accumulated forever). Persistence stays here at the call-site.
+              reverse = mergeRuntimeEdges(reverse, edges, 'all');
+              saveCacheSync(cacheDir, reverse);
+            } catch {
+              // Best-effort: runtime edge persistence failed — cache will be stale next run
+            }
+          },
+          {
+            // ZERO-EDGE HEARTBEAT — fires post-run; statsFile/rootDir are
+            // captured into this closure because the reporter runs AFTER
+            // configureVitest returns. Emitted with shadow=false: this is a
+            // post-run diagnostic, not a selection decision, so it must NOT be
+            // remapped into the shadow-selective/shadow-full-suite namespace.
+            onZeroEdgeRun: () => {
+              console.warn(
+                '[vitest-affected] HEARTBEAT: a completed test run collected ZERO ' +
+                  'dependency edges from importDurations across all modules. The reverse ' +
+                  'graph cannot be built or updated, so selection will fall back to the ' +
+                  'full suite indefinitely. This is the silent-starvation signal — verify ' +
+                  "that Vitest's importDurations collection is enabled and its API is intact.",
+              );
+              if (statsFile) writeStatsLine(statsFile, rootDir, {
+                action: 'heartbeat', reason: 'zero-edges',
+                graphSize: 0, cacheHit,
+              }, verbose, false);
+            },
+            // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
+            onSelectionMismatch: (strays) => {
+              console.warn(
+                `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
+              );
+              if (statsFile) writeStatsLine(statsFile, rootDir, {
+                action: 'heartbeat', reason: 'selection-mismatch',
+                affectedTests: strays.length,
+              }, verbose, false);
+            },
+          },
+        );
         setRootDir(rootDir);
 
         // configureVitest fires BEFORE Vitest's createReporters assigns vitest.reporters.
@@ -603,7 +726,12 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
             // Shadow guards the mutation site: compute the decision, never apply it.
-            if (!shadow) project.config.include = [];
+            if (!shadow) {
+              project.config.include = [];
+              // Record the (empty) selected set so self-verify catches a future
+              // Vitest that runs everything on an empty include.
+              setSelectedTests([]);
+            }
             if (statsFile) writeStatsLine(statsFile, rootDir, {
               action: 'selective', reason: 'allow-no-tests',
               changedFiles: changed.length, deletedFiles: deleted.length,
@@ -667,7 +795,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // 17. Apply results
         if (validTests.length > 0) {
           // Shadow guards the mutation site: compute the selection, never apply it.
-          if (!shadow) project.config.include = validTests;
+          if (!shadow) {
+            project.config.include = validTests;
+            // Record the selected set for the reporter's post-run self-verify.
+            setSelectedTests(validTests);
+          }
           if (statsFile) writeStatsLine(statsFile, rootDir, {
             action: 'selective',
             changedFiles: changed.length, deletedFiles: deleted.length,
