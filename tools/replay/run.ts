@@ -6,9 +6,10 @@
  * Devtool only: NOT part of the published package (absent from package.json
  * files/exports and the tsup entries). It drives the plugin through the
  * consumer's OWN vitest config — it imports nothing from src/. The analysis
- * layer (a later bead) imports mergeRuntimeEdges from dist.
+ * layer (analysis.ts / evolution.ts / detector.ts / report.ts) runs after the
+ * walk and imports mergeRuntimeEdges from dist (never src).
  */
-import { appendFile } from 'node:fs/promises';
+import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -28,6 +29,14 @@ import {
 } from './workdir.js';
 import { runCommit } from './exec.js';
 import { runGit } from './git-cmd.js';
+import {
+  analyzeRun,
+  writeReport,
+  flakeCheckCommit,
+  spawnDisabledRerun,
+  parseOutcomes,
+} from './analysis.js';
+import type { FlakeLogEntry } from './analysis.js';
 import type { LedgerEntry } from './types.js';
 
 export interface CliArgs {
@@ -140,6 +149,8 @@ export async function main(argv: string[]): Promise<string> {
   );
 
   let prevLockHash: string | null = null;
+  // Outcomes at the previous ok commit — the C-1 side of the flake guard.
+  let prevOutcomes: Map<string, string> = new Map();
   for (const sha of chain) {
     const changedFiles = await getCommitChangedFiles(cloneDir, sha);
     const cls = classifyCommit(sha, changedFiles);
@@ -149,6 +160,7 @@ export async function main(argv: string[]): Promise<string> {
         status: 'skipped',
         reason: `config/lockfile touched: ${cls.skipTriggers.join(', ')}`,
         timings: { totalMs: 0 },
+        changedFiles,
       });
       process.stdout.write(`[replay] ${sha} SKIPPED (${cls.skipTriggers.join(', ')})\n`);
       continue;
@@ -166,6 +178,7 @@ export async function main(argv: string[]): Promise<string> {
         status: 'BROKEN',
         reason: `install failed: ${err instanceof Error ? err.message : String(err)}`,
         timings: { totalMs: 0 },
+        changedFiles,
       });
       process.stdout.write(`[replay] ${sha} BROKEN (install)\n`);
       continue;
@@ -184,9 +197,49 @@ export async function main(argv: string[]): Promise<string> {
       reason: result.reason,
       timings: { totalMs: result.totalMs },
       ...(result.decision ? { decision: result.decision } : {}),
+      changedFiles,
     });
     process.stdout.write(`[replay] ${sha} ${result.status} (${result.reason})\n`);
+
+    // FLAKE GUARD — wired here, where per-commit outcomes are first available:
+    // a NEW failure (failed at C, not at C-1) is re-run ONCE with the plugin
+    // fully disabled (no cache/stats side effects). Re-runs are logged to
+    // flake-log.jsonl; the analysis excludes logged flakes from the
+    // outcome-confirmed tier.
+    if (result.status === 'ok' && result.outcomesPath) {
+      const curOutcomes = parseOutcomes(
+        await readFile(result.outcomesPath, 'utf-8'),
+      );
+      const flake = await flakeCheckCommit(sha, prevOutcomes, curOutcomes, () =>
+        spawnDisabledRerun(cloneDir),
+      );
+      if (flake.reran) {
+        const logEntry: FlakeLogEntry = {
+          sha,
+          newFailures: flake.newFailures,
+          confirmed: flake.confirmed,
+          flaky: flake.flaky,
+        };
+        await appendFile(
+          path.join(dirs.runDir, 'flake-log.jsonl'),
+          JSON.stringify(logEntry) + '\n',
+          'utf-8',
+        );
+        process.stdout.write(
+          `[replay] ${sha} flake-guard re-run: ${flake.newFailures.length} new failure(s), ` +
+            `${flake.confirmed.length} confirmed, ${flake.flaky.length} flaky\n`,
+        );
+      }
+      if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
+    }
   }
+
+  // ANALYSIS (A2b) — turn the raw artifacts into the honest measurement. The
+  // degeneration guard (zero selective decisions across the walk) throws here,
+  // surfacing on the report path: the CLI catch prints it and exits non-zero.
+  const analysis = await analyzeRun({ runDir: dirs.runDir, rootDir: cloneDir });
+  const reportPath = await writeReport(dirs.runDir, analysis);
+  process.stdout.write(`[replay] analysis report: ${reportPath}\n`);
 
   return dirs.runDir;
 }
