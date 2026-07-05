@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-gate:
+    name: quality-gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Build FIRST: tools/replay imports from ../../dist/index.js by design
+      # (the harness measures the BUILT artifact, never src) — on a fresh
+      # checkout dist/ doesn't exist yet, so type-checking before building
+      # fails with TS2307.
+      - name: Build
+        run: npm run build
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # Run the plugin's OWN suite with vitest-affected DISABLED so the suite
+      # never selects a subset of itself — the gate always exercises every test.
+      # The suite spawns real nested vitest runs (replay/integration); path
+      # canonicalization (toCanonicalPath) makes it platform-neutral, so the
+      # matrix is green on both Linux and macOS.
+      - name: Test (full suite, plugin disabled)
+        run: npx vitest run
+        env:
+          VITEST_AFFECTED_DISABLED: '1'
