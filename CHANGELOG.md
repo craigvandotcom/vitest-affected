@@ -5,7 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-07-06
+
+First stable release. Two tracks of work land here: **Track 1** hardens the
+silent-failure surface (heartbeats, path canonicalization, graph-membership
+override, `globalSetup` tracking), and **Track 2** adds observability and
+coverage reach (shadow mode, explain trail + CLI, cache staleness
+reconciliation, `resolve.alias` delta-parse, worker-script seeding, cache v3
+portable format, `fullSuiteTriggers`).
+
+### ⚠️ BREAKING
+
+- **Cache v3 on-disk format** — `.vitest-affected/graph.json` now stores paths
+  **relative to the (canonical) `rootDir`** instead of absolute paths, making
+  the cache portable across checkout locations (CI cache restore, moved
+  worktrees). In-memory representation stays absolute; relativization happens
+  only at the persistence boundary. **Migration is automatic and requires no
+  action:** v2 and v1 caches auto-migrate on read; a v3 cache without the new
+  `lastFullRebuild`/`runCount` metadata still loads (meta defaults to zero, so
+  staleness is not flagged until the next full run seeds the baseline); unknown
+  cache versions degrade to a safe cache miss (full suite, then the cache is
+  re-written in v3). The format change is only observable on **write** — nothing
+  a consumer imports changes.
+- **Canonicalized cache keys** — every path boundary now routes through a new
+  `toCanonicalPath()` helper (resolves symlinks via `realpathSync`, normalizes
+  separators to `/`). The v2 schema version is unchanged; this is a value-level
+  change to what a key *looks like*. **Self-healing, no migration needed:**
+  entries written through a different alias of the same file (macOS
+  `/var` → `/private/var` temp symlinks, a symlinked project root, Windows
+  separators) are canonicalized on read and converge instead of orphaning;
+  entries merging to the same canonical key are unioned. Any entry that still
+  fails to match simply misses — the cache-miss fallback (full suite) re-records
+  it canonically on the next run.
+
+### Migration from 0.x
+
+- **No action required.** Delete `.vitest-affected/` if you want a clean v3
+  cache immediately, or just run your suite once — v2/v1 caches auto-migrate and
+  stale aliased entries self-heal on the next full run.
+- The `vitest` peerDependency remains capped at `>=3.2.0 <5.0.0` (see
+  [0.5.0](#050---2026-05-03)). Vitest 5 is not yet validated — tracked for 1.1.
 
 ### Added
 
@@ -16,27 +55,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Line taxonomy** — stats lines fall into two classes: exactly one **DECISION** line per `configureVitest` exit (`action: "selective"`/`"full-suite"`, or shadow variants) carrying the full decision fields, and 0..n post-run **DIAGNOSTIC** lines (`action: "heartbeat"`) carrying only fields meaningful post-run — `timestamp`, `action`, `reason`, plus `strayCount` on `selection-mismatch` (decision-line fields like `graphSize`/`affectedTests` are no longer reused on heartbeat lines). Consumers/harnesses filter by `action`. The zero-edge line is always emitted, but its loud `console.warn` is scoped to full-suite-scale starvation (`testModules.length > 5`) so a small third-party-only selective run stays quiet.
   - **Reporter registration** stays on the existing `Object.defineProperty` interception of `vitest.reporters`. The documented `config.reporters.push([['name', {}]])` path takes a built-in name or a module path loaded in isolation — it cannot carry our live closure reporter (which shares `rootDir`, the reverse map, the cache-save callback, `statsFile`, and the selected set with the plugin instance). The heartbeats, not the registration path, are what make silent failure impossible.
 
-### Added (Track 2)
-
 - **`resolve.alias` feeds the static delta-parser** — string `find` aliases from the resolved Vite/Vitest config are passed into oxc-resolver, so brand-new imports through Vite-only aliases (stub packages, path shims) resolve during delta-parse instead of silently dropping the edge. User RegExp aliases are skipped with a startup warning (a lossy conversion would silently reopen the hole; runtime edges still cover them once the cache is warm); Vite's built-in `@vite/env` / `@vite/client` RegExp aliases are ignored silently.
 - **Explain trail** — per-test selection provenance (seed → edge chain): opt-in `explain` plugin option surfaces it on selective stats lines, and a new `npx vitest-affected-explain <testfile>` CLI answers "why is this test (not) selected right now?" against the cache + git state. New public API: `bfsAffectedTestsWithProvenance`, `explainSelection`.
 - **Cache staleness reconciliation** — the v3 cache tracks `lastFullRebuild` + selective `runCount`; past `staleCacheDays` (default 14) or `maxSelectiveRuns` (default 50) the plugin warns loudly and emits a `cache-stale` diagnostic recommending a full run (never force-runs; a full-suite run resets the baseline).
 - **Worker script changes now seed selection** — `new Worker(new URL('./x.ts', import.meta.url))` and the `SharedWorker` form are extracted during delta-parse (targeted source scan; template-literal/dynamic specifiers skipped). This is the ONLY coverage path for worker scripts: vitest's `importDurations` never sees worker-loaded modules (they execute outside vite-node's tracked VM), so runtime edges cannot cover them. Documented limitation: string-path workers served from `public/` (e.g. `new Worker('/workers/x.js')`) are not resolvable to source — declare those via `fullSuiteTriggers`.
-- **Cache v3: repo-relative paths on disk** — `graph.json` now stores paths relative to the (canonical) `rootDir`, making the cache portable across checkout locations (CI cache restore, moved worktrees). In-memory representation stays absolute; relativization happens only at the persistence boundary. v2 (and v1) caches auto-migrate on read; unknown versions degrade to a safe cache miss. BREAKING format change on write (v3), transparent to consumers.
+- **Cache v3: repo-relative paths on disk** — `graph.json` now stores paths relative to the (canonical) `rootDir`, making the cache portable across checkout locations (CI cache restore, moved worktrees). In-memory representation stays absolute; relativization happens only at the persistence boundary. v2 (and v1) caches auto-migrate on read; unknown versions degrade to a safe cache miss. See ⚠️ BREAKING above.
+- **Shadow-verification mode** — new `shadow?: boolean` option (or `VITEST_AFFECTED_SHADOW=1`, which activates it regardless of config) runs the full selection pipeline but never mutates `project.config.include`, so a single `vitest run` yields ground truth (all tests) alongside the would-be decision. Stats lines are remapped into a shadow namespace: `shadow-selective` carries `selectedFiles: string[]` (the would-be selection) and `shadow-full-suite` carries `selectedFiles: null` ("all tests"), with the original `reason` retained. `VITEST_AFFECTED_DISABLED=1` still wins (fully inert). `VITEST_AFFECTED_STATS_FILE=<path>` forces stats output to a path, overriding the config `statsFile`. Every exit path now emits exactly one stats line when a stats path is known (the four previously-silent early returns plus the catch-all `reason: "error"`); the disabled early-return remains silent by design.
+- **Public export: `mergeRuntimeEdges` + `ReverseMap` type** — the reporter's per-test runtime-edge merge is now an exported pure function `mergeRuntimeEdges(base: ReverseMap, fresh: ReverseMap, scope: Set<string> | 'all'): ReverseMap`. Additive public API (re-exported from the package entry). `scope: 'all'` overwrites every test present in `fresh`; a `Set<testPath>` restricts the overwrite to the listed tests and preserves other tests' edges. It never mutates its inputs and never touches the cache — persistence stays with the caller.
+- **`fullSuiteTriggers` option** — declare paths that force a full-suite run when changed, an escape hatch for dependencies the import graph can't see: fixtures read via `fs.readFile`, assets imported through Vite `assetsInclude` (e.g. `.md`), or generated data. Without it, changing such a file selects too few tests (an under-run / false negative) because no import edge points back to its dependents. Each rule is a string (exact path or directory prefix) or a `RegExp`, matched against the repo-relative path — same semantics as `ignoreChangedFiles`. Evaluated on the raw changed set *before* relevance filtering, so triggers on non-code files still fire. Opt-in; conservative by design (over-runs rather than risk an under-run).
+
+### Changed
+
+- **Env-file (`.env`, `.env.local`) drift is a documented `fullSuiteTriggers` recipe, not a built-in trigger** — env-file changes are handled via the opt-in `fullSuiteTriggers` escape hatch, not an always-on `CONFIG_BASENAMES` entry: git-diff change detection can't see gitignored env files (`git ls-files --others --modified --exclude-standard` honours `.gitignore`), so an always-on rule would be dead code for the common case, and corpus evidence showed zero observed misses from env drift. Regression tests pin both the current default (env files filtered out) and the recipe. See the README "Coupling channels" table.
 
 ### Fixed
 
 - **Rule matching now sees files above `rootDir`** — `toRepoRelative` returns an honest `../`-prefixed relative path (instead of the raw absolute) for files above `rootDir` but inside the git repo, so `fullSuiteTriggers`/`ignoreChangedFiles` string and prefix rules can match them (e.g. `'../../shared/fixtures/'` in a monorepo package). Previously such files produced an absolute string no string/prefix rule could ever match — the escape hatch was silently blind exactly where the import graph is too. No change for the common `rootDir === gitRoot` topology or for Windows drive paths examined on POSIX.
 - **Graph membership overrides the extension allowlist** — a changed or deleted file already present as a key in the loaded reverse dependency graph (e.g. a CSS module whose runtime edge the reporter recorded) now survives relevance filtering and seeds BFS, regardless of extension. Previously `DEFAULT_RELEVANT_EXTENSIONS` dropped such files before selection, silently under-running tests that depend on them. Explicit `ignoreChangedFiles` rules and built-in path ignores still win over membership; files not in the graph keep the conservative extension-based default.
-- **Path canonicalization at all path boundaries** — a new `toCanonicalPath()` helper (`src/graph/normalize.ts`) resolves symlinks via `realpathSync` and normalizes separators to forward slashes, and every path boundary now routes through it: the plugin's `rootDir` (`vitest.config.root`, canonicalized once at init), git output (`src/git.ts` — repo toplevel and every changed/deleted path), cache keys and values on load (`src/graph/cache.ts`), caller-provided `changedFiles`, `setupFiles`, test-file glob results, the runtime reporter's module paths (`src/plugin.ts`), resolver output (`src/graph/builder.ts`), and `toRepoRelative` (`src/changed-files.ts`). This fixes the recurring path-identity silent-failure class: two aliases of the same file (macOS `/var` → `/private/var` temp symlink, a symlinked project root, Windows separators) compared unequal as graph keys, so changed files silently missed their graph entries and tests were under-selected. `toCanonicalPath` is memoized per process, falls back to canonicalizing the nearest existing ancestor for paths that don't exist (git-reported deletions) instead of throwing, and leaves non-absolute-on-this-platform inputs (e.g. a Windows drive path examined on POSIX) as forward-slash-normalized only — realpathing those would resolve against `cwd` and fabricate a bogus path.
-  - **Cache compatibility note:** the v2 cache schema is unchanged (still `version: 2`) — canonicalization is a value-level change to what a key looks like. `loadCachedReverseMap` canonicalizes keys and values on read, so stale entries written through a different alias (e.g. `/var/folders/...` vs `/private/var/folders/...`) converge instead of orphaning; entries merging to the same canonical key are unioned. Any entry that still fails to match simply misses — the cache-miss fallback (full suite) re-records it canonically on the next run. Self-healing, no migration needed. Save-side keys arrive already canonical from the reporter, so `saveCacheSync` writes them as given.
+- **Path canonicalization at all path boundaries** — a new `toCanonicalPath()` helper (`src/graph/normalize.ts`) resolves symlinks via `realpathSync` and normalizes separators to forward slashes, and every path boundary now routes through it: the plugin's `rootDir` (`vitest.config.root`, canonicalized once at init), git output (`src/git.ts` — repo toplevel and every changed/deleted path), cache keys and values on load (`src/graph/cache.ts`), caller-provided `changedFiles`, `setupFiles`, test-file glob results, the runtime reporter's module paths (`src/plugin.ts`), resolver output (`src/graph/builder.ts`), and `toRepoRelative` (`src/changed-files.ts`). This fixes the recurring path-identity silent-failure class: two aliases of the same file (macOS `/var` → `/private/var` temp symlink, a symlinked project root, Windows separators) compared unequal as graph keys, so changed files silently missed their graph entries and tests were under-selected. `toCanonicalPath` is memoized per process, falls back to canonicalizing the nearest existing ancestor for paths that don't exist (git-reported deletions) instead of throwing, and leaves non-absolute-on-this-platform inputs (e.g. a Windows drive path examined on POSIX) as forward-slash-normalized only — realpathing those would resolve against `cwd` and fabricate a bogus path. See ⚠️ BREAKING above for the cache-key implications.
 - **`globalSetup` changes now force a full-suite run** — `setupFiles` changes already did this, but `globalSetup` (a sibling field on the resolved config, also `string | string[]`) was completely untracked: changing it silently ran a stale selective subset instead of the full suite. Mirrors the `setupFiles` idiom exactly (resolve-relative-to-root → canonicalize → `Set` → match against the raw changed+deleted set), new stats `reason: "global-setup-change"`.
-
-### Added
-
-- **Shadow-verification mode** — new `shadow?: boolean` option (or `VITEST_AFFECTED_SHADOW=1`, which activates it regardless of config) runs the full selection pipeline but never mutates `project.config.include`, so a single `vitest run` yields ground truth (all tests) alongside the would-be decision. Stats lines are remapped into a shadow namespace: `shadow-selective` carries `selectedFiles: string[]` (the would-be selection) and `shadow-full-suite` carries `selectedFiles: null` ("all tests"), with the original `reason` retained. `VITEST_AFFECTED_DISABLED=1` still wins (fully inert). `VITEST_AFFECTED_STATS_FILE=<path>` forces stats output to a path, overriding the config `statsFile`. Every exit path now emits exactly one stats line when a stats path is known (the four previously-silent early returns plus the catch-all `reason: "error"`); the disabled early-return remains silent by design.
-- **Public export: `mergeRuntimeEdges` + `ReverseMap` type** — the reporter's per-test runtime-edge merge is now an exported pure function `mergeRuntimeEdges(base: ReverseMap, fresh: ReverseMap, scope: Set<string> | 'all'): ReverseMap`. Additive public API (re-exported from the package entry). `scope: 'all'` overwrites every test present in `fresh`; a `Set<testPath>` restricts the overwrite to the listed tests and preserves other tests' edges. It never mutates its inputs and never touches the cache — persistence stays with the caller.
-- **`fullSuiteTriggers` option** — declare paths that force a full-suite run when changed, an escape hatch for dependencies the import graph can't see: fixtures read via `fs.readFile`, assets imported through Vite `assetsInclude` (e.g. `.md`), or generated data. Without it, changing such a file selects too few tests (an under-run / false negative) because no import edge points back to its dependents. Each rule is a string (exact path or directory prefix) or a `RegExp`, matched against the repo-relative path — same semantics as `ignoreChangedFiles`. Evaluated on the raw changed set *before* relevance filtering, so triggers on non-code files still fire. Opt-in; conservative by design (over-runs rather than risk an under-run).
 
 ## [0.5.0] - 2026-05-03
 
