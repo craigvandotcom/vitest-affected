@@ -7,9 +7,11 @@ import path from 'node:path';
 import { glob } from 'tinyglobby';
 import { deltaParseNewImports } from './graph/builder.js';
 import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
+import type { CacheMeta } from './graph/cache.js';
 import { normalizeModuleId, toCanonicalPath } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
-import { bfsAffectedTests } from './selector.js';
+import { bfsAffectedTestsWithProvenance } from './selector.js';
+import type { SelectionTrail } from './selector.js';
 import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
 import { mergeRuntimeEdges } from './runtime-merge.js';
 
@@ -53,12 +55,19 @@ export interface VitestAffectedOptions {
    *   (`reason`, `changedFiles`, `deletedFiles`, `ignoredFiles`, `affectedTests`,
    *   `totalTests`, `graphSize`, `cacheHit`, `durationMs`, and under shadow
    *   `selectedFiles`).
-   * - DIAGNOSTIC lines — 0..n post-run, always `action: "heartbeat"`. Emitted by
-   *   the runtime reporter AFTER the run, so they carry ONLY fields meaningful
-   *   there: `timestamp`, `action`, `reason`, plus `strayCount` on
+   * - DIAGNOSTIC lines — 0..n per run, always `action: "heartbeat"`. Mostly
+   *   emitted by the runtime reporter AFTER the run, so they carry ONLY fields
+   *   meaningful there: `timestamp`, `action`, `reason`, plus `strayCount` on
    *   `reason: "selection-mismatch"`. They deliberately do NOT reuse decision
    *   fields (`graphSize` / `affectedTests` / `changedFiles` / `cacheHit`) — that
-   *   semantics does not transfer to a post-run diagnostic.
+   *   semantics does not transfer to a post-run diagnostic. ONE diagnostic is
+   *   emitted PRE-run instead: `reason: "cache-stale"` (staleness
+   *   reconciliation), fired from inside `configureVitest` right after the cache
+   *   loads because its trigger (cache metadata age / selective-run count) is
+   *   known then, not post-run. It carries `staleCacheDays`, `cacheAgeDays`, and
+   *   `selectiveRunCount`. It is a recommendation only — the plugin never
+   *   force-runs the full suite (that would surprise a user mid-flow); the
+   *   accompanying decision line still reflects the normal selection.
    */
   statsFile?: string;
   /**
@@ -94,7 +103,40 @@ export interface VitestAffectedOptions {
    * an under-run. Default: none (opt-in).
    */
   fullSuiteTriggers?: Array<string | RegExp>;
+  /**
+   * When true, a `selective` DECISION stats line additionally carries an
+   * `explain` field: `{ [testPath]: { seed, chain } }` — for every selected
+   * test, the changed/deleted seed it was reached from and the full edge chain
+   * (seed → … → test) that caused its selection. OFF by default to keep stats
+   * lines small; a chain per test can be large on deep graphs. Paths are the
+   * same absolute canonical paths as `selectedFiles`. The companion
+   * `vitest-affected-explain <testfile>` CLI answers the same "why / why-not"
+   * question ad hoc against the cache + current git state.
+   */
+  explain?: boolean;
+  /**
+   * STALENESS RECONCILIATION threshold — age half. When the cache's
+   * `lastFullRebuild` is older than this many days, the plugin emits a loud
+   * `console.warn` + a `cache-stale` DIAGNOSTIC stats line recommending a full
+   * run (it never force-runs the full suite — that would surprise a user
+   * mid-flow; see the docs on the DECISION vs DIAGNOSTIC taxonomy). A full-suite
+   * run naturally refreshes the runtime map and resets the metadata. Default 14.
+   */
+  staleCacheDays?: number;
+  /**
+   * STALENESS RECONCILIATION threshold — run-count half. When more than this
+   * many SELECTIVE runs have accumulated since the last full rebuild (the graph
+   * drifting through many partial updates), the same `cache-stale` warning +
+   * stats line fire. Default 50.
+   */
+  maxSelectiveRuns?: number;
 }
+
+/** Default age threshold (days) for the staleness warning. */
+const DEFAULT_STALE_CACHE_DAYS = 14;
+/** Default selective-run-count threshold for the staleness warning. */
+const DEFAULT_MAX_SELECTIVE_RUNS = 50;
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
 /**
  * Config file basenames that, when changed, should trigger a full test suite run.
@@ -147,7 +189,10 @@ const ZERO_EDGE_STARVATION_MODULE_THRESHOLD = 5;
  * resolved rootDir is known (deferred because config() runs before configureVitest()).
  */
 export function createRuntimeReporter(
-  onEdgesCollected: (edges: Map<string, Set<string>>) => void,
+  onEdgesCollected: (
+    edges: Map<string, Set<string>>,
+    wasFullSuiteRun: boolean,
+  ) => void,
   diagnostics: {
     /**
      * Called on a COMPLETED run (reason !== 'interrupted', no unhandled errors)
@@ -249,6 +294,14 @@ export function createRuntimeReporter(
     // produce a false-positive heartbeat here either.
     if (reason === 'interrupted') return;
 
+    // Was this a full-suite run? selectedTests === null means no selective
+    // decision was applied (full-suite fallback, or shadow mode where all tests
+    // run) — the runtime map is (near) fully re-observed, so it resets the
+    // staleness baseline. Captured BEFORE the reset below. A selective run
+    // (selectedTests !== null, including the allow-no-tests empty set) only
+    // partially refreshes the map and instead ages the metadata.
+    const wasFullSuiteRun = selectedTests === null;
+
     // SELECTION SELF-VERIFY: a selective decision was applied this run, so
     // every test that ran must be in the selected set. A stray means the
     // include mutation silently lost effect (Vitest ran tests we did not
@@ -270,7 +323,7 @@ export function createRuntimeReporter(
       const snapshot = new Map(
         [...runtimeReverse].map(([k, v]) => [k, new Set(v)]),
       );
-      onEdgesCollected(snapshot);
+      onEdgesCollected(snapshot, wasFullSuiteRun);
     } else if (
       testModules.length > 0 &&
       errors.length === 0 &&
@@ -310,6 +363,10 @@ function writeStatsLine(
     durationMs?: number;
     strayCount?: number;
     selectedFiles?: string[] | null;
+    explain?: Record<string, SelectionTrail>;
+    staleCacheDays?: number;
+    cacheAgeDays?: number;
+    selectiveRunCount?: number;
   },
   verbose = false,
   shadow = false,
@@ -489,11 +546,41 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         cacheDir = path.join(rootDir, '.vitest-affected');
 
         let cacheHit: boolean;
+        // Staleness metadata — mutable `let` so the reporter closure can update
+        // it across watch-mode re-runs. Defaults to no-baseline zeros.
+        let cacheMeta: CacheMeta = { lastFullRebuild: 0, runCount: 0 };
         if (options.cache !== false) {
-          ({ reverse, hit: cacheHit } = loadCachedReverseMap(cacheDir, rootDir, verbose));
+          ({ reverse, hit: cacheHit, meta: cacheMeta } = loadCachedReverseMap(cacheDir, rootDir, verbose));
         } else {
           reverse = new Map();
           cacheHit = false;
+        }
+
+        // STALENESS RECONCILIATION — emitted PRE-run because the trigger (cache
+        // metadata) is known now, not after the run. Only fires when a baseline
+        // exists (lastFullRebuild > 0): a freshly-migrated v2/v1 cache or a
+        // pre-metadata v3 cache has none, so it is not flagged until its first
+        // full-suite run seeds the timestamp. A WARNING only — never a forced
+        // full suite (that would surprise a user mid-flow); the normal decision
+        // line still follows.
+        const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
+        const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
+        if (cacheMeta.lastFullRebuild > 0) {
+          const cacheAgeDays = (Date.now() - cacheMeta.lastFullRebuild) / MS_PER_DAY;
+          const agedOut = cacheAgeDays > staleCacheDays;
+          const runOut = cacheMeta.runCount > maxSelectiveRuns;
+          if (agedOut || runOut) {
+            console.warn(
+              `[vitest-affected] CACHE STALE: the dependency graph was last fully rebuilt ${cacheAgeDays.toFixed(1)} day(s) ago across ${cacheMeta.runCount} selective run(s) ` +
+                `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
+                'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
+            );
+            emitStats('heartbeat', 'cache-stale', {
+              staleCacheDays,
+              cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
+              selectiveRunCount: cacheMeta.runCount,
+            }, false);
+          }
         }
 
         // Inject runtime reporter that merges runtime edges into cached reverse map.
@@ -501,14 +588,24 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // into the existing cache rather than replacing it (which would destroy
         // graph data for tests that didn't run this time).
         const { reporter, setRootDir, setSelectedTests } = createRuntimeReporter(
-          (edges) => {
+          (edges, wasFullSuiteRun) => {
             if (!cacheDir) return;
             try {
               // Per-test overwrite for every test that ran this cycle: strip
               // stale edges, merge fresh ones (so removed imports are reflected,
               // not accumulated forever). Persistence stays here at the call-site.
               reverse = mergeRuntimeEdges(reverse, edges, 'all');
-              saveCacheSync(cacheDir, reverse);
+              // STALENESS METADATA update: a full-suite run re-observes (near)
+              // every edge → reset the baseline (now / 0). A selective run only
+              // partially refreshes → preserve lastFullRebuild, bump runCount.
+              // Reassign cacheMeta so a later watch re-run reads the fresh value.
+              cacheMeta = wasFullSuiteRun
+                ? { lastFullRebuild: Date.now(), runCount: 0 }
+                : {
+                    lastFullRebuild: cacheMeta.lastFullRebuild,
+                    runCount: cacheMeta.runCount + 1,
+                  };
+              saveCacheSync(cacheDir, reverse, cacheMeta);
             } catch {
               // Best-effort: runtime edge persistence failed — cache will be stale next run
             }
@@ -805,12 +902,29 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         const testFileSet = new Set(testFiles);
 
-        // 13. BFS: find affected tests
-        const affectedTests = bfsAffectedTests(
+        // 13. BFS: find affected tests (with provenance — the explain trail).
+        // Provenance is always computed (cheap: a parent map + a chain walk per
+        // test) but only surfaced in the stats line when options.explain is set.
+        const { tests: affectedTests, provenance } = bfsAffectedTestsWithProvenance(
           bfsSeeds,
           reverse,
           (f) => testFileSet.has(f),
         );
+
+        // Build the explain field for a set of selected tests, filtered to the
+        // provenance the BFS recorded. Returns undefined when explain is off so
+        // the field never appears on default lines.
+        const buildExplain = (
+          tests: string[],
+        ): Record<string, SelectionTrail> | undefined => {
+          if (!options.explain) return undefined;
+          const out: Record<string, SelectionTrail> = {};
+          for (const t of tests) {
+            const trail = provenance.get(t);
+            if (trail) out[t] = trail;
+          }
+          return out;
+        };
 
         // 14. Threshold check
         if (affectedTests.length === 0) {
@@ -828,6 +942,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
               selectedFiles: [],
+              explain: buildExplain([]),
             });
             return;
           }
@@ -893,6 +1008,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
             selectedFiles: validTests,
+            explain: buildExplain(validTests),
           });
         } else {
           emitStats('full-suite', 'no-valid-tests-on-disk', {
