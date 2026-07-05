@@ -24,11 +24,15 @@ jobs:
 
       - run: npm ci
 
-      - name: Type-check
-        run: npx tsc --noEmit
-
+      # Build FIRST: tools/replay imports from ../../dist/index.js by design
+      # (the harness measures the BUILT artifact, never src) — on a fresh
+      # checkout dist/ doesn't exist yet, so type-checking before building
+      # fails with TS2307.
       - name: Build
         run: npm run build
+
+      - name: Type-check
+        run: npx tsc --noEmit
 
       # Run the plugin's OWN suite with vitest-affected DISABLED so the suite
       # never selects a subset of itself — the gate always exercises every test.
