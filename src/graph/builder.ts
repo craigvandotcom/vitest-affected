@@ -18,6 +18,40 @@ function isBinarySpecifier(specifier: string): boolean {
 }
 
 /**
+ * Matches `new Worker(new URL('./specifier', import.meta.url))` and
+ * `new SharedWorker(new URL('./specifier', import.meta.url))` — a
+ * NewExpression construct that oxc-parser's staticImports/dynamicImports/
+ * staticExports never see (those only surface import/export declaration
+ * syntax, not arbitrary `new` calls).
+ *
+ * Implemented as a targeted regex scan over the raw source rather than an
+ * ESTree AST walk: oxc-parser's `parseSync` result exposes pre-extracted
+ * import/export lists, not a walkable Program AST — reaching the
+ * NewExpression node would mean pulling in a second traversal library (or
+ * hand-rolling one over oxc's AST shape) for one narrow construct. The
+ * shape matched here is narrow and requires a literal string specifier to
+ * be resolvable at all, so pattern-matching the source text is
+ * proportionate to the problem.
+ *
+ * Only plain-quoted (`'` / `"`) string literals are captured. Template
+ * literals are excluded entirely (whether or not they contain `${}`
+ * expressions) — worker specifiers are far less likely to need runtime
+ * interpolation than ordinary dynamic imports, and skipping the whole
+ * class keeps this scan simple; this is a deliberate (narrower) policy
+ * choice, not a reuse of the dynamic-import no-expression-backtick carve-out.
+ */
+const WORKER_URL_RE =
+  /new\s+(?:Worker|SharedWorker)\s*\(\s*new\s+URL\s*\(\s*(['"])([^'"]*)\1\s*,\s*import\.meta\.url\s*\)/g;
+
+function extractWorkerSpecifiers(source: string): string[] {
+  const specifiers: string[] = [];
+  for (const match of source.matchAll(WORKER_URL_RE)) {
+    specifiers.push(match[2]);
+  }
+  return specifiers;
+}
+
+/**
  * Mirrors Vite's resolved `Alias` shape (`ResolvedConfig.resolve.alias`) —
  * declared locally rather than imported from 'vite' so this module doesn't
  * take on a vite dependency; only the two fields we consume are declared.
@@ -139,6 +173,14 @@ export function resolveFileImports(
           specifiers.push(entry.moduleRequest.value);
         }
       }
+    }
+  }
+
+  // Worker/SharedWorker construction — new Worker(new URL('./x', import.meta.url))
+  // Invisible to oxc-parser's import/export extraction (see extractWorkerSpecifiers).
+  for (const specifier of extractWorkerSpecifiers(source)) {
+    if (!isBinarySpecifier(specifier)) {
+      specifiers.push(specifier);
     }
   }
 

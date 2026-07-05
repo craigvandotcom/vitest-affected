@@ -303,3 +303,63 @@ describe('resolve.alias plumbing (T2a)', () => {
     expect(newTargets.some(t => t.endsWith('b.ts'))).toBe(true);
   });
 });
+
+describe('new Worker(new URL(...)) extraction (T2b)', () => {
+  test('Worker URL specifier yields an import edge in delta-parse', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const workerFile = path.join(tmpDir, 'worker.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new Worker(new URL('./worker.ts', import.meta.url));\nexport const x = w;\n`,
+    );
+    writeFileSync(workerFile, 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(true);
+  });
+
+  test('SharedWorker URL specifier yields an import edge in delta-parse', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-sharedworker-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const workerFile = path.join(tmpDir, 'shared-worker.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new SharedWorker(new URL("./shared-worker.ts", import.meta.url));\nexport const x = w;\n`,
+    );
+    writeFileSync(workerFile, 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('shared-worker.ts'))).toBe(true);
+  });
+
+  test('template-literal / dynamic Worker URL specifier is skipped', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-template-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    writeFileSync(
+      entryFile,
+      'const name = "worker";\nconst w = new Worker(new URL(`./${name}.ts`, import.meta.url));\nexport const x = w;\n',
+    );
+    writeFileSync(path.join(tmpDir, 'worker.ts'), 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(false);
+  });
+
+  test('non-URL Worker argument is ignored', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-nonurl-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new Worker('./worker.ts');\nexport const x = w;\n`,
+    );
+    writeFileSync(path.join(tmpDir, 'worker.ts'), 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(false);
+  });
+});
