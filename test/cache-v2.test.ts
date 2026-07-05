@@ -62,7 +62,11 @@ describe('v2 cache round-trip', () => {
     expect(reverse.size).toBe(0);
   });
 
-  test('writes valid JSON with version: 2', () => {
+  // NOTE: saveCacheSync now writes v3 (rootDir-relative paths) — the cache v3
+  // bead (relative-path portability) moved the write format forward. This
+  // assertion is updated from `version: 2` to `version: 3` accordingly; see
+  // test/cache-v3.test.ts for the new format's dedicated coverage.
+  test('writes valid JSON with version: 3', () => {
     const rootDir = makeTempDir();
     const cacheDir = path.join(rootDir, '.vitest-affected');
 
@@ -70,7 +74,7 @@ describe('v2 cache round-trip', () => {
     const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
     const parsed = JSON.parse(raw);
 
-    expect(parsed.version).toBe(2);
+    expect(parsed.version).toBe(3);
     expect(typeof parsed.builtAt).toBe('number');
     expect(typeof parsed.reverseMap).toBe('object');
   });
@@ -274,7 +278,11 @@ describe('orphaned tmp cleanup', () => {
 });
 
 describe('verbose logging', () => {
-  test('logs v2 cache hit in verbose mode', () => {
+  // NOTE: saveCacheSync now writes v3, so a save→load round trip hits the v3
+  // branch (logs "v3 cache hit"), not "v2 cache hit". Updated accordingly —
+  // native v2-on-disk logging (the v2→v3 migration branch) is covered in
+  // test/cache-v3.test.ts.
+  test('logs v3 cache hit in verbose mode', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const rootDir = makeTempDir();
     const cacheDir = path.join(rootDir, '.vitest-affected');
@@ -283,7 +291,7 @@ describe('verbose logging', () => {
     loadCachedReverseMap(cacheDir, rootDir, true);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('v2 cache hit'),
+      expect.stringContaining('v3 cache hit'),
     );
     warnSpy.mockRestore();
   });

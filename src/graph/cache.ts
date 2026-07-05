@@ -109,7 +109,7 @@ function toConfinedReverseMap(
 
 /**
  * Validates a plain object where all keys are strings and all values are
- * arrays of strings. Used for both v2 reverseMap and v1 runtimeEdges.
+ * arrays of strings. Used for v3/v2 reverseMap and v1 runtimeEdges.
  */
 function isValidReverseMapObject(
   value: unknown,
@@ -126,27 +126,82 @@ function isValidReverseMapObject(
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Disk format v2 — runtime-first architecture
-// ---------------------------------------------------------------------------
+/**
+ * Convert an absolute canonical path to a path relative to `canonicalRoot`,
+ * forward-slash normalized. This is the save-side half of the v3
+ * relative-path boundary: the in-memory reverse map stays absolute (the
+ * whole selector/reporter pipeline expects that), and relativization happens
+ * only here, right before the value is written to disk.
+ *
+ * The prefix-strip is the common case (every entry in the in-memory map is
+ * already confined under canonicalRoot by construction). `path.relative` is
+ * a defensive fallback only — it degrades gracefully instead of throwing if
+ * an out-of-root entry were ever to slip through.
+ */
+function toRootRelative(absPath: string, canonicalRoot: string): string {
+  const rootPrefix = canonicalRoot.endsWith('/') ? canonicalRoot : canonicalRoot + '/';
+  if (absPath.startsWith(rootPrefix)) return absPath.slice(rootPrefix.length);
+  return path.relative(canonicalRoot, absPath).replaceAll('\\', '/');
+}
 
-interface CacheDiskFormatV2 {
-  version: 2;
+/**
+ * Convert a rootDir-relative raw reverseMap (as persisted in v3) back into an
+ * absolute-path raw reverseMap, by joining every key/value onto
+ * `canonicalRoot`. This is the load-side half of the v3 relative-path
+ * boundary: once rejoined, the map is in exactly the shape v2 raw maps were
+ * (absolute paths), so it flows through the existing `toConfinedReverseMap`
+ * canonicalization + confinement pipeline unchanged — including the
+ * defense-in-depth `isUnderRootDir` filter, which also catches a relative
+ * entry crafted with `../` segments to escape rootDir (`path.join` resolves
+ * those before the confinement check runs).
+ */
+function relativeMapToAbsolute(
+  rawMap: Record<string, string[]>,
+  canonicalRoot: string,
+): Record<string, string[]> {
+  const toAbsolute = (relPath: string): string =>
+    path.join(canonicalRoot, relPath).replaceAll('\\', '/');
+
+  const absolute: Record<string, string[]> = {};
+  for (const [relFile, relTests] of Object.entries(rawMap)) {
+    absolute[toAbsolute(relFile)] = relTests.map(toAbsolute);
+  }
+  return absolute;
+}
+
+// ---------------------------------------------------------------------------
+// Disk format v3 — rootDir-relative paths (current)
+// ---------------------------------------------------------------------------
+//
+// v3 stores paths relative to the canonicalized rootDir instead of absolute
+// (v1/v2 stored absolute paths, which machine-locks the cache — a fresh
+// checkout on a different machine/CI runner, or even a differently-mounted
+// checkout on the same machine, could never hit). Relativizing at the
+// persistence boundary makes a cache produced at one checkout path load
+// correctly at another, as long as the relative structure under rootDir is
+// identical. In-memory representation is unaffected: still absolute
+// canonical paths, always.
+
+interface CacheDiskFormatV3 {
+  version: 3;
   builtAt: number;
-  reverseMap: Record<string, string[]>;  // source → test_files
+  reverseMap: Record<string, string[]>;  // source → test_files, rootDir-relative
 }
 
 const CACHE_VERSION_V1 = 1;
 const CACHE_VERSION_V2 = 2;
+const CACHE_VERSION_V3 = 3;
 
 /**
  * Load cached reverse map from graph.json.
  *
  * Handles:
- * - v2 directly
- * - v1 with runtimeEdges → migrated to v2 reverse map
+ * - v3 directly (current — rootDir-relative paths, rejoined to absolute)
+ * - v2 (absolute paths) → migrated to the in-memory reverse map (will be
+ *   re-persisted as v3 on the next save)
+ * - v1 with runtimeEdges → migrated to the in-memory reverse map
  * - v1 without runtimeEdges → cache miss
- * - Corrupt/missing → cache miss
+ * - Corrupt/missing/unknown version → cache miss
  *
  * @returns { reverse, hit } where hit=false means caller should run full suite
  */
@@ -184,7 +239,24 @@ export function loadCachedReverseMap(
 
   const obj = parsed as Record<string, unknown>;
 
-  // --- v2 format ---
+  // --- v3 format (current) ---
+  if (obj['version'] === CACHE_VERSION_V3) {
+    const reverseMapRaw = obj['reverseMap'];
+    if (!isValidReverseMapObject(reverseMapRaw)) {
+      if (verbose) console.warn('[vitest-affected] v3 cache schema invalid — cache miss');
+      return { reverse: new Map(), hit: false };
+    }
+
+    // Rejoin rootDir-relative paths back to absolute before they enter the
+    // canonicalization/confinement pipeline shared with v2/v1.
+    const absoluteRaw = relativeMapToAbsolute(reverseMapRaw, canonicalRoot);
+    const reverse = toConfinedReverseMap(absoluteRaw, canonicalRoot);
+
+    if (verbose) console.warn(`[vitest-affected] v3 cache hit — ${reverse.size} entries`);
+    return { reverse, hit: true };
+  }
+
+  // --- v2 → v3 migration (v2 stored absolute paths) ---
   if (obj['version'] === CACHE_VERSION_V2) {
     const reverseMapRaw = obj['reverseMap'];
     if (!isValidReverseMapObject(reverseMapRaw)) {
@@ -194,7 +266,7 @@ export function loadCachedReverseMap(
 
     const reverse = toConfinedReverseMap(reverseMapRaw, canonicalRoot);
 
-    if (verbose) console.warn(`[vitest-affected] v2 cache hit — ${reverse.size} entries`);
+    if (verbose) console.warn(`[vitest-affected] v2→v3 migration — ${reverse.size} entries`);
     return { reverse, hit: true };
   }
 
@@ -219,13 +291,22 @@ export function loadCachedReverseMap(
 }
 
 /**
- * Persist a reverse map to disk in v2 format.
- * Atomic write: temp file → renameSync.
+ * Persist a reverse map to disk in v3 format (rootDir-relative paths).
+ * Atomic write: temp file → renameSync. Always writes current-version-only —
+ * there is no reason to ever write v1/v2 again, migration is a read-time-only
+ * concern.
  *
- * Keys/values are written as given: in the plugin's flow they arrive already
- * canonicalized (reporter + mergeRuntimeEdges operate on canonical paths), and
- * loadCachedReverseMap canonicalizes on read anyway — so save-side
- * canonicalization would be redundant work on every test run's hot path.
+ * Keys/values arrive already canonicalized absolute paths (the reporter +
+ * mergeRuntimeEdges operate on canonical paths); this function relativizes
+ * them against rootDir right before serialization — the one place the
+ * absolute→relative boundary crosses on the way to disk.
+ *
+ * `saveCacheSync` intentionally keeps its 2-arg signature (no explicit
+ * `rootDir` parameter) for caller compatibility: every call site in this
+ * codebase constructs `cacheDir` as `path.join(rootDir, '.vitest-affected')`,
+ * so `path.dirname(cacheDir)` recovers rootDir without a signature change.
+ * Canonicalized defensively in case a caller ever passes a non-canonical
+ * cacheDir.
  */
 export function saveCacheSync(
   cacheDir: string,
@@ -233,13 +314,17 @@ export function saveCacheSync(
 ): void {
   mkdirSync(cacheDir, { recursive: true });
 
+  const canonicalRoot = toCanonicalPath(path.dirname(cacheDir));
+
   const reverseMap: Record<string, string[]> = {};
   for (const [file, tests] of reverse) {
-    reverseMap[file] = [...tests];
+    reverseMap[toRootRelative(file, canonicalRoot)] = [...tests].map((t) =>
+      toRootRelative(t, canonicalRoot),
+    );
   }
 
-  const payload: CacheDiskFormatV2 = {
-    version: CACHE_VERSION_V2,
+  const payload: CacheDiskFormatV3 = {
+    version: CACHE_VERSION_V3,
     builtAt: Date.now(),
     reverseMap,
   };
