@@ -753,8 +753,18 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
-        // 11. Delta parse: find new imports in changed files not yet in cache
-        const extraSeeds = deltaParseNewImports(changed, reverse, rootDir, verbose);
+        // 11. Delta parse: find new imports in changed files not yet in cache.
+        // Feed resolve.alias (Vite/Vitest config, resolved form) into the
+        // resolver so the static parser can see Vite-only aliases (e.g. stub
+        // packages) that tsconfig paths don't cover. project.vite is the
+        // per-project Vite dev server; its resolved config always exposes
+        // resolve.alias as Alias[] (string finds usable, RegExp finds are
+        // skipped — see createResolver). Optional-chained defensively: unit
+        // tests exercise this hook with plain mock `project` objects that
+        // don't carry a `vite` server at all — undefined here is the correct
+        // "no alias data available" case, not an error.
+        const resolveAlias = project.vite?.config?.resolve?.alias;
+        const extraSeeds = deltaParseNewImports(changed, reverse, rootDir, verbose, resolveAlias);
         const bfsSeeds = [...allChangedFiles, ...extraSeeds];
 
         // 12. Glob test files using project.config.include patterns
