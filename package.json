@@ -11,6 +11,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "vitest-affected-explain": "./dist/explain-cli.js"
+  },
   "files": [
     "dist"
   ],
@@ -38,7 +41,10 @@
   },
   "author": "CraigVan",
   "license": "MIT",
-  "sideEffects": false,
+  "sideEffects": [
+    "**/explain-cli.ts",
+    "**/explain-cli.js"
+  ],
   "engines": {
     "node": ">=18"
   },

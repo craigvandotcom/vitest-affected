@@ -63,8 +63,16 @@ import type {
 // never to a crash or a silently-clean commit)
 // ---------------------------------------------------------------------------
 
-/** Parse a captured v2 graph.json into a ReverseMap; empty map on any drift. */
-export function parseGraphReverseMap(content: string): ReverseMap {
+/**
+ * Parse a captured graph.json into a ReverseMap; empty map on any drift.
+ * Version-aware: v2 stores ABSOLUTE canonical paths (passed through as-is);
+ * v3 stores rootDir-RELATIVE paths (absolutized here against the clone's
+ * rootDir, forward-slashed) — the whole analysis pipeline operates in
+ * absolute canonical space, so relativity must not leak past this boundary.
+ * Unknown versions degrade to an empty map (the commit becomes unmeasurable,
+ * loudly — never silently clean).
+ */
+export function parseGraphReverseMap(content: string, rootDir?: string): ReverseMap {
   const map: ReverseMap = new Map();
   let parsed: unknown;
   try {
@@ -74,16 +82,20 @@ export function parseGraphReverseMap(content: string): ReverseMap {
   }
   if (parsed === null || typeof parsed !== 'object') return map;
   const obj = parsed as Record<string, unknown>;
-  if (obj.version !== 2) return map;
+  const version = obj.version;
+  if (version !== 2 && version !== 3) return map;
+  if (version === 3 && !rootDir) return map; // relative paths need a base
+  const abs = (p: string): string =>
+    version === 3 ? `${rootDir!.replace(/\/+$/, '')}/${p}` : p;
   const raw = obj.reverseMap;
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return map;
   for (const [file, tests] of Object.entries(raw as Record<string, unknown>)) {
     if (!Array.isArray(tests)) continue;
     const set = new Set<string>();
     for (const t of tests) {
-      if (typeof t === 'string') set.add(t);
+      if (typeof t === 'string') set.add(abs(t));
     }
-    if (set.size > 0) map.set(file, set);
+    if (set.size > 0) map.set(abs(file), set);
   }
   return map;
 }
@@ -356,7 +368,7 @@ export async function analyzeRun(
     // Load per-commit artifacts.
     const graphPath = path.join(runDir, 'graphs', `${entry.sha}.json`);
     const freshMap = existsSync(graphPath)
-      ? parseGraphReverseMap(await readFile(graphPath, 'utf-8'))
+      ? parseGraphReverseMap(await readFile(graphPath, 'utf-8'), rootDir)
       : null;
     const outcomesPath = path.join(runDir, 'outcomes', `${entry.sha}.json`);
     // Outcome test names are normalized into the graphs' canonical path space

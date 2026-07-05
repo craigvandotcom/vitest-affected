@@ -352,7 +352,7 @@ describe('replay: planted-miss silver bullet (real walk + drifted cache)', () =>
       };
       // Sanity: the runtime reporter DID capture the aliased edge at warm-up
       // (alias-transparent) — this is exactly the edge a live delta-parser misses.
-      const modKey = Object.keys(graph.reverseMap).find((k) => k.endsWith('/src/mod.ts'));
+      const modKey = Object.keys(graph.reverseMap).find((k) => k.endsWith('src/mod.ts'));
       expect(modKey).toBeDefined();
       delete graph.reverseMap[modKey as string];
       writeFileSync(warmupGraphPath, JSON.stringify(graph));
@@ -458,6 +458,7 @@ describe('replay: control fixture (no planted miss → zero misses)', () => {
       const inputs: CommitEdgeInput[] = okEntries.map((e) => {
         const graph = parseGraphReverseMap(
           readFileSync(path.join(graphsDir, `${e.sha}.json`), 'utf-8'),
+          cloneDir,
         );
         const changedFiles = (e.changedFiles ?? []).map((f) =>
           path.resolve(cloneDir, f),

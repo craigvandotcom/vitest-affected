@@ -568,7 +568,7 @@ describe('Cache persistence: ENOENT on fresh install', () => {
 
     const raw = readFileSync(path.join(cacheDir, 'graph.json'), 'utf-8');
     const parsed = JSON.parse(raw) as { version: number; reverseMap: Record<string, string[]> };
-    expect(parsed.version).toBe(2);
+    expect(parsed.version).toBe(3);
     expect(typeof parsed.reverseMap).toBe('object');
   });
 });

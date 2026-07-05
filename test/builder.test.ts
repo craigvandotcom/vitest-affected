@@ -212,3 +212,154 @@ describe('deltaParseNewImports', () => {
     warnSpy.mockRestore();
   });
 });
+
+describe('resolve.alias plumbing (T2a)', () => {
+  test('aliased specifier (string find) resolves to the stub path in delta-parse', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-alias-string-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const stubFile = path.join(tmpDir, 'stub-foo.ts');
+    writeFileSync(entryFile, `import { thing } from '@stub/foo';\nexport const x = thing;\n`);
+    writeFileSync(stubFile, 'export const thing = 1;\n');
+
+    const cachedReverse = new Map<string, Set<string>>();
+    const aliasEntries = [{ find: '@stub/foo', replacement: stubFile }];
+
+    const newTargets = deltaParseNewImports(
+      [entryFile],
+      cachedReverse,
+      tmpDir,
+      false,
+      aliasEntries,
+    );
+    expect(newTargets).toHaveLength(1);
+    expect(newTargets[0].endsWith('stub-foo.ts')).toBe(true);
+  });
+
+  test('RegExp find is skipped with a startup warning; unaliased resolution still works', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-alias-regexp-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const bFile = path.join(tmpDir, 'b.ts');
+    writeFileSync(entryFile, `import { b } from './b';\nexport const x = b;\n`);
+    writeFileSync(bFile, 'export const b = 1;\n');
+
+    const cachedReverse = new Map<string, Set<string>>();
+    const aliasEntries = [
+      { find: /^@bar\/(.*)$/, replacement: path.join(tmpDir, 'bar-$1.ts') },
+    ];
+
+    const newTargets = deltaParseNewImports(
+      [entryFile],
+      cachedReverse,
+      tmpDir,
+      false,
+      aliasEntries,
+    );
+
+    // RegExp find skipped — documented via startup warning, not converted.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'resolve.alias has 1 RegExp find(s) that cannot be fed into the static delta-parser resolver',
+      ),
+    );
+    // Unaliased relative-import resolution is otherwise intact.
+    expect(newTargets).toHaveLength(1);
+    expect(newTargets[0].endsWith('b.ts')).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  test("Vite's built-in RegExp aliases (@vite/env, @vite/client) do not trigger the warning", () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-alias-builtin-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    writeFileSync(entryFile, 'export const x = 1;\n');
+
+    // The two aliases Vite unconditionally injects into every resolved config —
+    // dev-client plumbing, irrelevant to selection; they must be silently ignored.
+    const aliasEntries = [
+      { find: /^\/?@vite\/env/, replacement: path.join(tmpDir, 'node_modules/vite/dist/client/env.mjs') },
+      { find: /^\/?@vite\/client/, replacement: path.join(tmpDir, 'node_modules/vite/dist/client/client.mjs') },
+    ];
+
+    deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir, false, aliasEntries);
+
+    const regexpWarnings = warnSpy.mock.calls.filter((c) =>
+      String(c[0]).includes('RegExp find(s)'),
+    );
+    expect(regexpWarnings).toHaveLength(0);
+    warnSpy.mockRestore();
+  });
+
+  test('unaliased behavior is unchanged when no aliasEntries are passed', () => {
+    const simpleDir = fixtureDir('simple');
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const cachedReverse = new Map<string, Set<string>>();
+
+    const newTargets = deltaParseNewImports([aFile], cachedReverse, simpleDir);
+    expect(newTargets.length).toBeGreaterThan(0);
+    expect(newTargets.some(t => t.endsWith('b.ts'))).toBe(true);
+  });
+});
+
+describe('new Worker(new URL(...)) extraction (T2b)', () => {
+  test('Worker URL specifier yields an import edge in delta-parse', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const workerFile = path.join(tmpDir, 'worker.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new Worker(new URL('./worker.ts', import.meta.url));\nexport const x = w;\n`,
+    );
+    writeFileSync(workerFile, 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(true);
+  });
+
+  test('SharedWorker URL specifier yields an import edge in delta-parse', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-sharedworker-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const workerFile = path.join(tmpDir, 'shared-worker.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new SharedWorker(new URL("./shared-worker.ts", import.meta.url));\nexport const x = w;\n`,
+    );
+    writeFileSync(workerFile, 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('shared-worker.ts'))).toBe(true);
+  });
+
+  test('template-literal / dynamic Worker URL specifier is skipped', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-template-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    writeFileSync(
+      entryFile,
+      'const name = "worker";\nconst w = new Worker(new URL(`./${name}.ts`, import.meta.url));\nexport const x = w;\n',
+    );
+    writeFileSync(path.join(tmpDir, 'worker.ts'), 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(false);
+  });
+
+  test('non-URL Worker argument is ignored', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-worker-nonurl-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    writeFileSync(
+      entryFile,
+      `const w = new Worker('./worker.ts');\nexport const x = w;\n`,
+    );
+    writeFileSync(path.join(tmpDir, 'worker.ts'), 'export const handler = () => 1;\n');
+
+    const newTargets = deltaParseNewImports([entryFile], new Map<string, Set<string>>(), tmpDir);
+    expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(false);
+  });
+});

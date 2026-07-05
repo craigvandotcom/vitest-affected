@@ -159,7 +159,7 @@ describe('integration: plugin orchestration', () => {
       const cache = JSON.parse(readFileSync(cacheFile, 'utf-8')) as {
         version: number;
       };
-      expect(cache.version).toBe(2);
+      expect(cache.version).toBe(3);
 
       // Second run: cache hit → selective execution
       const report2 = await runVitest(tmp, pluginEnv);
@@ -347,7 +347,7 @@ export default defineConfig({
 
   /**
    * Test 6: Cache file created after first run with v2 format
-   * Run vitest → verify .vitest-affected/graph.json is created with version: 2
+   * Run vitest → verify .vitest-affected/graph.json is created with version: 3
    */
   test(
     'cache persistence: graph.json exists after first run with v2 format',
@@ -374,7 +374,7 @@ export default defineConfig({
         version: number;
         reverseMap?: Record<string, string[]>;
       };
-      expect(cache.version).toBe(2);
+      expect(cache.version).toBe(3);
       expect(typeof cache.reverseMap).toBe('object');
     },
     30_000,
@@ -417,7 +417,7 @@ export default defineConfig({
       // Verify cache was repopulated with v2 format
       const cacheFile = path.join(tmp, '.vitest-affected', 'graph.json');
       const cache = JSON.parse(readFileSync(cacheFile, 'utf-8')) as { version: number };
-      expect(cache.version).toBe(2);
+      expect(cache.version).toBe(3);
     },
     30_000,
   );
