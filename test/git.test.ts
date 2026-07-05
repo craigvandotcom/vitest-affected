@@ -160,6 +160,48 @@ describe('getChangedFiles', () => {
     }
   });
 
+  // 11. .env-drift decision (T2c): gitignored .env changes are INVISIBLE to
+  // git-diff-based detection — the empirical fact the "document a recipe,
+  // don't add to CONFIG_BASENAMES" decision rests on. `ls-files --others
+  // --modified --exclude-standard` (used for the unstaged/untracked source)
+  // honours .gitignore for untracked paths, so a newly-created, gitignored
+  // .env never appears in `changed` at all — no filter downstream (extension
+  // allowlist, configBasenames, fullSuiteTriggers) can act on a file the
+  // changed-file set never contains.
+  test('a newly-created, gitignored .env is invisible (not in changed, not in deleted)', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'seed.ts'), 'export const seed = 0;\n');
+    writeFileSync(path.join(dir, '.gitignore'), '.env\n.env.local\n');
+    await git(['add', 'seed.ts', '.gitignore'], dir);
+    await git(['commit', '-m', 'seed'], dir);
+
+    writeFileSync(path.join(dir, '.env'), 'SECRET=1\n');
+    writeFileSync(path.join(dir, '.env.local'), 'SECRET_LOCAL=1\n');
+
+    const result = await getChangedFiles(dir);
+    expect(result.changed).not.toContain(path.join(dir, '.env'));
+    expect(result.changed).not.toContain(path.join(dir, '.env.local'));
+    expect(result.deleted).toHaveLength(0);
+  });
+
+  // Counter-case: IF a repo tracks its .env (unusual — most gitignore it),
+  // gitignore no longer applies to that already-tracked path and a plain
+  // modification surfaces normally via the unstaged path. This is the one
+  // scenario where a CONFIG_BASENAMES entry would ever fire — corpus evidence
+  // showed no failure justifying paying that always-on cost for it.
+  test('a tracked (unusual) .env IS visible once modified — gitignore does not apply to tracked paths', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, '.gitignore'), '.env\n');
+    writeFileSync(path.join(dir, '.env'), 'SECRET=1\n');
+    await git(['add', '-f', '.gitignore', '.env'], dir);
+    await git(['commit', '-m', 'seed (tracked .env, unusual)'], dir);
+
+    writeFileSync(path.join(dir, '.env'), 'SECRET=2\n');
+
+    const result = await getChangedFiles(dir);
+    expect(result.changed).toContain(path.join(dir, '.env'));
+  });
+
   // 10. Renamed file: old name in deleted, new name in changed
   test('handles renamed files correctly', async () => {
     const dir = await makeTempRepo();

@@ -214,6 +214,84 @@ describe('fullSuiteTriggers option', () => {
   });
 });
 
+describe('env-drift recipe (T2c decision): fullSuiteTriggers, not CONFIG_BASENAMES', () => {
+  // DECISION: env-drift (external .env/.env.local edits — 74 BCA test files read
+  // process.env with zero trigger today) is handled as a documented, OPT-IN
+  // fullSuiteTriggers recipe, not an always-on CONFIG_BASENAMES entry. Two
+  // reasons: (1) corpus evidence (A4 walk, 99 commits) showed zero observed
+  // misses via any channel, including env-adjacent commits — nothing forces
+  // the always-on form; (2) .env is gitignored in the common case, so
+  // src/git.ts's `ls-files --others --modified --exclude-standard` never
+  // surfaces it as "changed" at all (see test/git.test.ts) — an always-on
+  // CONFIG_BASENAMES entry would be dead code for that path and would only
+  // ever fire for the unusual repo that tracks .env in git.
+  //
+  // The recipe below is for consumers who compute `changedFiles` themselves
+  // (e.g. a CI step that diffs deployed env vars against the previous deploy,
+  // or a repo that intentionally tracks .env) and pass it in explicitly —
+  // that's the one channel where a git-diff-blind file can still reach the
+  // plugin.
+  async function run(
+    plugin: ReturnType<typeof vitestAffected>,
+    tmpDir: string,
+  ) {
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const hook = (plugin as Record<string, unknown>).configureVitest as (
+      ctx: { vitest: typeof vitest; project: typeof project },
+    ) => Promise<void>;
+    await hook({ vitest, project });
+    return projectConfig;
+  }
+
+  function lastStatsReason(statsFile: string): string {
+    const lines = readFileSync(statsFile, 'utf-8').trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]).reason;
+  }
+
+  test('recipe: fullSuiteTriggers: [/^\\.env/] forces full suite for an explicitly-provided .env change', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const envPath = path.join(tmpDir, '.env');
+    writeFileSync(envPath, 'SECRET=1\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({
+        changedFiles: [envPath],
+        cache: true,
+        fullSuiteTriggers: [/^\.env/],
+        statsFile,
+      }),
+      tmpDir,
+    );
+
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('full-suite-trigger');
+  });
+
+  test('the documented gap: WITHOUT the recipe, the same .env change is silently dropped (reason=no-changes)', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const envPath = path.join(tmpDir, '.env');
+    writeFileSync(envPath, 'SECRET=1\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const projectConfig = await run(
+      vitestAffected({
+        changedFiles: [envPath],
+        cache: true,
+        statsFile,
+      }),
+      tmpDir,
+    );
+
+    // No trigger configured → .env has no matching extension and isn't a
+    // config basename → filtered to nothing → full suite via "no-changes",
+    // NOT via a targeted env-aware decision. This is the gap the README
+    // caveat documents.
+    expect(projectConfig.include).toEqual(['tests/**/*.test.ts']);
+    expect(lastStatsReason(statsFile)).toBe('no-changes');
+  });
+});
+
 describe('globalSetup full-suite trigger', () => {
   /** Run the configureVitest hook against a mock context whose project.config.globalSetup is set. */
   async function run(

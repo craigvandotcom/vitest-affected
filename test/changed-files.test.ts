@@ -200,6 +200,45 @@ describe('filterRelevantChangedFiles — graphMembership override (CSS relevance
   });
 });
 
+describe('.env-drift (T2c decision: documented recipe, not a default) — current behavior', () => {
+  // DECISION (see _plans/ or bead result doc for full reasoning): .env/.env.local
+  // are NOT added to CONFIG_BASENAMES. Two independent reasons converge here:
+  // (1) corpus evidence showed zero observed misses through any channel,
+  // including env-adjacent commits, so there's no failure forcing an always-on
+  // rule; (2) .env files are gitignored in the overwhelming common case, so
+  // src/git.ts's `ls-files --others --modified --exclude-standard` never even
+  // surfaces them as a "changed" file — an always-on CONFIG_BASENAMES entry
+  // would be dead code for that case and would only fire in the unusual
+  // scenario where a repo tracks its .env in git. The supported path for
+  // consumers who DO need this is the `fullSuiteTriggers` recipe (opt-in,
+  // consistent with the existing fixtures escape hatch) — see
+  // `test/plugin.test.ts`'s "env-drift recipe" describe block. These tests
+  // pin the current (unmatched) default so a future change to
+  // DEFAULT_RELEVANT_EXTENSIONS or CONFIG_BASENAMES can't silently flip it.
+  test('.env is filtered out by default (no extension, not a config basename)', () => {
+    const r = call({ changed: [abs('.env')] });
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([abs('.env')]);
+  });
+
+  test('.env.local is filtered out by default (".local" extension not allowlisted)', () => {
+    const r = call({ changed: [abs('.env.local')] });
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([abs('.env.local')]);
+  });
+
+  test('a consumer CAN opt in via configBasenames (mechanism proof, not the default)', () => {
+    // Demonstrates the mechanism a consumer would use if they decided (a) was
+    // right for their repo — .env genuinely tracked in git and read by every
+    // test. Not wired into the library's own CONFIG_BASENAMES by default.
+    const r = call(
+      { changed: [abs('.env')] },
+      { configBasenames: new Set([...CONFIG_BASENAMES, '.env']) },
+    );
+    expect(r.changed).toEqual([abs('.env')]);
+  });
+});
+
 describe('toRepoRelative', () => {
   test('strips rootDir prefix and normalizes slashes', () => {
     expect(toRepoRelative('/proj/src/a.ts', '/proj')).toBe('src/a.ts');
