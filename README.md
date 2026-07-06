@@ -1,6 +1,7 @@
 # vitest-affected
 
 [![npm version](https://img.shields.io/npm/v/vitest-affected)](https://www.npmjs.com/package/vitest-affected)
+[![CI](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml/badge.svg)](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/vitest-affected)](https://github.com/craigvandotcom/vitest-affected/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
 
