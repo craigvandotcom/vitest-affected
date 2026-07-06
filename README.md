@@ -2,7 +2,8 @@
 
 [![npm version](https://img.shields.io/npm/v/vitest-affected)](https://www.npmjs.com/package/vitest-affected)
 [![CI](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml/badge.svg)](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml)
-[![measured miss record](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcraigvandotcom%2Fvitest-affected%2Fmain%2F_evidence%2Fbadge.json)](https://github.com/craigvandotcom/vitest-affected/blob/main/_evidence/badge.json)
+[![measured misses](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcraigvandotcom%2Fvitest-affected%2Fmain%2F_evidence%2Fbadge-misses.json)](https://github.com/craigvandotcom/vitest-affected/blob/main/_plans/research/2026-07-05-a4-walk/analysis.md)
+[![verified selections](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcraigvandotcom%2Fvitest-affected%2Fmain%2F_evidence%2Fbadge-verified.json)](https://github.com/craigvandotcom/vitest-affected/blob/main/_plans/research/2026-07-05-a4-walk/analysis.md)
 [![license](https://img.shields.io/npm/l/vitest-affected)](https://github.com/craigvandotcom/vitest-affected/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
 

@@ -28,7 +28,6 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..');
-const badgePath = path.join(repoRoot, '_evidence', 'badge.json');
 const logPath = path.resolve(
   repoRoot,
   '../body-compass-app/_ci-evidence/vitest-affected-divergence-log.jsonl'
@@ -65,12 +64,36 @@ const totalMisses = REPLAY_BASELINE.misses + liveMisses;
 const totalDecisions = REPLAY_BASELINE.selectiveDecisions + liveSelective;
 const asOf = new Date().toISOString().slice(0, 10);
 
-const badge = {
-  schemaVersion: 1,
-  label: 'measured miss record',
-  message: `${totalMisses} misses · ${totalDecisions} selective decisions · ${checkpoints} live checkpoints (${asOf})`,
-  color: totalMisses === 0 ? 'brightgreen' : 'red',
-};
-
-writeFileSync(badgePath, JSON.stringify(badge, null, 2) + '\n');
-console.log(`[evidence-badge] ${badge.message} → ${badgePath}`);
+// Two short label|value badges — one crammed sentence renders as mud.
+// `asOf`/`checkpoints` are non-schema extras shields ignores; they document
+// freshness for anyone who opens the JSON.
+const badges = [
+  [
+    path.join(repoRoot, '_evidence', 'badge-misses.json'),
+    {
+      schemaVersion: 1,
+      label: 'measured misses',
+      message: String(totalMisses),
+      color: totalMisses === 0 ? 'brightgreen' : 'red',
+      asOf,
+      liveCheckpoints: checkpoints,
+    },
+  ],
+  [
+    path.join(repoRoot, '_evidence', 'badge-verified.json'),
+    {
+      schemaVersion: 1,
+      label: 'verified selections',
+      message: String(totalDecisions),
+      color: 'blue',
+      asOf,
+      liveCheckpoints: checkpoints,
+    },
+  ],
+];
+for (const [file, badge] of badges) {
+  writeFileSync(file, JSON.stringify(badge, null, 2) + '\n');
+}
+console.log(
+  `[evidence-badge] misses=${totalMisses} verified=${totalDecisions} checkpoints=${checkpoints} (${asOf})`
+);
