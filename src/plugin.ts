@@ -8,7 +8,7 @@ import { glob } from 'tinyglobby';
 import { deltaParseNewImports } from './graph/builder.js';
 import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
 import type { CacheMeta } from './graph/cache.js';
-import { normalizeModuleId, toCanonicalPath } from './graph/normalize.js';
+import { normalizeModuleId, safeLabel, toCanonicalPath } from './graph/normalize.js';
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTestsWithProvenance } from './selector.js';
 import type { SelectionTrail } from './selector.js';
@@ -730,7 +730,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
             onSelectionMismatch: (strays) => {
               console.warn(
-                `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
+                `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).map(safeLabel).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
               );
               emitStats(statsCtx, 'heartbeat', 'selection-mismatch', {
                 strayCount: strays.length,
@@ -799,7 +799,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           );
           if (triggerHit) {
             console.warn(
-              `[vitest-affected] Full-suite trigger matched (${toRepoRelative(triggerHit, rootDir)}) — running full suite`,
+              `[vitest-affected] Full-suite trigger matched (${safeLabel(toRepoRelative(triggerHit, rootDir))}) — running full suite`,
             );
             emitStats(statsCtx, 'full-suite', 'full-suite-trigger', {
               changedFiles: changed.length, deletedFiles: deleted.length,
@@ -1046,7 +1046,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const validTests = affectedTests.filter((f) => {
           if (!existsSync(f)) {
             console.warn(
-              `[vitest-affected] Affected test file not found on disk: ${f}`,
+              `[vitest-affected] Affected test file not found on disk: ${safeLabel(f)}`,
             );
             return false;
           }

@@ -67,7 +67,7 @@ The master plan lives at `_backlog/intelligent-test-selection.md`. Beads are the
 - All new modules must have corresponding test files
 - `node_modules/` paths are never included in the dependency graph
 - Graph maps use `Map<string, Set<string>>` with absolute file paths
-- Test fixtures live in `test/fixtures/` with known dependency structures (simple, diamond, circular)
+- Test fixtures live in `test/fixtures/` with known dependency structures (simple, diamond)
 
 ## Evidence badge
 

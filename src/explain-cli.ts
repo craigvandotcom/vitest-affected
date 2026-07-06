@@ -27,26 +27,27 @@
 import path from 'node:path';
 import { loadCachedReverseMap } from './graph/cache.js';
 import { getChangedFiles } from './git.js';
-import { toCanonicalPath } from './graph/normalize.js';
+import { safeLabel, toCanonicalPath } from './graph/normalize.js';
 import { explainSelection, type ExplainResult } from './explain-core.js';
 
 /** Render an ExplainResult to stdout. */
 function printResult(result: ExplainResult, seeds: string[]): void {
   if (result.selected) {
-    console.log(`SELECTED: ${result.testFile}`);
-    console.log(`  why: ${result.reason}`);
-    console.log(`  seed: ${result.seed}`);
+    console.log(`SELECTED: ${safeLabel(result.testFile)}`);
+    // reason embeds the seed path (explain-core), so sanitize it too.
+    console.log(`  why: ${safeLabel(result.reason)}`);
+    console.log(`  seed: ${result.seed === null ? 'null' : safeLabel(result.seed)}`);
     console.log('  chain:');
     result.chain.forEach((node, i) => {
       const arrow = i === 0 ? '' : '  ↳ ';
-      console.log(`    ${arrow}${node}`);
+      console.log(`    ${arrow}${safeLabel(node)}`);
     });
   } else {
-    console.log(`NOT SELECTED: ${result.testFile}`);
-    console.log(`  why not: ${result.reason}`);
+    console.log(`NOT SELECTED: ${safeLabel(result.testFile)}`);
+    console.log(`  why not: ${safeLabel(result.reason)}`);
     if (seeds.length > 0) {
       console.log(`  changed files considered (${seeds.length}):`);
-      for (const s of seeds.slice(0, 20)) console.log(`    - ${s}`);
+      for (const s of seeds.slice(0, 20)) console.log(`    - ${safeLabel(s)}`);
       if (seeds.length > 20) console.log(`    … (+${seeds.length - 20} more)`);
     }
   }

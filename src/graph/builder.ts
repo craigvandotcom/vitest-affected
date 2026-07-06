@@ -2,7 +2,7 @@ import { ResolverFactory } from 'oxc-resolver';
 import { parseSync } from 'oxc-parser';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { toCanonicalPath } from './normalize.js';
+import { safeLabel, toCanonicalPath } from './normalize.js';
 import type { ReverseMap } from './types.js';
 
 const BINARY_EXTENSIONS = new Set([
@@ -142,7 +142,7 @@ export function resolveFileImports(
 ): string[] {
   const { module: mod, errors } = parseSync(file, source);
   if (errors.length > 0) {
-    console.warn(`[vitest-affected] Parse errors in ${file} — imports may be incomplete`);
+    console.warn(`[vitest-affected] Parse errors in ${safeLabel(file)} — imports may be incomplete`);
   }
   const specifiers: string[] = [];
 
@@ -179,6 +179,18 @@ export function resolveFileImports(
 
   // Worker/SharedWorker construction — new Worker(new URL('./x', import.meta.url))
   // Invisible to oxc-parser's import/export extraction (see extractWorkerSpecifiers).
+  //
+  // SEED-ONLY BOUNDARY, BY DESIGN. The static extraction in this function
+  // (staticImports + dynamicImports + re-exports + WORKER_URL_RE) exists ONLY to
+  // let deltaParseNewImports discover the import TARGETS of the changed files, so
+  // those targets can seed additional BFS entry points that the runtime cache has
+  // not observed yet (a brand-new import added this edit). It deliberately does
+  // NOT construct persistent reverse edges: the authoritative reverse graph is
+  // built solely from Vitest's importDurations (folded in by runtime-merge), which
+  // captures the REAL, executed module graph — including transitive and
+  // conditionally-loaded edges a static walk would miss. Mirrors the vi.mock /
+  // vi.importActual BY-DESIGN edge-presence note in runtime-merge.ts: static
+  // parsing seeds, runtime observation is the source of truth.
   for (const specifier of extractWorkerSpecifiers(source)) {
     if (!isBinarySpecifier(specifier)) {
       specifiers.push(specifier);
@@ -237,7 +249,7 @@ export function deltaParseNewImports(
       if (!cachedReverse.has(imp)) {
         newTargets.push(imp);
         if (verbose) {
-          console.warn(`[vitest-affected] Delta parse: new import target ${imp} from ${file}`);
+          console.warn(`[vitest-affected] Delta parse: new import target ${safeLabel(imp)} from ${safeLabel(file)}`);
         }
       }
     }

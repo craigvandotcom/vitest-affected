@@ -41,7 +41,7 @@ vitest-affected/
 │   ├── git.ts            # 4 parallel git commands → { changed: string[], deleted: string[] }
 │   └── selector.ts       # Pure BFS on reverse graph → affected test file paths
 ├── test/
-│   ├── fixtures/         # Known-structure projects: simple/, diamond/, circular/
+│   ├── fixtures/         # Known-structure projects: simple/, diamond/
 │   └── *.test.ts         # Unit + integration tests
 ├── _backlog/             # Master plan: intelligent-test-selection.md
 ├── .beads/               # beads_rust task management database

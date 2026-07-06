@@ -243,6 +243,8 @@ Selective runs only refresh edges for the tests that actually ran, so a long str
 
 Add `.vitest-affected/` to your `.gitignore`. For CI, cache this directory between runs for instant test selection.
 
+Keep `.vitest-affected/` untracked — the cached `graph.json` shapes which tests get selected, so a committed or tampered graph could quietly narrow a run. Restore it from a trusted CI cache, never from the repo, and don't gate merges on a selective run alone: keep a periodic full run (e.g. the [shadow-mode](#ci-divergence-monitoring) job, or a scheduled full suite) as the source of truth.
+
 ## Watch Mode
 
 In `vitest --watch`, the plugin delegates to Vitest's native file-watching and HMR-based module graph. The runtime reporter continues updating the cache, so the next `vitest run` has the latest dependency data.
@@ -286,11 +288,17 @@ Under shadow, decision lines are remapped into a shadow namespace with the origi
 Two ways to see the provenance of a selection — the seed (the changed/deleted file) and the full edge chain (`seed → … → test`) that caused it:
 
 - **`explain: true`** attaches an `explain` field to the `selective` decision line: `{ [testPath]: { seed, chain } }` for every selected test. Off by default because chains can be large on deep graphs.
-- **`npx vitest-affected-explain <testfile>`** answers the question ad hoc against the current cache + git state — including *why-not* (which chain is missing) for a test that isn't selected:
+- **`npx vitest-affected-explain <testfile>`** answers the question ad hoc against the current cache + git state — including *why-not* for a test that isn't selected. When a test isn't selected it reports **that** no cached import chain connects a changed file to it (and lists the changed files it considered as seeds), rather than reconstructing the specific missing edge:
 
 ```bash
 $ npx vitest-affected-explain test/checkout.test.ts
-SELECTED — seed src/cart.ts → src/checkout.ts → test/checkout.test.ts
+SELECTED: /repo/test/checkout.test.ts
+  why: reached from changed file /repo/src/cart.ts via 2 edge(s)
+  seed: /repo/src/cart.ts
+  chain:
+    /repo/src/cart.ts
+      ↳ /repo/src/checkout.ts
+      ↳ /repo/test/checkout.test.ts
 ```
 
 ## CI divergence monitoring

@@ -59,7 +59,11 @@ export async function getChangedFiles(
     return { changed: [], deleted: [] };
   }
 
-  // Step 2: Shallow clone detection (only relevant when ref is provided)
+  // Step 2: Shallow clone detection (only relevant when ref is provided).
+  // Scoped to ref-based selection ON PURPOSE: a ref-less run diffs only the
+  // working tree / index against HEAD, which a shallow (HEAD-only) clone fully
+  // satisfies — so we deliberately tolerate shallow clones there and guard only
+  // the ref path, where reaching a historical merge-base requires real depth.
   if (ref !== undefined) {
     try {
       const { stdout } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
