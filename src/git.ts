@@ -6,9 +6,23 @@ import { toCanonicalPath } from './graph/normalize.js';
 
 const execFile = promisify(execFileCb);
 
+// Disable Node's 1MB default stdout cap. A large changeset (a giant diff range,
+// or codegen touching 10k+ files) overflows the default and makes execFile
+// reject with "maxBuffer length exceeded" — which the per-command `.catch(() => [])`
+// below would swallow into an empty file list, silently UNDER-selecting tests.
+// The safety invariant is over-select on failure, never silently under-select, so
+// git output is never capped (an unbounded diff cannot get us tests wrong; only
+// truncation can). A pathological OOM would crash → propagate → full-suite
+// fallback, which is the safe side.
+const GIT_STDOUT_MAX_BUFFER = Infinity;
+
 async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise<{ stdout: string }> {
   try {
-    const { stdout } = await execFile(cmd, args, { ...opts, encoding: 'utf-8' });
+    const { stdout } = await execFile(cmd, args, {
+      ...opts,
+      encoding: 'utf-8',
+      maxBuffer: GIT_STDOUT_MAX_BUFFER,
+    });
     return { stdout: stdout ?? '' };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -57,6 +71,35 @@ export async function getChangedFiles(
     }
   }
 
+  // Step 2b: Ref resolvability check (only relevant when ref is provided).
+  // The shallow-clone guard above only fires when the repo IS shallow. On a
+  // NON-shallow checkout the ref can still fail to resolve (CI fetched only
+  // HEAD, the ref was never fetched, or a typo). Left unguarded, the committed
+  // `git diff ${ref}...HEAD` below fails and the per-command catch would
+  // silently drop the ENTIRE committed diff — the user asked for ref-based
+  // selection and would silently get working-tree-only selection instead.
+  // Mirror the shallow-clone guard EXACTLY: throw a loud `vitest-affected:`
+  // error so the plugin's catch-all falls back to the full suite.
+  if (ref !== undefined) {
+    let refResolves = false;
+    try {
+      // `--verify --quiet <ref>^{commit}` exits 0 (prints the SHA) when the ref
+      // resolves to a commit, and non-zero with no output otherwise — which
+      // exec() surfaces as a throw.
+      await exec('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: rootDir });
+      refResolves = true;
+    } catch {
+      refResolves = false;
+    }
+    if (!refResolves) {
+      throw new Error(
+        `vitest-affected: ref "${ref}" does not resolve to a commit. ` +
+        'Cannot compute ref-based diff. ' +
+        'Ensure the ref is fetched (e.g. "git fetch origin <ref>" in CI) and spelled correctly.'
+      );
+    }
+  }
+
   // Step 3: Get git root (paths from git diff are relative to git root, not rootDir)
   // Canonicalize explicitly rather than relying on git's own realpath behavior
   // (which resolves symlinks when locating the repo toplevel): on macOS this is
@@ -74,10 +117,16 @@ export async function getChangedFiles(
   //
   // All paths are relative to gitRoot.
 
+  // No `.catch(() => [])` here (unlike the staged/unstaged sources below): the
+  // ref was verified to resolve and the repo is non-shallow, so a failure of
+  // `git diff ${ref}...HEAD` is genuinely unexpected (e.g. unrelated histories
+  // with no merge base, or an I/O error). Silently returning [] would drop the
+  // ref-based diff the user explicitly requested — an under-selection. Letting
+  // it reject propagates through Promise.all → getChangedFiles throws → the
+  // plugin's catch-all falls back to the full suite (the safe, loud outcome).
   const committedPromise: Promise<string[]> = ref !== undefined
     ? exec('git', ['diff', '--name-only', '--diff-filter=ACMRD', `${ref}...HEAD`], { cwd: gitRoot })
         .then(r => r.stdout.trim().split('\n').filter(Boolean))
-        .catch(() => [])
     : Promise.resolve([]);
 
   // staged (add/copy/modify/rename) — new names or modified files

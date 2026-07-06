@@ -27,9 +27,13 @@ No separate eslint/prettier/biome — TypeScript strict mode is the only static 
 src/
 ├── index.ts          # Public API: vitestAffected() + VitestAffectedOptions type
 ├── plugin.ts         # Vitest plugin — configureVitest hook + runtime reporter
+├── changed-files.ts  # filterRelevantChangedFiles/toRepoRelative — extension + ignore-path filtering of git changes
+├── explain-core.ts   # Pure "why would/wouldn't test X be selected" decision logic, no IO
+├── explain-cli.ts    # `vitest-affected-explain` bin — ad hoc CLI against on-disk cache + git state
+├── runtime-merge.ts  # mergeRuntimeEdges — folds Vitest's importDurations into the reverse graph
 ├── graph/
 │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports for changed files
-│   ├── cache.ts      # v2 cache: loadCachedReverseMap / saveCacheSync (JSON persistence)
+│   ├── cache.ts      # v3 cache (rootDir-relative paths; v1/v2 read-migrated): loadCachedReverseMap / saveCacheSync
 │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs
 ├── git.ts            # 4 parallel git commands → { changed[], deleted[] }
 └── selector.ts       # Pure BFS on reverse graph → affected test file paths

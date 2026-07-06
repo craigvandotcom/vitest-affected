@@ -29,22 +29,28 @@ vitest-affected/
 ├── src/
 │   ├── index.ts          # Public API: vitestAffected() + VitestAffectedOptions type
 │   ├── plugin.ts         # Vitest plugin — configureVitest({ vitest, project }) orchestration
+│   ├── changed-files.ts  # filterRelevantChangedFiles/toRepoRelative — extension + ignore-path filtering of git changes
+│   ├── explain-core.ts   # Pure "why would/wouldn't test X be selected" decision logic, no IO
+│   ├── explain-cli.ts    # `vitest-affected-explain` bin — ad hoc CLI against on-disk cache + git state
+│   ├── runtime-merge.ts  # mergeRuntimeEdges — folds Vitest's importDurations into the reverse graph
 │   ├── graph/
-│   │   └── builder.ts    # oxc-parser + oxc-resolver → { forward, reverse } Map<string, Set<string>>
-│   ├── git.ts            # 3 parallel git commands → { changed: string[], deleted: string[] }
+│   │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports(changedFiles, cachedReverse) → new import targets
+│   │   ├── cache.ts      # v3 cache (rootDir-relative paths; v1/v2 read-time migrated) — loadCachedReverseMap/saveCacheSync
+│   │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs; realpath canonicalization
+│   ├── git.ts            # 4 parallel git commands → { changed: string[], deleted: string[] }
 │   └── selector.ts       # Pure BFS on reverse graph → affected test file paths
 ├── test/
 │   ├── fixtures/         # Known-structure projects: simple/, diamond/, circular/
 │   └── *.test.ts         # Unit + integration tests
 ├── _backlog/             # Master plan: intelligent-test-selection.md
 ├── .beads/               # beads_rust task management database
-├── package.json          # ESM-only, peerDep vitest >=3.1.0
+├── package.json          # ESM-only, peerDep vitest >=3.2.0 <5.0.0
 ├── tsconfig.json         # Strict, ES2022, bundler resolution
 ├── tsup.config.ts        # Build: ESM-only, dts, clean
 └── vitest.config.ts      # Test config: include test/**/*.test.ts, exclude test/fixtures/**
 ```
 
-**Data flow:** `plugin.configureVitest` → `buildFullGraph(rootDir)` → `getChangedFiles(rootDir)` → `bfsAffectedTests(changed, reverse, isTestFile)` → mutate `project.config.include` to absolute paths.
+**Data flow:** `plugin.configureVitest` → `loadCachedReverseMap` (graph/cache.ts) → `getChangedFiles(rootDir)` (git.ts) → `deltaParseNewImports` (graph/builder.ts, parses only changed files for new import targets) → `bfsAffectedTestsWithProvenance` (selector.ts) → mutate `project.config.include` to absolute paths. After each run, the runtime reporter merges `importDurations` into the reverse graph (`runtime-merge.ts`) and persists it via `saveCacheSync`.
 
 **Runtime dependencies:** `oxc-parser`, `oxc-resolver`, and `tinyglobby` are runtime deps (used inside the plugin at test time), not devDependencies. They must be in `dependencies` so consumers get them transitively.
 

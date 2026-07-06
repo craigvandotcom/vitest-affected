@@ -311,9 +311,15 @@ beforeAll(async () => {
 // a shadow-SELECTIVE decision picking mod.test, and mod.test flips passed→failed).
 //
 // The plant: trim the aliased edge (src/mod.ts→mod.test) out of the WARM-UP
-// graph — reconstructing the drifted cache a LIVE plugin would hold (its
-// delta-parser can't resolve the alias, so it never learned the edge; the
-// full-suite harness captures it, so we remove it). analyzeRun then simulates
+// graph — reconstructing the drifted cache a LIVE plugin would hold. The edge
+// is a REVERSE edge (mod.test imports mod.ts through the @app alias) and at C2
+// the only changed file is the SOURCE (src/mod.ts). Delta-parse re-parses only
+// the changed files' OWN outgoing imports, so it never re-reads the unchanged
+// test that holds the aliased import — the reverse edge is unrecoverable from a
+// drifted cache regardless of the delta-parser's alias support (which is real:
+// project.vite.config.resolve.alias DOES reach the resolver — see
+// test/alias-integration.test.ts). Runtime importDurations captured the edge at
+// warm-up (alias-transparent), so we remove it here. analyzeRun then simulates
 // the live selection from that drifted cache, MISSES mod.test at C2, and — since
 // the planted commit broke the test — the outcome-confirmed tier labels the flip.
 // ===========================================================================
@@ -351,7 +357,9 @@ describe('replay: planted-miss silver bullet (real walk + drifted cache)', () =>
         reverseMap: Record<string, string[]>;
       };
       // Sanity: the runtime reporter DID capture the aliased edge at warm-up
-      // (alias-transparent) — this is exactly the edge a live delta-parser misses.
+      // (alias-transparent). Once removed, a live plugin can't rebuild it: at C2
+      // only the source changed, and delta-parse never re-reads the unchanged
+      // test that owns the aliased import — so this reverse edge stays missed.
       const modKey = Object.keys(graph.reverseMap).find((k) => k.endsWith('src/mod.ts'));
       expect(modKey).toBeDefined();
       delete graph.reverseMap[modKey as string];

@@ -234,6 +234,14 @@ export function createRuntimeReporter(
   // paths). `null` = no selective decision was applied this run (full-suite,
   // shadow mode, or not yet decided) → self-verify is skipped.
   let selectedTests: string[] | null = null;
+  // Whether the NEXT completed run is the first of this process. `configureVitest`
+  // runs ONCE per process; on watch-mode re-runs Vitest re-scopes to its own
+  // subset without the plugin re-selecting (and selectedTests has been reset to
+  // null below), so only the first completed run may be treated as a genuine
+  // full-suite rebuild. Every subsequent re-run takes the selective path,
+  // regardless of selectedTests. Flipped false after the first non-interrupted
+  // run end.
+  let isFirstRun = true;
 
   function setRootDir(dir: string): void {
     rootDir = dir;
@@ -294,13 +302,24 @@ export function createRuntimeReporter(
     // produce a false-positive heartbeat here either.
     if (reason === 'interrupted') return;
 
-    // Was this a full-suite run? selectedTests === null means no selective
-    // decision was applied (full-suite fallback, or shadow mode where all tests
-    // run) — the runtime map is (near) fully re-observed, so it resets the
-    // staleness baseline. Captured BEFORE the reset below. A selective run
-    // (selectedTests !== null, including the allow-no-tests empty set) only
-    // partially refreshes the map and instead ages the metadata.
-    const wasFullSuiteRun = selectedTests === null;
+    // Was this a full-suite REBUILD? Two conditions must BOTH hold:
+    //   1. selectedTests === null — no selective decision was applied (full-suite
+    //      fallback, or shadow mode where all tests run), so the runtime map is
+    //      (near) fully re-observed.
+    //   2. isFirstRun — this is the FIRST completed run of the process. In watch
+    //      mode configureVitest does NOT re-run, so selectedTests is reset to
+    //      null after every run (below); a Vitest-chosen subset re-run would then
+    //      spuriously read as a full-suite rebuild and falsely reset the
+    //      staleness baseline (lastFullRebuild=now, runCount=0) while most edges
+    //      stay stale — neutralizing the staleness warning in the primary dev
+    //      workflow. Gating on the first run keeps genuine single-shot full-suite
+    //      runs (disabled/fallback) correct while routing every watch re-run down
+    //      the selective path (bump runCount, keep lastFullRebuild).
+    // Captured BEFORE the resets below. A selective run (selectedTests !== null,
+    // including the allow-no-tests empty set) or any watch re-run only partially
+    // refreshes the map and instead ages the metadata.
+    const wasFullSuiteRun = selectedTests === null && isFirstRun;
+    isFirstRun = false;
 
     // SELECTION SELF-VERIFY: a selective decision was applied this run, so
     // every test that ran must be in the selected set. A stray means the
@@ -402,6 +421,99 @@ function writeStatsLine(
   }
 }
 
+/**
+ * Ambient stats-emission context threaded into {@link emitStats}. Built once per
+ * `configureVitest` invocation; `rootDir` is a mutable field (starts at cwd,
+ * reassigned to the canonical config root once resolved) so early exits and later
+ * ones both resolve relative stats paths from the right base without rebuilding
+ * the object. Stable identity — captured by the runtime reporter's post-run
+ * diagnostic closures too.
+ */
+interface EmitStatsCtx {
+  statsFile?: string;
+  rootDir: string;
+  verbose: boolean;
+  shadow: boolean;
+}
+
+/**
+ * Shared stats-emission helper — the single funnel replacing every `if
+ * (statsFile) writeStatsLine(...)` call site. No-op when no stats path is
+ * configured. `shadowFlag` defaults to the ambient `shadow` mode but the post-run
+ * reporter diagnostics (heartbeat lines) pass `false` explicitly — they are never
+ * remapped into the shadow-selective/shadow-full-suite namespace.
+ */
+function emitStats(
+  ctx: EmitStatsCtx,
+  action: string,
+  reason?: string,
+  extra?: Record<string, unknown>,
+  shadowFlag: boolean = ctx.shadow,
+): void {
+  if (!ctx.statsFile) return;
+  writeStatsLine(
+    ctx.statsFile,
+    ctx.rootDir,
+    { action, reason, ...extra },
+    ctx.verbose,
+    shadowFlag,
+  );
+}
+
+/**
+ * Twin-block helper: resolve a `string | string[]` config field
+ * (setupFiles/globalSetup) into a canonicalized Set, check it against the RAW
+ * changed+deleted set, and on a hit warn + emit the full-suite stats line.
+ * Returns true so the caller can early-return.
+ */
+function checkFullSuiteConfigField(
+  rawField: string | string[] | undefined,
+  warnMessage: string,
+  reason: string,
+  rootDir: string,
+  rawChanged: string[],
+  changedCount: number,
+  deletedCount: number,
+  graphSize: number,
+  startMs: number,
+  statsCtx: EmitStatsCtx,
+): boolean {
+  const fieldRaw = rawField ?? [];
+  const fieldSet = new Set(
+    (Array.isArray(fieldRaw) ? fieldRaw : [fieldRaw]).map((f) =>
+      toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+    ),
+  );
+  if (rawChanged.some((f) => fieldSet.has(f))) {
+    console.warn(warnMessage);
+    emitStats(statsCtx, 'full-suite', reason, {
+      changedFiles: changedCount, deletedFiles: deletedCount,
+      graphSize, durationMs: Date.now() - startMs,
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Build the `explain` field for a set of selected tests, filtered to the
+ * provenance the BFS recorded. Returns undefined when explain is off so the field
+ * never appears on default stats lines.
+ */
+function buildExplain(
+  tests: string[],
+  explain: boolean | undefined,
+  provenance: Map<string, SelectionTrail>,
+): Record<string, SelectionTrail> | undefined {
+  if (!explain) return undefined;
+  const out: Record<string, SelectionTrail> = {};
+  for (const t of tests) {
+    const trail = provenance.get(t);
+    if (trail) out[t] = trail;
+  }
+  return out;
+}
+
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   // Hoisted state — shared between config() and configureVitest()
   let reverse: Map<string, Set<string>> = new Map();
@@ -429,34 +541,17 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       // so the catch-all can still emit; rootDir starts at cwd and is refined
       // once vitest.config.root resolves.
       const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
-      // Canonicalize the cwd fallback so the workspace/config-shape early-exit
-      // emissions resolve relative stats paths from a canonical base — the same
-      // path-identity boundary every other path in the plugin routes through.
-      let statsRootDir = toCanonicalPath(process.cwd());
-
-      // Shared stats-emission closure — replaces every `if (statsFile)
-      // writeStatsLine(...)` call site below. Reads `statsRootDir` (mutable —
-      // starts at cwd, reassigned to the canonical rootDir once resolved at
-      // step 4) so early exits and later ones both get the right root without
-      // duplicating the two-phase logic per call site. `shadowFlag` defaults
-      // to the ambient `shadow` mode but the post-run reporter diagnostics
-      // (heartbeat lines) pass `false` explicitly — they are never remapped
-      // into the shadow-selective/shadow-full-suite namespace.
-      function emitStats(
-        action: string,
-        reason?: string,
-        extra?: Record<string, unknown>,
-        shadowFlag: boolean = shadow,
-      ): void {
-        if (!statsFile) return;
-        writeStatsLine(
-          statsFile,
-          statsRootDir,
-          { action, reason, ...extra },
-          verbose,
-          shadowFlag,
-        );
-      }
+      // Ambient stats-emission context, passed to the module-level `emitStats`.
+      // `rootDir` is canonicalized (the same path-identity boundary every other
+      // path in the plugin routes through) and starts at the cwd fallback so the
+      // workspace/config-shape early exits resolve relative stats paths correctly;
+      // it is reassigned to the canonical config root once resolved at step 4.
+      const statsCtx: EmitStatsCtx = {
+        statsFile,
+        rootDir: toCanonicalPath(process.cwd()),
+        verbose,
+        shadow,
+      };
 
       try {
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
@@ -469,7 +564,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
           );
-          emitStats('full-suite', 'workspace', {
+          emitStats(statsCtx, 'full-suite', 'workspace', {
             durationMs: Date.now() - startMs,
           });
           return;
@@ -485,7 +580,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Unexpected config shape — running full suite',
           );
-          emitStats('full-suite', 'config-shape', {
+          emitStats(statsCtx, 'full-suite', 'config-shape', {
             durationMs: Date.now() - startMs,
           });
           return;
@@ -499,7 +594,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // which git itself resolves through symlinks when locating the repo
         // toplevel — a silent under-selection.
         const rootDir = toCanonicalPath(vitest.config.root);
-        statsRootDir = rootDir;
+        statsCtx.rootDir = rootDir;
 
         // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
         // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
@@ -529,7 +624,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
             );
-            emitStats('full-suite', 'import-durations-shape', {
+            emitStats(statsCtx, 'full-suite', 'import-durations-shape', {
               graphSize: reverse.size, durationMs: Date.now() - startMs,
             });
             return;
@@ -575,7 +670,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
                 `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
                 'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
             );
-            emitStats('heartbeat', 'cache-stale', {
+            emitStats(statsCtx, 'heartbeat', 'cache-stale', {
               staleCacheDays,
               cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
               selectiveRunCount: cacheMeta.runCount,
@@ -629,14 +724,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
                     "that Vitest's importDurations collection is enabled and its API is intact.",
                 );
               }
-              emitStats('heartbeat', 'zero-edges', undefined, false);
+              emitStats(statsCtx, 'heartbeat', 'zero-edges', undefined, false);
             },
             // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
             onSelectionMismatch: (strays) => {
               console.warn(
                 `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
               );
-              emitStats('heartbeat', 'selection-mismatch', {
+              emitStats(statsCtx, 'heartbeat', 'selection-mismatch', {
                 strayCount: strays.length,
               }, false);
             },
@@ -705,7 +800,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               `[vitest-affected] Full-suite trigger matched (${toRepoRelative(triggerHit, rootDir)}) — running full suite`,
             );
-            emitStats('full-suite', 'full-suite-trigger', {
+            emitStats(statsCtx, 'full-suite', 'full-suite-trigger', {
               changedFiles: changed.length, deletedFiles: deleted.length,
               graphSize: reverse.size, durationMs: Date.now() - startMs,
             });
@@ -722,37 +817,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // matching 6a's behavior.
         const rawChangedForSetup = [...changed, ...deleted];
 
-        // Shared twin-block helper: resolve a `string | string[]` config
-        // field (setupFiles/globalSetup) into a canonicalized Set, check it
-        // against the RAW changed+deleted set, and on a hit warn + emit the
-        // full-suite stats line. Returns true so the caller can early-return.
-        function checkFullSuiteConfigField(
-          rawField: string | string[] | undefined,
-          warnMessage: string,
-          reason: string,
-        ): boolean {
-          const fieldRaw = rawField ?? [];
-          const fieldSet = new Set(
-            (Array.isArray(fieldRaw) ? fieldRaw : [fieldRaw]).map((f) =>
-              toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-            ),
-          );
-          if (rawChangedForSetup.some((f) => fieldSet.has(f))) {
-            console.warn(warnMessage);
-            emitStats('full-suite', reason, {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              graphSize: reverse.size, durationMs: Date.now() - startMs,
-            });
-            return true;
-          }
-          return false;
-        }
-
         if (
           checkFullSuiteConfigField(
             project.config.setupFiles,
             '[vitest-affected] Setup file change detected — running full suite',
             'setup-file-change',
+            rootDir, rawChangedForSetup, changed.length, deleted.length,
+            reverse.size, startMs, statsCtx,
           )
         ) {
           return;
@@ -766,6 +837,8 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             project.config.globalSetup,
             '[vitest-affected] Global setup file change detected — running full suite',
             'global-setup-change',
+            rootDir, rawChangedForSetup, changed.length, deleted.length,
+            reverse.size, startMs, statsCtx,
           )
         ) {
           return;
@@ -802,7 +875,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 7. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
-          emitStats('full-suite', 'no-changes', {
+          emitStats(statsCtx, 'full-suite', 'no-changes', {
             changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
             graphSize: reverse.size,
             durationMs: Date.now() - startMs,
@@ -826,7 +899,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Config file change detected — running full suite',
           );
-          emitStats('full-suite', 'config-change', {
+          emitStats(statsCtx, 'full-suite', 'config-change', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, durationMs: Date.now() - startMs,
@@ -841,7 +914,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
             );
           }
-          emitStats('full-suite', 'cache-miss', {
+          emitStats(statsCtx, 'full-suite', 'cache-miss', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: 0, cacheHit: false,
@@ -870,7 +943,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No include patterns configured — running full suite',
           );
-          emitStats('full-suite', 'no-include-patterns', {
+          emitStats(statsCtx, 'full-suite', 'no-include-patterns', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
@@ -892,7 +965,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No test files matched include patterns — running full suite',
           );
-          emitStats('full-suite', 'no-test-files', {
+          emitStats(statsCtx, 'full-suite', 'no-test-files', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
@@ -911,21 +984,6 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           (f) => testFileSet.has(f),
         );
 
-        // Build the explain field for a set of selected tests, filtered to the
-        // provenance the BFS recorded. Returns undefined when explain is off so
-        // the field never appears on default lines.
-        const buildExplain = (
-          tests: string[],
-        ): Record<string, SelectionTrail> | undefined => {
-          if (!options.explain) return undefined;
-          const out: Record<string, SelectionTrail> = {};
-          for (const t of tests) {
-            const trail = provenance.get(t);
-            if (trail) out[t] = trail;
-          }
-          return out;
-        };
-
         // 14. Threshold check
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
@@ -936,20 +994,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               // Vitest that runs everything on an empty include.
               setSelectedTests([]);
             }
-            emitStats('selective', 'allow-no-tests', {
+            emitStats(statsCtx, 'selective', 'allow-no-tests', {
               changedFiles: changed.length, deletedFiles: deleted.length,
               ignoredFiles: ignoredCount,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
               selectedFiles: [],
-              explain: buildExplain([]),
+              explain: buildExplain([], options.explain, provenance),
             });
             return;
           }
           console.warn(
             '[vitest-affected] No affected tests found — running full suite',
           );
-          emitStats('full-suite', 'no-affected-tests', {
+          emitStats(statsCtx, 'full-suite', 'no-affected-tests', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
@@ -964,7 +1022,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
           );
-          emitStats('full-suite', 'threshold-exceeded', {
+          emitStats(statsCtx, 'full-suite', 'threshold-exceeded', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: affectedTests.length, totalTests: testFiles.length,
@@ -1002,16 +1060,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             // Record the selected set for the reporter's post-run self-verify.
             setSelectedTests(validTests);
           }
-          emitStats('selective', undefined, {
+          emitStats(statsCtx, 'selective', undefined, {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
             selectedFiles: validTests,
-            explain: buildExplain(validTests),
+            explain: buildExplain(validTests, options.explain, provenance),
           });
         } else {
-          emitStats('full-suite', 'no-valid-tests-on-disk', {
+          emitStats(statsCtx, 'full-suite', 'no-valid-tests-on-disk', {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: 0, totalTests: testFiles.length,
@@ -1024,7 +1082,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         console.warn(
           `[vitest-affected] Unexpected error — running full suite: ${err instanceof Error ? err.message : String(err)}`,
         );
-        emitStats('full-suite', 'error', {
+        emitStats(statsCtx, 'full-suite', 'error', {
           durationMs: Date.now() - startMs,
         });
       }

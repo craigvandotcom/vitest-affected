@@ -202,6 +202,29 @@ describe('getChangedFiles', () => {
     expect(result.changed).toContain(path.join(dir, '.env'));
   });
 
+  // 12. Non-shallow repo, unresolvable ref → loud failure (full-suite fallback).
+  // The shallow-clone guard only fires when the repo IS shallow. On a normal
+  // (non-shallow) checkout, a ref that never resolves (never fetched, typo)
+  // must NOT silently drop the committed diff and degrade to working-tree-only
+  // selection. getChangedFiles rethrows a `vitest-affected:` error — the same
+  // loud-failure taxonomy the shallow-clone guard uses — which the plugin's
+  // catch-all turns into a full-suite fallback. Mirrors the shallow guard's
+  // assertion: expect a reject carrying the recognizable error prefix.
+  test('throws (loud failure) when ref does not resolve on a non-shallow repo', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'a.ts'), 'export const a = 1;\n');
+    await git(['add', 'a.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Sanity: this is a normal, non-shallow repo (shallow guard would not fire).
+    const { stdout: shallow } = await git(['rev-parse', '--is-shallow-repository'], dir);
+    expect(shallow.trim()).toBe('false');
+
+    await expect(getChangedFiles(dir, 'no-such-ref-xyz')).rejects.toThrow(
+      /vitest-affected: ref "no-such-ref-xyz" does not resolve/,
+    );
+  });
+
   // 10. Renamed file: old name in deleted, new name in changed
   test('handles renamed files correctly', async () => {
     const dir = await makeTempRepo();
