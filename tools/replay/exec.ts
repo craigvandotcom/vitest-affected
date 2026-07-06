@@ -22,6 +22,12 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { execa } from 'execa';
 import { runGit } from './git-cmd.js';
+import { trackChild } from './child-registry.js';
+import {
+  STDOUT_MAX_BUFFER,
+  VITEST_RUN_TIMEOUT_MS,
+  CHILD_FORCE_KILL_MS,
+} from './limits.js';
 import type { ShadowDecision } from './types.js';
 
 /**
@@ -166,16 +172,54 @@ export async function runCommit(
 
   let stdout: string;
   try {
-    const result = await execa(
-      'npx',
-      ['vitest', 'run', '--reporter=json'],
-      // extendEnv:false — the child gets EXACTLY buildRunEnv's env, never an
-      // extension of the parent process.env (which would re-introduce the CI /
-      // GITHUB_ACTIONS / VITEST_AFFECTED_DISABLED keys buildRunEnv deletes; see
-      // its doc comment). `env` is a full copy of the base env, so PATH etc. are
-      // carried through.
-      { cwd: cloneDir, env, reject: false, extendEnv: false },
+    // trackChild registers the subprocess so the top-level signal handler
+    // (run.ts) can terminate it before deleting the clone / exiting, instead of
+    // orphaning a live worker pool. forceKillAfterDelay guarantees the
+    // SIGTERM→SIGKILL escalation whether the kill comes from the signal handler
+    // or the `timeout` below.
+    const result = await trackChild(
+      execa(
+        'npx',
+        ['vitest', 'run', '--reporter=json'],
+        // extendEnv:false — the child gets EXACTLY buildRunEnv's env, never an
+        // extension of the parent process.env (which would re-introduce the CI /
+        // GITHUB_ACTIONS / VITEST_AFFECTED_DISABLED keys buildRunEnv deletes; see
+        // its doc comment). `env` is a full copy of the base env, so PATH etc. are
+        // carried through.
+        //
+        // maxBuffer STDOUT_MAX_BUFFER (256MB): a big suite's --reporter=json can
+        // exceed execa's 100MB default; on overflow execa truncates stdout, which
+        // parses to an EMPTY outcome map — corrupt ground truth, no error. The
+        // finite 256MB cap raises the ceiling while still bounding memory.
+        //
+        // timeout VITEST_RUN_TIMEOUT_MS (30 min): a wedged suite must not stall
+        // the walk. reject:false means a timeout does NOT throw — it resolves with
+        // result.timedOut=true, checked below and classified BROKEN so the walk
+        // continues.
+        {
+          cwd: cloneDir,
+          env,
+          reject: false,
+          extendEnv: false,
+          maxBuffer: STDOUT_MAX_BUFFER,
+          timeout: VITEST_RUN_TIMEOUT_MS,
+          forceKillAfterDelay: CHILD_FORCE_KILL_MS,
+        },
+      ),
     );
+    // reject:false surfaces failures on the result, not as a throw. A timed-out
+    // (or maxBuffer-terminated) run has partial/truncated stdout that would parse
+    // to an empty/garbage outcome map, so classify it BROKEN explicitly rather
+    // than letting the corrupt capture flow into analysis. A normal non-zero exit
+    // (FAILING tests) is NOT a timeout/overflow — it stays a capturable outcome.
+    if (result.timedOut) {
+      return broken(`vitest run timed out after ${VITEST_RUN_TIMEOUT_MS}ms`);
+    }
+    if (result.isMaxBuffer) {
+      return broken(
+        `vitest --reporter=json output exceeded ${STDOUT_MAX_BUFFER} bytes (truncated)`,
+      );
+    }
     stdout = result.stdout;
   } catch (err) {
     return broken(`vitest invocation failed: ${errText(err)}`);

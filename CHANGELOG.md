@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Committed renames now seed a deletion** — git change detection runs with
+  `--no-renames`, so a committed rename surfaces the old path as a deletion
+  (which seeds BFS from the dependents of the vanished file) instead of being
+  collapsed into a single rename entry git otherwise reports. Previously the old
+  path never entered the changed set and tests depending on it were silently
+  under-selected.
+- **Unresolvable `ref` now fails loudly into the full suite** — an `ref` that
+  git cannot resolve (bad branch/SHA, missing base in a shallow CI checkout)
+  throws and falls back to the full suite with a warning, instead of silently
+  degrading to a working-tree-only diff that under-selects against the intended
+  base.
+- **git stdout capped at a finite 256MB** — the git exec `maxBuffer` is set to a
+  finite 256MB so a pathologically large diff overflows into a catchable error
+  that trips the full-suite fallback. Previously the default 1MB buffer silently
+  emptied the changed set on overflow (and a brief `Infinity` cap risked an
+  unbounded allocation) — both under-ran tests without warning.
+- **Type-changed (`T`) files now enter the changed set** — git status/diff type
+  changes (e.g. a file swapped to/from a symlink) are no longer dropped by the
+  status-code filter and now seed selection like any other modification.
+- **Watch-mode re-runs no longer misclassified as full rebuilds** — a watch-mode
+  re-invocation is correctly recognized as incremental rather than a fresh full
+  rebuild, restoring the cache-staleness warning that the misclassification
+  suppressed.
+
+### Changed
+
+- **Hero-card accuracy metric now counts missed decisions over verified
+  decisions** — the evidence badge reports misses relative to the set of
+  verified decisions, a more honest denominator than the prior basis.
+
 ## [0.9.0] - 2026-07-06
 
 Release-candidate for 1.0: everything below is the 1.0 feature set, shipped

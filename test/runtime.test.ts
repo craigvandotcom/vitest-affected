@@ -13,25 +13,15 @@ import {
 import { tmpdir } from 'node:os';
 import { execa } from 'execa';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
-import type { TestModule } from 'vitest/node';
 import { createRuntimeReporter, vitestAffected } from '../src/plugin.js';
 import { saveCacheSync, loadCachedReverseMap } from '../src/graph/cache.js';
 import * as cacheModule from '../src/graph/cache.js';
 import { normalizeModuleId } from '../src/graph/normalize.js';
+import { createMockTestModule } from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function createMockTestModule(
-  moduleId: string,
-  importDurations: Record<string, { selfTime: number; totalTime: number }>,
-): TestModule {
-  return {
-    moduleId,
-    diagnostic: () => ({ importDurations }),
-  } as unknown as TestModule;
-}
 
 function makeTmpDir(): string {
   // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var);
@@ -407,7 +397,7 @@ describe('Integration: cacheDir guard in onEdgesCollected callback', () => {
         onFilterWatchedSpecification: () => {},
       };
 
-      const hook = (plugin as Record<string, unknown>).configureVitest as (ctx: {
+      const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (ctx: {
         vitest: typeof mockVitest;
         project: typeof mockProject;
       }) => Promise<void>;

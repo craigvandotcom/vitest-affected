@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { bfsAffectedTests } from '../src/selector.js';
+import { bfsAffectedTests, bfsAffectedTestsWithProvenance } from '../src/selector.js';
 
 const isTest = (f: string) => f.includes('.test.');
 
@@ -80,5 +80,28 @@ describe('bfsAffectedTests', () => {
     const isTestStrict = (f: string) => f.endsWith('.test.ts');
     expect(bfsAffectedTests(['/tests/helpers.ts'], reverse, isTestStrict))
       .toEqual(['/tests/a.test.ts', '/tests/b.test.ts']);
+  });
+
+  // 10. High-fan-in regression: a single node is a dependent of MANY seeds.
+  // The enqueue guard must admit it exactly once (was O(E) duplicate enqueues)
+  // while keeping selection + first-recorded-trail provenance byte-identical.
+  test('high fan-in node — deduped enqueue, first-edge-wins provenance preserved', () => {
+    // s1..s50 each have the SAME dependent T (T imports all of them). In the
+    // reverse map that is 50 incoming edges into T.
+    const seeds = Array.from({ length: 50 }, (_, i) => `/src/s${i}.ts`);
+    const reverse = new Map<string, Set<string>>(
+      seeds.map((s) => [s, new Set(['/tests/t.test.ts'])]),
+    );
+
+    // Selection: T is found exactly once, no duplicates.
+    expect(bfsAffectedTests(seeds, reverse, isTest)).toEqual(['/tests/t.test.ts']);
+
+    // Provenance: first seed in encounter order (s0) wins the trail.
+    const { tests, provenance } = bfsAffectedTestsWithProvenance(seeds, reverse, isTest);
+    expect(tests).toEqual(['/tests/t.test.ts']);
+    const trail = provenance.get('/tests/t.test.ts');
+    expect(trail).toBeDefined();
+    expect(trail!.seed).toBe('/src/s0.ts');
+    expect(trail!.chain).toEqual(['/src/s0.ts', '/tests/t.test.ts']);
   });
 });

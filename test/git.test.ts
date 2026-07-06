@@ -202,6 +202,29 @@ describe('getChangedFiles', () => {
     expect(result.changed).toContain(path.join(dir, '.env'));
   });
 
+  // 12. Non-shallow repo, unresolvable ref → loud failure (full-suite fallback).
+  // The shallow-clone guard only fires when the repo IS shallow. On a normal
+  // (non-shallow) checkout, a ref that never resolves (never fetched, typo)
+  // must NOT silently drop the committed diff and degrade to working-tree-only
+  // selection. getChangedFiles rethrows a `vitest-affected:` error — the same
+  // loud-failure taxonomy the shallow-clone guard uses — which the plugin's
+  // catch-all turns into a full-suite fallback. Mirrors the shallow guard's
+  // assertion: expect a reject carrying the recognizable error prefix.
+  test('throws (loud failure) when ref does not resolve on a non-shallow repo', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'a.ts'), 'export const a = 1;\n');
+    await git(['add', 'a.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Sanity: this is a normal, non-shallow repo (shallow guard would not fire).
+    const { stdout: shallow } = await git(['rev-parse', '--is-shallow-repository'], dir);
+    expect(shallow.trim()).toBe('false');
+
+    await expect(getChangedFiles(dir, 'no-such-ref-xyz')).rejects.toThrow(
+      /vitest-affected: ref "no-such-ref-xyz" does not resolve/,
+    );
+  });
+
   // 10. Renamed file: old name in deleted, new name in changed
   test('handles renamed files correctly', async () => {
     const dir = await makeTempRepo();
@@ -216,5 +239,68 @@ describe('getChangedFiles', () => {
     expect(result.changed).toContain(path.join(dir, 'new-name.ts'));
     // old.ts no longer exists → deleted
     expect(result.deleted).toContain(path.join(dir, 'old.ts'));
+  });
+
+  // 13. COMMITTED rename (ref-based): both old and new path must surface.
+  // git's DEFAULT rename detection collapses a committed A→B rename into a single
+  // --name-only entry showing only the NEW path, so the OLD path would never enter
+  // `deleted` and its cached `old → [tests]` reverse edges would never seed BFS —
+  // a silent under-selection. `--no-renames` splits the rename back into A + D.
+  // Regression guard for the committed-diff path (the staged path was already
+  // covered by test 10, which exercises the working tree, not ref...HEAD).
+  test('committed rename surfaces BOTH old (deleted) and new (changed) paths', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'renamed-old.ts'), 'export const x = 1;\n');
+    await git(['add', 'renamed-old.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Rename AND commit it, so the change is committed (not in the working tree).
+    await git(['mv', 'renamed-old.ts', 'renamed-new.ts'], dir);
+    await git(['commit', '-m', 'rename'], dir);
+
+    // ref points BEFORE the rename → the committed diff HEAD~1...HEAD is the rename.
+    const result = await getChangedFiles(dir, 'HEAD~1');
+    // new path exists on disk → changed/added
+    expect(result.changed).toContain(path.join(dir, 'renamed-new.ts'));
+    // old path no longer exists → deleted (this is what default rename detection drops)
+    expect(result.deleted).toContain(path.join(dir, 'renamed-old.ts'));
+  });
+
+  // 14. COMMITTED type-change (ref-based): a tracked path whose TYPE changes
+  // (regular file → symlink) is reported by git as a single `T` entry and nothing
+  // else. With --diff-filter=ACMD (no T) that entry is silently dropped: the path
+  // never enters `changed`, its cached reverse edges never seed BFS, and dependent
+  // tests are silently skipped — violating "never silently skip tests". Adding T
+  // (ACMDT) restores it. The new form (a symlink) still exists on disk, so
+  // existsSync routes it to `changed`. Regression guard for the committed-diff path.
+  // symlink() is POSIX-only; this suite's CI matrix is ubuntu + macos (no Windows),
+  // so skip on win32 rather than fight platform-specific symlink semantics.
+  const maybeSymlinkTest = process.platform === 'win32' ? test.skip : test;
+  maybeSymlinkTest('committed type-change (file → symlink) surfaces the path in changed', async () => {
+    const { symlinkSync, unlinkSync } = await import('node:fs');
+    const dir = await makeTempRepo();
+    // Two committed regular files: `target.ts` is the symlink destination, and
+    // `shifty.ts` starts life as a regular file.
+    writeFileSync(path.join(dir, 'target.ts'), 'export const target = 1;\n');
+    writeFileSync(path.join(dir, 'shifty.ts'), 'export const shifty = 1;\n');
+    await git(['add', 'target.ts', 'shifty.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Replace the regular file with a symlink pointing at the other committed
+    // file, then commit — this is a pure type-change (git reports it as `T`).
+    unlinkSync(path.join(dir, 'shifty.ts'));
+    symlinkSync('target.ts', path.join(dir, 'shifty.ts'));
+    await git(['add', 'shifty.ts'], dir);
+    await git(['commit', '-m', 'file → symlink'], dir);
+
+    // ref points BEFORE the type-change → the committed diff HEAD~1...HEAD is the T entry.
+    const result = await getChangedFiles(dir, 'HEAD~1');
+    // The symlink still exists on disk → existsSync → the path is routed to
+    // `changed` (never `deleted`). getChangedFiles canonicalizes via realpath, which
+    // resolves the symlink to its target — the SAME canonicalization graph keys use
+    // (see graph/builder.ts), so this is self-consistent. The load-bearing assertion
+    // is that a `T` entry surfaces in `changed` AT ALL (empty before the ACMDT fix).
+    expect(result.changed).toContain(realpathSync(path.join(dir, 'shifty.ts')));
+    expect(result.deleted).not.toContain(realpathSync(path.join(dir, 'shifty.ts')));
   });
 });

@@ -1,25 +1,19 @@
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { loadCachedReverseMap, saveCacheSync } from '../src/graph/cache.js';
+import { makeTempDir as makeTempDirTracked, cleanupTempDirs } from './_helpers.js';
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
+// loadCachedReverseMap canonicalizes keys/values on load, so fixture literals
+// must be canonical or lookups by the raw alias fail — makeTempDir realpaths.
 function makeTempDir(): string {
-  // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var);
-  // loadCachedReverseMap canonicalizes keys/values on load, so fixture literals
-  // must be canonical or lookups by the raw alias fail.
-  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-v2-')));
-  tempDirs.push(dir);
-  return dir;
+  return makeTempDirTracked(tempDirs, 'vitest-affected-v2-');
 }
 
 describe('v2 cache round-trip', () => {

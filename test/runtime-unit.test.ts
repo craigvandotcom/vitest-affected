@@ -1,23 +1,9 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect } from 'vitest';
-import type { TestModule } from 'vitest/node';
-import type { TestRunEndReason } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import { createRuntimeReporter } from '../src/plugin.js';
 import { mergeRuntimeEdges, type ReverseMap } from '../src/runtime-merge.js';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function createMockTestModule(
-  moduleId: string,
-  importDurations: Record<string, { selfTime: number; totalTime: number }>,
-): TestModule {
-  return {
-    moduleId,
-    diagnostic: () => ({ importDurations }),
-  } as unknown as TestModule;
-}
+import { createMockTestModule } from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // createRuntimeReporter
@@ -199,6 +185,82 @@ describe('createRuntimeReporter', () => {
 
     // Empty map — should NOT call onEdgesCollected
     expect(collected).toHaveLength(0);
+  });
+
+  // --- staleness-baseline classification across runs (watch mode) ------------
+  // configureVitest runs ONCE per process; on watch-mode re-runs Vitest
+  // re-scopes to its own subset without the plugin re-selecting. wasFullSuiteRun
+  // (the flag that resets the staleness baseline) must be true ONLY on the first
+  // completed run — a later re-run with selectedTests reset to null must NOT be
+  // misclassified as a fresh full-suite rebuild.
+
+  /** Run one cycle: observe an edge, then end the run. Returns nothing —
+   *  callers read the captured wasFullSuiteRun flags. */
+  function runCycle(
+    reporter: Reporter,
+    setRootDir: (d: string) => void,
+    testPath: string,
+    depPath: string,
+  ): void {
+    setRootDir('/project');
+    reporter.onTestModuleEnd!(
+      createMockTestModule(testPath, { [depPath]: { selfTime: 1, totalTime: 2 } }),
+    );
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+  }
+
+  test('watch re-run after a full-suite first run is NOT reclassified as full-suite', () => {
+    const flags: boolean[] = [];
+    const { reporter, setRootDir } = createRuntimeReporter((_edges, wasFullSuiteRun) => {
+      flags.push(wasFullSuiteRun);
+    });
+
+    // Run 1: no selective decision applied (full-suite) → genuine full rebuild.
+    runCycle(reporter, setRootDir, '/project/a.test.ts', '/project/src/a.ts');
+    // Run 2: watch re-run — configureVitest did NOT re-run, so no new selection.
+    // selectedTests is null again, but this must take the selective path.
+    runCycle(reporter, setRootDir, '/project/b.test.ts', '/project/src/b.ts');
+
+    expect(flags).toEqual([true, false]);
+  });
+
+  test('watch re-run after a selective first run stays selective', () => {
+    const flags: boolean[] = [];
+    const { reporter, setRootDir, setSelectedTests } = createRuntimeReporter(
+      (_edges, wasFullSuiteRun) => {
+        flags.push(wasFullSuiteRun);
+      },
+    );
+
+    // Run 1: a selective decision was applied → not a full rebuild.
+    setSelectedTests(['/project/a.test.ts']);
+    runCycle(reporter, setRootDir, '/project/a.test.ts', '/project/src/a.ts');
+    // Run 2: watch re-run — selectedTests was reset to null by run 1's end, but
+    // the first-run gate keeps it on the selective path.
+    runCycle(reporter, setRootDir, '/project/b.test.ts', '/project/src/b.ts');
+
+    expect(flags).toEqual([false, false]);
+  });
+
+  test('an interrupted first run does not consume the first-run full-suite baseline', () => {
+    const flags: boolean[] = [];
+    const { reporter, setRootDir } = createRuntimeReporter((_edges, wasFullSuiteRun) => {
+      flags.push(wasFullSuiteRun);
+    });
+
+    // Interrupted run: onTestRunEnd returns early (no callback, no flag flip).
+    setRootDir('/project');
+    reporter.onTestModuleEnd!(
+      createMockTestModule('/project/a.test.ts', {
+        '/project/src/a.ts': { selfTime: 1, totalTime: 2 },
+      }),
+    );
+    reporter.onTestRunEnd!([], [], 'interrupted' as TestRunEndReason);
+    expect(flags).toHaveLength(0);
+
+    // The FIRST completed run should still be classified full-suite.
+    runCycle(reporter, setRootDir, '/project/b.test.ts', '/project/src/b.ts');
+    expect(flags).toEqual([true]);
   });
 });
 

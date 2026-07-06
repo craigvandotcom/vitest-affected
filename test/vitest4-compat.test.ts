@@ -59,7 +59,7 @@ function makeContext(rootDir: string, projectConfig: MockProjectConfig) {
 async function runHook(rootDir: string, projectConfig: MockProjectConfig): Promise<void> {
   const plugin = vitestAffected({ changedFiles: [], cache: false });
   const { vitest, project } = makeContext(rootDir, projectConfig);
-  const hook = (plugin as Record<string, unknown>).configureVitest as (
+  const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
     ctx: { vitest: typeof vitest; project: typeof project },
   ) => Promise<void>;
   await hook({ vitest, project });

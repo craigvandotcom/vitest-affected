@@ -1,18 +1,16 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolveFileImports, createResolver, deltaParseNewImports } from '../src/graph/builder.js';
+import { cleanupTempDirs } from './_helpers.js';
 
 const fixtureDir = (name: string) => path.resolve(import.meta.dirname, 'fixtures', name);
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 describe('createResolver', () => {

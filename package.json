@@ -20,8 +20,12 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest",
-    "lint": "tsc --noEmit"
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "replay": "npm run build && tsx tools/replay/run.ts",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "vitest",

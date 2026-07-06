@@ -1,0 +1,11 @@
+{
+  // Type-checks the test suite (which the base tsconfig excludes from the build).
+  // Includes src/ too so test imports of the plugin resolve. Emit is off — this
+  // config exists purely to enforce `strict` / "no any" over test/.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["test", "src"],
+  "exclude": ["node_modules", "dist"]
+}

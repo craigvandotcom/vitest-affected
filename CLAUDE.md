@@ -17,7 +17,7 @@ Stack: TypeScript, Vitest plugin API, oxc-parser, oxc-resolver, tinyglobby
 | Test (single file) | `npx vitest run test/path/to/file.test.ts` |
 | Type-check | `tsc --noEmit` |
 | Lint | `tsc --noEmit` (TypeScript strict is the linter) |
-| Quality gate | `tsc --noEmit && npm run build && npx vitest run` |
+| Quality gate | `npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run` |
 
 No separate eslint/prettier/biome — TypeScript strict mode is the only static analysis.
 
@@ -27,9 +27,14 @@ No separate eslint/prettier/biome — TypeScript strict mode is the only static 
 src/
 ├── index.ts          # Public API: vitestAffected() + VitestAffectedOptions type
 ├── plugin.ts         # Vitest plugin — configureVitest hook + runtime reporter
+├── changed-files.ts  # filterRelevantChangedFiles/toRepoRelative — extension + ignore-path filtering of git changes
+├── explain-core.ts   # Pure "why would/wouldn't test X be selected" decision logic, no IO
+├── explain-cli.ts    # `vitest-affected-explain` bin — ad hoc CLI against on-disk cache + git state
+├── runtime-merge.ts  # mergeRuntimeEdges — folds Vitest's importDurations into the reverse graph
 ├── graph/
+│   ├── types.ts      # ReverseMap — canonical domain type
 │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports for changed files
-│   ├── cache.ts      # v2 cache: loadCachedReverseMap / saveCacheSync (JSON persistence)
+│   ├── cache.ts      # v3 cache (rootDir-relative paths; v1/v2 read-migrated): loadCachedReverseMap / saveCacheSync
 │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs
 ├── git.ts            # 4 parallel git commands → { changed[], deleted[] }
 └── selector.ts       # Pure BFS on reverse graph → affected test file paths
@@ -62,7 +67,7 @@ The master plan lives at `_backlog/intelligent-test-selection.md`. Beads are the
 - All new modules must have corresponding test files
 - `node_modules/` paths are never included in the dependency graph
 - Graph maps use `Map<string, Set<string>>` with absolute file paths
-- Test fixtures live in `test/fixtures/` with known dependency structures (simple, diamond, circular)
+- Test fixtures live in `test/fixtures/` with known dependency structures (simple, diamond)
 
 ## Evidence badge
 

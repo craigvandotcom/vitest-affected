@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { runGit } from './git-cmd.js';
+import { INSTALL_TIMEOUT_MS } from './limits.js';
 import type { CommitClassification } from './types.js';
 
 /** Default lockfile the harness watches for reinstall decisions. */
@@ -138,5 +139,13 @@ export async function ensureInstall(
   reinstall: boolean,
 ): Promise<void> {
   if (!reinstall) return;
-  await execa('pnpm', ['install', '--prefer-offline'], { cwd: cloneDir });
+  // INSTALL_TIMEOUT_MS bounds a wedged install; no reject:false here, so on
+  // timeout execa throws (ExecaError, timedOut:true) and the caller marks the
+  // commit BROKEN. NOTE: the live walk uses run.ts's own installDeps (frozen
+  // fallback) — this exported helper is currently unused by the walk, but kept
+  // consistent so any future caller inherits the same finite bound.
+  await execa('pnpm', ['install', '--prefer-offline'], {
+    cwd: cloneDir,
+    timeout: INSTALL_TIMEOUT_MS,
+  });
 }

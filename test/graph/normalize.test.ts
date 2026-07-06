@@ -2,7 +2,36 @@ import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
 import { mkdtempSync, writeFileSync, symlinkSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { normalizeModuleId, toCanonicalPath, clearCanonicalPathCache } from '../../src/graph/normalize.js';
+import { normalizeModuleId, safeLabel, toCanonicalPath, clearCanonicalPathCache } from '../../src/graph/normalize.js';
+
+describe('safeLabel', () => {
+  test('neutralizes ESC (0x1b) so ANSI escape sequences cannot reach the terminal', () => {
+    // A filename carrying a raw ANSI colour/erase sequence.
+    const malicious = 'src/\x1b[31mfoo\x1b[0m.test.ts';
+    const safe = safeLabel(malicious);
+    expect(safe).not.toContain('\x1b');
+    expect(safe).toBe('src/?[31mfoo?[0m.test.ts');
+  });
+
+  test('replaces all C0 control chars (incl. NUL, CR, LF, TAB) with ?', () => {
+    const input = 'a\x00b\tc\rd\ne';
+    expect(safeLabel(input)).toBe('a?b?c?d?e');
+  });
+
+  test('replaces DEL (0x7f) and C1 controls (0x80-0x9f)', () => {
+    expect(safeLabel('x\x7fy')).toBe('x?y');
+    expect(safeLabel('x\x85y\x9fz')).toBe('x?y?z');
+  });
+
+  test('leaves ordinary path characters (incl. unicode above C1) untouched', () => {
+    const ordinary = '/home/user/src/файл-café.test.ts';
+    expect(safeLabel(ordinary)).toBe(ordinary);
+  });
+
+  test('empty string is a no-op', () => {
+    expect(safeLabel('')).toBe('');
+  });
+});
 
 describe('normalizeModuleId', () => {
   test('strips \\0 prefix (Vite virtual module marker)', () => {

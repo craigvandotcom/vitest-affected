@@ -1,17 +1,7 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach, vi } from 'vitest';
 import path from 'node:path';
-import {
-  mkdirSync,
-  mkdtempSync,
-  writeFileSync,
-  rmSync,
-  readFileSync,
-  existsSync,
-  realpathSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
-import type { TestModule } from 'vitest/node';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import {
   bfsAffectedTests,
@@ -20,6 +10,14 @@ import {
 import { explainSelection } from '../src/explain-core.js';
 import { vitestAffected } from '../src/plugin.js';
 import { loadCachedReverseMap, saveCacheSync } from '../src/graph/cache.js';
+import {
+  createMockContext,
+  runHook,
+  readStats,
+  createMockTestModule as mockModule,
+  makeTempDir,
+  cleanupTempDirs,
+} from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // Env isolation — the plugin reads these; the outer runner leaks them in.
@@ -45,10 +43,7 @@ afterEach(() => {
     else delete process.env[k];
   }
   vi.restoreAllMocks();
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 const isTest = (f: string) => f.includes('.test.');
@@ -198,55 +193,13 @@ describe('explainSelection (CLI core)', () => {
 // Shared plugin harness
 // ===========================================================================
 
-interface MockProjectConfig {
-  include: string[];
-  exclude: string[];
-  setupFiles: string[];
-}
-
-function createMockContext(rootDir: string) {
-  const projectConfig: MockProjectConfig = {
-    include: ['tests/**/*.test.ts'],
-    exclude: [],
-    setupFiles: [],
-  };
-  const project = { config: projectConfig };
-  const vitest = {
-    config: { root: rootDir, watch: false },
-    projects: [project],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: () => {},
-  };
-  return { vitest, project, projectConfig };
-}
-
-async function runHook(
-  plugin: ReturnType<typeof vitestAffected>,
-  ctx: { vitest: unknown; project: unknown },
-): Promise<void> {
-  const hook = (plugin as Record<string, unknown>).configureVitest as (
-    c: { vitest: unknown; project: unknown },
-  ) => Promise<void>;
-  await hook(ctx);
-}
-
-function readStats(statsFile: string): Array<Record<string, unknown>> {
-  if (!existsSync(statsFile)) return [];
-  return readFileSync(statsFile, 'utf-8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
-}
-
 function lineWithReason(statsFile: string, reason: string): Record<string, unknown> | undefined {
   return readStats(statsFile).find((l) => l.reason === reason);
 }
 
 /** Temp project main.ts → main.test.ts + a warm (fresh) v3 cache. */
 function setupProject(): { tmpDir: string; mainPath: string; testPath: string } {
-  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-explain-')));
-  tempDirs.push(tmpDir);
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-explain-');
   mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
   mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
   writeFileSync(path.join(tmpDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
@@ -288,15 +241,6 @@ function wiredReporter(vitest: { reporters: unknown[] }): Reporter {
   return r;
 }
 
-function mockModule(
-  moduleId: string,
-  importDurations: Record<string, { selfTime: number; totalTime: number }>,
-): TestModule {
-  return {
-    moduleId,
-    diagnostic: () => ({ importDurations }),
-  } as unknown as TestModule;
-}
 
 // ===========================================================================
 // (3) PLUGIN EXPLAIN STATS FIELD — present when enabled, absent by default.
@@ -344,8 +288,7 @@ describe('plugin explain stats field', () => {
 
 describe('cache staleness metadata', () => {
   test('saveCacheSync persists meta; load returns it', () => {
-    const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-meta-')));
-    tempDirs.push(tmpDir);
+    const tmpDir = makeTempDir(tempDirs, 'vitest-affected-meta-');
     const cacheDir = path.join(tmpDir, '.vitest-affected');
     const reverse = new Map([[path.join(tmpDir, 'src', 'a.ts'), new Set([path.join(tmpDir, 'test', 'a.test.ts')])]]);
 
@@ -358,8 +301,7 @@ describe('cache staleness metadata', () => {
   });
 
   test('default (2-arg) save writes a FRESH baseline (lastFullRebuild≈now, runCount 0)', () => {
-    const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-meta-')));
-    tempDirs.push(tmpDir);
+    const tmpDir = makeTempDir(tempDirs, 'vitest-affected-meta-');
     const cacheDir = path.join(tmpDir, '.vitest-affected');
     const before = Date.now();
 
@@ -371,8 +313,7 @@ describe('cache staleness metadata', () => {
   });
 
   test('a v3 cache WITHOUT metadata fields still hits, with zeroed meta (no baseline)', () => {
-    const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-meta-')));
-    tempDirs.push(tmpDir);
+    const tmpDir = makeTempDir(tempDirs, 'vitest-affected-meta-');
     const cacheDir = path.join(tmpDir, '.vitest-affected');
     mkdirSync(cacheDir, { recursive: true });
     writeFileSync(

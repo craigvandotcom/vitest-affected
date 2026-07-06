@@ -10,6 +10,7 @@ jobs:
   quality-gate:
     name: quality-gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +34,12 @@ jobs:
 
       - name: Type-check
         run: npx tsc --noEmit
+
+      # The base tsconfig excludes test/ from the build, so the suite is never
+      # type-checked by the step above. tsconfig.test.json includes test/ + src/
+      # (noEmit) to enforce `strict` / "no any" across the tests too.
+      - name: Type-check tests
+        run: npx tsc -p tsconfig.test.json --noEmit
 
       # Run the plugin's OWN suite with vitest-affected DISABLED so the suite
       # never selects a subset of itself — the gate always exercises every test.

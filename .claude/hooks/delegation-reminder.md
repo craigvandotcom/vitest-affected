@@ -35,10 +35,10 @@ Master plan: `_backlog/intelligent-test-selection.md`
 
 ## Quality Gate
 
-Before committing, all three checks must pass:
+Before committing, all four checks must pass:
 
 ```bash
-tsc --noEmit && npx vitest run && npm run build
+npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run
 ```
 
 The pre-commit hook enforces this automatically on `git commit`.

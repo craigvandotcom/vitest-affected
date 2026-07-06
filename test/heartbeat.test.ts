@@ -1,20 +1,19 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach, vi } from 'vitest';
 import path from 'node:path';
-import {
-  mkdirSync,
-  mkdtempSync,
-  writeFileSync,
-  rmSync,
-  readFileSync,
-  existsSync,
-  realpathSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
-import type { TestModule } from 'vitest/node';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
+import {
+  createMockContext,
+  runHook,
+  readStats,
+  lastStat,
+  createMockTestModule as mockModule,
+  makeTempDir,
+  cleanupTempDirs,
+} from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // Env isolation — the plugin reads these; the outer runner leaks them in.
@@ -40,10 +39,7 @@ afterEach(() => {
     else delete process.env[k];
   }
   vi.restoreAllMocks();
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 // ---------------------------------------------------------------------------
@@ -54,8 +50,7 @@ afterEach(() => {
 function setupProject(): { tmpDir: string; mainPath: string; testPath: string } {
   // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var → /private/var);
   // the plugin canonicalizes all paths, so fixture literals must be canonical too.
-  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-heartbeat-')));
-  tempDirs.push(tmpDir);
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-heartbeat-');
 
   mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
   mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
@@ -82,8 +77,7 @@ function setupProject(): { tmpDir: string; mainPath: string; testPath: string } 
  * without tripping the selection self-verify.
  */
 function setupProjectNoCache(): { tmpDir: string; mainPath: string } {
-  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-heartbeat-nc-')));
-  tempDirs.push(tmpDir);
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-heartbeat-nc-');
 
   mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
   mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
@@ -107,57 +101,6 @@ function countByAction(statsFile: string): Record<string, number> {
   return out;
 }
 
-interface MockProjectConfig {
-  include: string[];
-  exclude: string[];
-  setupFiles: string[];
-  experimental?: {
-    importDurations?: unknown;
-  };
-}
-
-/** Mock { vitest, project }; experimental is passthrough so shape-check tests can drive it. */
-function createMockContext(rootDir: string, experimental?: MockProjectConfig['experimental']) {
-  const projectConfig: MockProjectConfig = {
-    include: ['tests/**/*.test.ts'],
-    exclude: [],
-    setupFiles: [],
-    experimental,
-  };
-  const project = { config: projectConfig };
-  const vitest = {
-    config: { root: rootDir, watch: false },
-    projects: [project],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: () => {},
-  };
-  return { vitest, project, projectConfig };
-}
-
-async function runHook(
-  plugin: ReturnType<typeof vitestAffected>,
-  ctx: { vitest: unknown; project: unknown },
-): Promise<void> {
-  const hook = (plugin as Record<string, unknown>).configureVitest as (
-    c: { vitest: unknown; project: unknown },
-  ) => Promise<void>;
-  await hook(ctx);
-}
-
-function readStats(statsFile: string): Array<Record<string, unknown>> {
-  if (!existsSync(statsFile)) return [];
-  return readFileSync(statsFile, 'utf-8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
-}
-
-function lastStat(statsFile: string): Record<string, unknown> {
-  const lines = readStats(statsFile);
-  return lines[lines.length - 1];
-}
-
 /** Grab the runtime reporter the plugin wired into vitest.reporters. */
 function wiredReporter(vitest: { reporters: unknown[] }): Reporter {
   const r = (vitest.reporters as Reporter[]).find(
@@ -165,17 +108,6 @@ function wiredReporter(vitest: { reporters: unknown[] }): Reporter {
   );
   if (!r) throw new Error('no reporter wired');
   return r;
-}
-
-/** Mock TestModule with a given moduleId and importDurations map. */
-function mockModule(
-  moduleId: string,
-  importDurations: Record<string, { selfTime: number; totalTime: number }>,
-): TestModule {
-  return {
-    moduleId,
-    diagnostic: () => ({ importDurations }),
-  } as unknown as TestModule;
 }
 
 // ===========================================================================
@@ -299,7 +231,7 @@ describe('importDurations config shape-check', () => {
     const { tmpDir, mainPath } = setupProject();
     const statsFile = path.join(tmpDir, 'stats.jsonl');
     const { vitest, project, projectConfig } = createMockContext(tmpDir, {
-      importDurations: 123 as unknown, // structural drift
+      experimental: { importDurations: 123 as unknown }, // structural drift
     });
     const originalInclude = [...projectConfig.include];
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -319,7 +251,7 @@ describe('importDurations config shape-check', () => {
     const { tmpDir, mainPath } = setupProject();
     const statsFile = path.join(tmpDir, 'stats.jsonl');
     const { vitest, project } = createMockContext(tmpDir, {
-      importDurations: { limit: 'high' as unknown }, // limit must be a number
+      experimental: { importDurations: { limit: 'high' as unknown } }, // limit must be a number
     });
 
     await runHook(
@@ -334,12 +266,14 @@ describe('importDurations config shape-check', () => {
     const { tmpDir, mainPath } = setupProject();
     const statsFile = path.join(tmpDir, 'stats.jsonl');
     const { vitest, project } = createMockContext(tmpDir, {
-      importDurations: {
-        limit: 10,
-        print: 'on-warn',
-        // a hypothetical future field must NOT trigger the fallback
-        someFutureField: { nested: true },
-      } as unknown,
+      experimental: {
+        importDurations: {
+          limit: 10,
+          print: 'on-warn',
+          // a hypothetical future field must NOT trigger the fallback
+          someFutureField: { nested: true },
+        } as unknown,
+      },
     });
 
     await runHook(

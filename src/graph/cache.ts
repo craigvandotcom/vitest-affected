@@ -9,6 +9,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { toCanonicalPath } from './normalize.js';
+import type { ReverseMap } from './types.js';
 
 const GRAPH_FILE = 'graph.json';
 
@@ -82,14 +83,14 @@ function isUnderRootDir(filePath: string, rootDir: string): boolean {
 function toConfinedReverseMap(
   rawMap: Record<string, string[]>,
   canonicalRoot: string,
-): Map<string, Set<string>> {
+): ReverseMap {
   const rootPrefix = canonicalRoot.endsWith('/') ? canonicalRoot : canonicalRoot + '/';
   // Paths already under the canonical root were written canonically on save →
   // trust them; only alias/legacy paths pay the realpath cost.
   const canonicalize = (p: string): string =>
     p.startsWith(rootPrefix) ? p : toCanonicalPath(p);
 
-  const reverse = new Map<string, Set<string>>();
+  const reverse: ReverseMap = new Map();
   for (const [file, tests] of Object.entries(rawMap)) {
     const canonicalFile = canonicalize(file);
     if (!isUnderRootDir(canonicalFile, canonicalRoot)) continue;
@@ -240,7 +241,7 @@ export function loadCachedReverseMap(
   cacheDir: string,
   rootDir: string,
   verbose = false,
-): { reverse: Map<string, Set<string>>; hit: boolean; meta: CacheMeta } {
+): { reverse: ReverseMap; hit: boolean; meta: CacheMeta } {
   cleanupOrphanedTmp(cacheDir);
 
   // Canonicalize the confinement boundary itself; keys/values are
@@ -355,7 +356,7 @@ export function loadCachedReverseMap(
  */
 export function saveCacheSync(
   cacheDir: string,
-  reverse: Map<string, Set<string>>,
+  reverse: ReverseMap,
   meta: Partial<CacheMeta> = {},
 ): void {
   mkdirSync(cacheDir, { recursive: true });

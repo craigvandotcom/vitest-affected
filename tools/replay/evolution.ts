@@ -29,8 +29,9 @@
  *  - Recorded shadow-full-suite with a cache-INDEPENDENT reason (the decision
  *    does not depend on cache state: config-change, setup-file-change,
  *    global-setup-change, full-suite-trigger, no-changes, workspace,
- *    config-shape): a live deployment would also have gone full-suite →
- *    scope 'all'.
+ *    config-shape, import-durations-shape, no-include-patterns, no-test-files,
+ *    error — full table on CACHE_INDEPENDENT_FULL_SUITE_REASONS below): a live
+ *    deployment would also have gone full-suite → scope 'all'.
  *  - Recorded shadow-full-suite with a cache-DEPENDENT reason (cache-miss —
  *    cannot happen live once the evolved cache exists; no-affected-tests /
  *    threshold-exceeded and other selection-size-dependent reasons — the live
@@ -60,6 +61,35 @@ export type MergeScope = Set<string> | 'all';
  * Full-suite reasons whose decision does NOT depend on cache state — a live
  * deployment with a drifted cache would have made the same full-suite call,
  * run everything, and persisted everything (scope 'all').
+ *
+ * CLASSIFICATION TABLE — all 15 full-suite `reason` strings emitStats() emits.
+ * src/plugin.ts is the SOURCE OF TRUTH for this enumeration (grep its
+ * `emitStats(…, 'full-suite', …)` call sites); keep this list in sync when a
+ * reason is added/removed there. Unlisted reasons default to cache-DEPENDENT
+ * (conservative: never optimistically refreshes the drifted cache).
+ *
+ *   reason                 | class       | why
+ *   -----------------------|-------------|--------------------------------------
+ *   workspace              | INDEPENDENT | >1 vitest project — config structure
+ *   config-shape           | INDEPENDENT | malformed config object — pre-cache
+ *   import-durations-shape | INDEPENDENT | experimental.importDurations shape —
+ *                          |             |   checked before the cache is loaded
+ *   setup-file-change      | INDEPENDENT | setup file in the changed set (git)
+ *   global-setup-change    | INDEPENDENT | globalSetup file in changed set (git)
+ *   full-suite-trigger     | INDEPENDENT | trigger glob matched a changed file
+ *   no-changes             | INDEPENDENT | zero relevant changes — git state
+ *   config-change          | INDEPENDENT | config basename changed — git state
+ *   no-include-patterns    | INDEPENDENT | include patterns empty — config
+ *   no-test-files          | INDEPENDENT | glob matched no tests — filesystem
+ *   error                  | INDEPENDENT | catch-all exception → full-suite +
+ *                          |             |   persist-all regardless of cache
+ *   -----------------------|-------------|--------------------------------------
+ *   cache-miss             | DEPENDENT   | no cache; can't happen live once the
+ *                          |             |   evolved cache exists → selective
+ *   no-affected-tests      | DEPENDENT   | empty BFS over drifted-cache content
+ *   threshold-exceeded     | DEPENDENT   | selection-size ratio over cache graph
+ *   no-valid-tests-on-disk | DEPENDENT   | BFS selection (cache-derived) missing
+ *                          |             |   on disk — still hinges on cache
  */
 export const CACHE_INDEPENDENT_FULL_SUITE_REASONS: ReadonlySet<string> =
   new Set([
@@ -70,6 +100,12 @@ export const CACHE_INDEPENDENT_FULL_SUITE_REASONS: ReadonlySet<string> =
     'no-changes',
     'workspace',
     'config-shape',
+    // Added round-2: genuinely cache-independent but previously defaulting to
+    // cache-dependent → pessimistic (more-drifted) reconstruction. See table.
+    'import-durations-shape',
+    'no-include-patterns',
+    'no-test-files',
+    'error',
   ]);
 
 /**

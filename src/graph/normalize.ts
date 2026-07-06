@@ -2,6 +2,24 @@ import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
 /**
+ * Neutralize terminal control sequences before a file path or import specifier
+ * is interpolated into console output. Git allows arbitrary bytes in filenames
+ * (only `/` and NUL are forbidden), and while git's own porcelain output is
+ * quotePath-escaped, paths that reach us via tinyglobby globs, the on-disk
+ * cache, or the Vite resolver bypass that escaping entirely. An attacker who
+ * controls a filename could otherwise embed ANSI/C0/C1 escapes that rewrite the
+ * developer's terminal (cursor moves, title spoofing, hidden text) when the
+ * plugin logs that path. Replace every C0 control (incl. ESC 0x1b), DEL, and
+ * C1 control with `?` so the label is inert but still recognizable. Purely a
+ * display shield — never mutate a path used for graph identity or filesystem
+ * access (those flow through toCanonicalPath, not this).
+ */
+export function safeLabel(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, '?');
+}
+
+/**
  * Strip Vite-specific prefixes and suffixes from spec.moduleId before graph lookup.
  * Without normalization, the watch filter becomes a silent no-op.
  */

@@ -108,6 +108,27 @@ describe('evolution: evolutionScope', () => {
     expect(evolutionScope(fullSuite('full-suite-trigger'), new Set())).toBe(
       'all',
     );
+    // Round-2 additions — real reasons emitStats() emits that were previously
+    // (wrongly) defaulting to cache-dependent. Pin the newly-classified ones so
+    // a regression in the set re-introduces the pessimistic drift bias.
+    expect(
+      evolutionScope(
+        fullSuite('no-include-patterns'),
+        new Set(['t/a.test.ts']),
+      ),
+    ).toBe('all');
+    expect(
+      evolutionScope(fullSuite('no-test-files'), new Set(['t/a.test.ts'])),
+    ).toBe('all');
+    expect(
+      evolutionScope(
+        fullSuite('import-durations-shape'),
+        new Set(['t/a.test.ts']),
+      ),
+    ).toBe('all');
+    expect(
+      evolutionScope(fullSuite('error'), new Set(['t/a.test.ts'])),
+    ).toBe('all');
   });
 
   test('cache-DEPENDENT full-suite reason → simulated selection (live would have been selective)', () => {

@@ -6,9 +6,31 @@ import { toCanonicalPath } from './graph/normalize.js';
 
 const execFile = promisify(execFileCb);
 
+// Raise Node's 1MB default stdout cap to a large finite bound. A big changeset
+// (a giant diff range, or codegen touching 10k+ files) overflows the 1MB default
+// and makes execFile reject with "maxBuffer length exceeded".
+//
+// The cap is finite ON PURPOSE. `Infinity` would let git's stdout buffer grow
+// unbounded until the process dies with an UNCATCHABLE V8 heap OOM — which no
+// try/catch can intercept, so the plugin's full-suite fallback never runs. A
+// finite cap instead makes overflow throw a CATCHABLE error:
+//   - committed path (no `.catch`): rejects → propagates through Promise.all →
+//     getChangedFiles throws → the plugin's catch-all falls back to the full suite;
+//   - staged/unstaged paths (per-command `.catch(() => [])`): the throw is caught
+//     locally and that source degrades to [].
+// Either way the outcome is a real error the plugin can act on — over-select via
+// full-suite fallback — rather than the whole test process dying. 256MB is far
+// above any realistic `--name-only` diff (paths only, no contents) yet still a
+// bound V8 can honor without OOM.
+const GIT_STDOUT_MAX_BUFFER = 256 * 1024 * 1024;
+
 async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise<{ stdout: string }> {
   try {
-    const { stdout } = await execFile(cmd, args, { ...opts, encoding: 'utf-8' });
+    const { stdout } = await execFile(cmd, args, {
+      ...opts,
+      encoding: 'utf-8',
+      maxBuffer: GIT_STDOUT_MAX_BUFFER,
+    });
     return { stdout: stdout ?? '' };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -37,7 +59,11 @@ export async function getChangedFiles(
     return { changed: [], deleted: [] };
   }
 
-  // Step 2: Shallow clone detection (only relevant when ref is provided)
+  // Step 2: Shallow clone detection (only relevant when ref is provided).
+  // Scoped to ref-based selection ON PURPOSE: a ref-less run diffs only the
+  // working tree / index against HEAD, which a shallow (HEAD-only) clone fully
+  // satisfies — so we deliberately tolerate shallow clones there and guard only
+  // the ref path, where reaching a historical merge-base requires real depth.
   if (ref !== undefined) {
     try {
       const { stdout } = await exec('git', ['rev-parse', '--is-shallow-repository'], { cwd: rootDir });
@@ -57,6 +83,35 @@ export async function getChangedFiles(
     }
   }
 
+  // Step 2b: Ref resolvability check (only relevant when ref is provided).
+  // The shallow-clone guard above only fires when the repo IS shallow. On a
+  // NON-shallow checkout the ref can still fail to resolve (CI fetched only
+  // HEAD, the ref was never fetched, or a typo). Left unguarded, the committed
+  // `git diff ${ref}...HEAD` below fails and the per-command catch would
+  // silently drop the ENTIRE committed diff — the user asked for ref-based
+  // selection and would silently get working-tree-only selection instead.
+  // Mirror the shallow-clone guard EXACTLY: throw a loud `vitest-affected:`
+  // error so the plugin's catch-all falls back to the full suite.
+  if (ref !== undefined) {
+    let refResolves = false;
+    try {
+      // `--verify --quiet <ref>^{commit}` exits 0 (prints the SHA) when the ref
+      // resolves to a commit, and non-zero with no output otherwise — which
+      // exec() surfaces as a throw.
+      await exec('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: rootDir });
+      refResolves = true;
+    } catch {
+      refResolves = false;
+    }
+    if (!refResolves) {
+      throw new Error(
+        `vitest-affected: ref "${ref}" does not resolve to a commit. ` +
+        'Cannot compute ref-based diff. ' +
+        'Ensure the ref is fetched (e.g. "git fetch origin <ref>" in CI) and spelled correctly.'
+      );
+    }
+  }
+
   // Step 3: Get git root (paths from git diff are relative to git root, not rootDir)
   // Canonicalize explicitly rather than relying on git's own realpath behavior
   // (which resolves symlinks when locating the repo toplevel): on macOS this is
@@ -67,23 +122,37 @@ export async function getChangedFiles(
 
   // Step 4: Parallel git commands
   //
-  // Committed changes (ref-based): use git diff with ref...HEAD
+  // Committed changes (ref-based): use git diff with ref...HEAD and --no-renames so
+  //   a rename surfaces as its A (new path) + D (old path) pair. WITHOUT --no-renames,
+  //   git's default rename detection collapses A→B into a single entry showing only the
+  //   NEW path, so the OLD path never enters `changed`/`deleted` and the cached
+  //   `old → [tests]` reverse edges never seed BFS — an under-selection. This mirrors
+  //   the staged path's diff-index A+D behaviour below. --diff-filter includes T
+  //   (type-changed, e.g. file → symlink) so a type-change surfaces as `changed`
+  //   rather than being silently dropped — another under-selection.
   // Staged changes: use diff-index --cached which reports renames as A+D entries (unlike
-  //   git diff --cached which merges renames into a single R entry with --name-only)
+  //   git diff --cached which merges renames into a single R entry with --name-only);
+  //   T (type-changed) is likewise included so it enters `changed`.
   // Unstaged changes: ls-files --others --modified reports untracked and modified tracked files
   //
   // All paths are relative to gitRoot.
 
+  // No `.catch(() => [])` here (unlike the staged/unstaged sources below): the
+  // ref was verified to resolve and the repo is non-shallow, so a failure of
+  // `git diff ${ref}...HEAD` is genuinely unexpected (e.g. unrelated histories
+  // with no merge base, or an I/O error). Silently returning [] would drop the
+  // ref-based diff the user explicitly requested — an under-selection. Letting
+  // it reject propagates through Promise.all → getChangedFiles throws → the
+  // plugin's catch-all falls back to the full suite (the safe, loud outcome).
   const committedPromise: Promise<string[]> = ref !== undefined
-    ? exec('git', ['diff', '--name-only', '--diff-filter=ACMRD', `${ref}...HEAD`], { cwd: gitRoot })
+    ? exec('git', ['diff', '--name-only', '--no-renames', '--diff-filter=ACMDT', `${ref}...HEAD`], { cwd: gitRoot })
         .then(r => r.stdout.trim().split('\n').filter(Boolean))
-        .catch(() => [])
     : Promise.resolve([]);
 
-  // staged (add/copy/modify/rename) — new names or modified files
+  // staged (add/copy/modify/rename/type-change) — new names or modified files
   const stagedChangedPromise: Promise<string[]> = exec(
     'git',
-    ['diff-index', '--cached', '--name-only', '--diff-filter=ACMR', 'HEAD'],
+    ['diff-index', '--cached', '--name-only', '--diff-filter=ACMRT', 'HEAD'],
     { cwd: gitRoot }
   )
     .then(r => r.stdout.trim().split('\n').filter(Boolean))

@@ -19,7 +19,7 @@
  * the reporter of edges (same failure class as the known macOS git.test.ts
  * flakes).
  */
-import { mkdtempSync, realpathSync, mkdirSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, realpathSync, mkdirSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { runGit } from './git-cmd.js';
@@ -76,6 +76,22 @@ export async function cloneConsumer(
   const dest = path.join(workdir, CONSUMER_DIRNAME);
   await runGit(workdir, ['clone', '--no-hardlinks', repoPath, dest]);
   return dest;
+}
+
+/**
+ * Remove the multi-GB consumer clone once the walk is done, keeping every run
+ * artifact (reports / logs / ledger under <workdir>/runs) intact — ONLY the clone
+ * is a per-run disposable. Best-effort and idempotent: an already-removed or
+ * missing clone is a no-op, and teardown NEVER throws, so a run interrupted
+ * mid-walk can't have its real error masked by a cleanup failure. cloneDir is a
+ * throwaway clone under the OS temp dir, so removing it is safe.
+ */
+export function removeClone(cloneDir: string): void {
+  try {
+    rmSync(cloneDir, { recursive: true, force: true });
+  } catch {
+    /* best-effort — never let a cleanup error mask the walk's real outcome */
+  }
 }
 
 /**
