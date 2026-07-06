@@ -123,9 +123,12 @@ export async function getChangedFiles(
   //   git's default rename detection collapses A→B into a single entry showing only the
   //   NEW path, so the OLD path never enters `changed`/`deleted` and the cached
   //   `old → [tests]` reverse edges never seed BFS — an under-selection. This mirrors
-  //   the staged path's diff-index A+D behaviour below.
+  //   the staged path's diff-index A+D behaviour below. --diff-filter includes T
+  //   (type-changed, e.g. file → symlink) so a type-change surfaces as `changed`
+  //   rather than being silently dropped — another under-selection.
   // Staged changes: use diff-index --cached which reports renames as A+D entries (unlike
-  //   git diff --cached which merges renames into a single R entry with --name-only)
+  //   git diff --cached which merges renames into a single R entry with --name-only);
+  //   T (type-changed) is likewise included so it enters `changed`.
   // Unstaged changes: ls-files --others --modified reports untracked and modified tracked files
   //
   // All paths are relative to gitRoot.
@@ -138,14 +141,14 @@ export async function getChangedFiles(
   // it reject propagates through Promise.all → getChangedFiles throws → the
   // plugin's catch-all falls back to the full suite (the safe, loud outcome).
   const committedPromise: Promise<string[]> = ref !== undefined
-    ? exec('git', ['diff', '--name-only', '--no-renames', '--diff-filter=ACMD', `${ref}...HEAD`], { cwd: gitRoot })
+    ? exec('git', ['diff', '--name-only', '--no-renames', '--diff-filter=ACMDT', `${ref}...HEAD`], { cwd: gitRoot })
         .then(r => r.stdout.trim().split('\n').filter(Boolean))
     : Promise.resolve([]);
 
-  // staged (add/copy/modify/rename) — new names or modified files
+  // staged (add/copy/modify/rename/type-change) — new names or modified files
   const stagedChangedPromise: Promise<string[]> = exec(
     'git',
-    ['diff-index', '--cached', '--name-only', '--diff-filter=ACMR', 'HEAD'],
+    ['diff-index', '--cached', '--name-only', '--diff-filter=ACMRT', 'HEAD'],
     { cwd: gitRoot }
   )
     .then(r => r.stdout.trim().split('\n').filter(Boolean))

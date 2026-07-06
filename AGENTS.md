@@ -20,7 +20,7 @@
 | **Type-check**   | `tsc --noEmit`                                       |
 | **Format**       | N/A (no formatter configured)                        |
 | **Build**        | `npm run build`                                      |
-| **Quality gate** | `tsc --noEmit && npx vitest run && npm run build`    |
+| **Quality gate** | `npm run build && tsc --noEmit && npx vitest run`    |
 
 ## Architecture
 

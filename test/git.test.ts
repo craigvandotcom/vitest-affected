@@ -265,4 +265,42 @@ describe('getChangedFiles', () => {
     // old path no longer exists → deleted (this is what default rename detection drops)
     expect(result.deleted).toContain(path.join(dir, 'renamed-old.ts'));
   });
+
+  // 14. COMMITTED type-change (ref-based): a tracked path whose TYPE changes
+  // (regular file → symlink) is reported by git as a single `T` entry and nothing
+  // else. With --diff-filter=ACMD (no T) that entry is silently dropped: the path
+  // never enters `changed`, its cached reverse edges never seed BFS, and dependent
+  // tests are silently skipped — violating "never silently skip tests". Adding T
+  // (ACMDT) restores it. The new form (a symlink) still exists on disk, so
+  // existsSync routes it to `changed`. Regression guard for the committed-diff path.
+  // symlink() is POSIX-only; this suite's CI matrix is ubuntu + macos (no Windows),
+  // so skip on win32 rather than fight platform-specific symlink semantics.
+  const maybeSymlinkTest = process.platform === 'win32' ? test.skip : test;
+  maybeSymlinkTest('committed type-change (file → symlink) surfaces the path in changed', async () => {
+    const { symlinkSync, unlinkSync } = await import('node:fs');
+    const dir = await makeTempRepo();
+    // Two committed regular files: `target.ts` is the symlink destination, and
+    // `shifty.ts` starts life as a regular file.
+    writeFileSync(path.join(dir, 'target.ts'), 'export const target = 1;\n');
+    writeFileSync(path.join(dir, 'shifty.ts'), 'export const shifty = 1;\n');
+    await git(['add', 'target.ts', 'shifty.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Replace the regular file with a symlink pointing at the other committed
+    // file, then commit — this is a pure type-change (git reports it as `T`).
+    unlinkSync(path.join(dir, 'shifty.ts'));
+    symlinkSync('target.ts', path.join(dir, 'shifty.ts'));
+    await git(['add', 'shifty.ts'], dir);
+    await git(['commit', '-m', 'file → symlink'], dir);
+
+    // ref points BEFORE the type-change → the committed diff HEAD~1...HEAD is the T entry.
+    const result = await getChangedFiles(dir, 'HEAD~1');
+    // The symlink still exists on disk → existsSync → the path is routed to
+    // `changed` (never `deleted`). getChangedFiles canonicalizes via realpath, which
+    // resolves the symlink to its target — the SAME canonicalization graph keys use
+    // (see graph/builder.ts), so this is self-consistent. The load-bearing assertion
+    // is that a `T` entry surfaces in `changed` AT ALL (empty before the ACMDT fix).
+    expect(result.changed).toContain(realpathSync(path.join(dir, 'shifty.ts')));
+    expect(result.deleted).not.toContain(realpathSync(path.join(dir, 'shifty.ts')));
+  });
 });

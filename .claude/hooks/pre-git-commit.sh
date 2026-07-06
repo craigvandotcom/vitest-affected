@@ -51,24 +51,35 @@ run_check() {
   fi
 }
 
-# 1. Type check (cannot auto-fix)
-run_check "1/3" "Type checking" "npx tsc --noEmit" || {
+# 1. Build FIRST (cannot auto-fix)
+# tests/type-check import from the BUILT ./dist artifact (vitest.config.ts +
+# tools/replay), so a stale dist would make steps 2-4 validate the pre-edit
+# build. Mirror CI, which builds before type-checking/testing.
+run_check "1/4" "Building project" "npm run build" || {
   exit 2
 }
 
-# 2. Tests (cannot auto-fix)
-run_check "2/3" "Running tests" "npx vitest run" || {
+# 2. Type check (cannot auto-fix)
+run_check "2/4" "Type checking" "npx tsc --noEmit" || {
+  exit 2
+}
+
+# 3. Type check tests (cannot auto-fix)
+# The base tsconfig excludes test/ from the build, so the suite is never
+# type-checked by step 2. tsconfig.test.json includes test/ + src/ (noEmit)
+# to enforce strict / "no any" across the tests too.
+run_check "3/4" "Type checking tests" "npx tsc -p tsconfig.test.json --noEmit" || {
+  exit 2
+}
+
+# 4. Tests (cannot auto-fix)
+run_check "4/4" "Running tests" "npx vitest run" || {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
   echo "TIPS FOR FIXING TEST FAILURES:" >&2
   echo "  • Run 'npx vitest run test/path/to/file.test.ts' for a specific test" >&2
   echo "  • Run 'npx vitest' for interactive watch mode" >&2
   echo "  • Check test fixtures in test/fixtures/ for known dependency structures" >&2
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-  exit 2
-}
-
-# 3. Build (cannot auto-fix)
-run_check "3/3" "Building project" "npm run build" || {
   exit 2
 }
 

@@ -31,6 +31,8 @@ import {
 } from './workdir.js';
 import { runCommit } from './exec.js';
 import { runGit } from './git-cmd.js';
+import { killTrackedChildren } from './child-registry.js';
+import { INSTALL_TIMEOUT_MS, SIGNAL_CHILD_GRACE_MS } from './limits.js';
 import {
   analyzeAndReport,
   flakeCheckCommit,
@@ -191,11 +193,27 @@ export async function main(argv: string[]): Promise<string> {
     cleaned = true;
     removeClone(cloneDir);
   };
+  // Signal handling is ORDER-CRITICAL: a live ~320s vitest child (spawned via
+  // execa several frames down in runCommit / spawnDisabledRerun) may be running
+  // when Ctrl-C arrives. Deleting the clone out from under its worker pool — or
+  // just exiting and orphaning it — is the gap. So: terminate every tracked
+  // child FIRST (SIGTERM, execa-escalated to SIGKILL, bounded wait), THEN remove
+  // the clone, THEN exit. Idempotent re-entrancy guard so a coincident
+  // SIGINT+SIGTERM (or a repeat) doesn't run the teardown twice.
+  let signalHandled = false;
   const onSignal = (sig: NodeJS.Signals): void => {
-    cleanup();
-    // Reflect the interruption in the exit code (128 + signal number) — a walk
-    // killed with Ctrl-C must not exit 0 and look clean.
-    process.exit(sig === 'SIGINT' ? 130 : 143);
+    if (signalHandled) return;
+    signalHandled = true;
+    void (async () => {
+      try {
+        await killTrackedChildren(SIGNAL_CHILD_GRACE_MS);
+      } finally {
+        cleanup();
+        // Reflect the interruption in the exit code (128 + signal number) — a
+        // walk killed with Ctrl-C must not exit 0 and look clean.
+        process.exit(sig === 'SIGINT' ? 130 : 143);
+      }
+    })();
   };
   process.once('SIGINT', onSignal);
   process.once('SIGTERM', onSignal);
@@ -351,13 +369,21 @@ async function ensureInstallForCommit(
 /**
  * Reset the disposable consumer clone to a pristine tree: discard tracked-file
  * modifications (`git reset --hard`) and remove untracked, non-ignored files
- * (`git clean -fd` — WITHOUT `-x`, so gitignored node_modules / plugin caches
- * survive and stay off the critical path). cloneDir is a throwaway clone under the
- * OS temp dir (workdir.ts), so a destructive reset is safe here.
+ * (`git clean -fd` — WITHOUT `-x`, so gitignored node_modules survives and stays
+ * off the critical path). cloneDir is a throwaway clone under the OS temp dir
+ * (workdir.ts), so a destructive reset is safe here.
+ *
+ * `-e .vitest-affected`: the accumulating plugin cache MUST survive every reset.
+ * `.vitest-affected/` is only gitignored from a certain commit onward in the
+ * walked repo (BCA), so on OLDER commits `git clean -fd` (which deletes untracked
+ * NON-ignored files) would wipe the cache every iteration — degrading every
+ * decision to a cold cache-miss/full-suite and eventually tripping the analysis'
+ * degeneration guard. The explicit exclude protects the cache regardless of
+ * whether the checked-out commit's .gitignore happens to cover it.
  */
 async function resetClone(cloneDir: string): Promise<void> {
   await runGit(cloneDir, ['reset', '--hard']);
-  await runGit(cloneDir, ['clean', '-fd']);
+  await runGit(cloneDir, ['clean', '-fd', '-e', '.vitest-affected']);
 }
 
 /**
@@ -372,16 +398,25 @@ async function resetClone(cloneDir: string): Promise<void> {
  */
 async function installDeps(cloneDir: string, reinstall: boolean): Promise<void> {
   if (!reinstall) return;
+  // INSTALL_TIMEOUT_MS: a wedged install must not stall an unattended walk. These
+  // spawns do NOT set `reject: false`, so on timeout execa THROWS (ExecaError with
+  // timedOut:true) — the throw propagates to ensureInstallForCommit's caller
+  // (run.ts main loop try/catch) and is classified install→BROKEN, so the walk
+  // continues past a hung commit rather than aborting.
   try {
     await execa('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], {
       cwd: cloneDir,
+      timeout: INSTALL_TIMEOUT_MS,
     });
     return;
   } catch (err) {
     if (!isFrozenLockfileMismatch(err)) throw err;
   }
   // Legitimate lockfile / package.json drift at this commit — resolve normally.
-  await execa('pnpm', ['install', '--prefer-offline'], { cwd: cloneDir });
+  await execa('pnpm', ['install', '--prefer-offline'], {
+    cwd: cloneDir,
+    timeout: INSTALL_TIMEOUT_MS,
+  });
 }
 
 /**

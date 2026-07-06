@@ -38,7 +38,7 @@ Master plan: `_backlog/intelligent-test-selection.md`
 Before committing, all three checks must pass:
 
 ```bash
-tsc --noEmit && npx vitest run && npm run build
+npm run build && tsc --noEmit && npx vitest run
 ```
 
 The pre-commit hook enforces this automatically on `git commit`.
