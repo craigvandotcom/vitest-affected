@@ -2,9 +2,10 @@
 
 [![npm version](https://img.shields.io/npm/v/vitest-affected)](https://www.npmjs.com/package/vitest-affected)
 [![CI](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml/badge.svg)](https://github.com/craigvandotcom/vitest-affected/actions/workflows/ci.yml)
-[![measured miss record — live evidence](https://raw.githubusercontent.com/craigvandotcom/vitest-affected/main/_evidence/hero.svg)](https://github.com/craigvandotcom/vitest-affected/blob/main/_plans/research/2026-07-05-a4-walk/analysis.md)
 [![license](https://img.shields.io/npm/l/vitest-affected)](https://github.com/craigvandotcom/vitest-affected/blob/main/LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
+
+[![measured miss record — live evidence](https://raw.githubusercontent.com/craigvandotcom/vitest-affected/main/_evidence/hero.svg)](https://github.com/craigvandotcom/vitest-affected/blob/main/_plans/research/2026-07-05-a4-walk/analysis.md)
 
 Run only the tests affected by your changes. Zero config, runtime dependency tracking, ~5ms selection overhead.
 
