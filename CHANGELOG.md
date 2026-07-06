@@ -5,9 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-07-06
+## [0.9.0] - 2026-07-06
 
-First stable release. Two tracks of work land here: **Track 1** hardens the
+Release-candidate for 1.0: everything below is the 1.0 feature set, shipped
+at 0.9 deliberately — the CI divergence monitor (see README § CI divergence
+monitoring) now accumulates live evidence on every full consumer run, and
+1.0 graduates once a few months of that stream stay clean. Measured
+reliability and 1.0 are the same milestone; the measuring is now continuous. Two tracks of work land here: **Track 1** hardens the
 silent-failure surface (heartbeats, path canonicalization, graph-membership
 override, `globalSetup` tracking), and **Track 2** adds observability and
 coverage reach (shadow mode, explain trail + CLI, cache staleness
