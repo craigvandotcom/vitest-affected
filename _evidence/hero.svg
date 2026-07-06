@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="170" viewBox="0 0 720 170" role="img" aria-label="selection accuracy 100%, PASS: 0 misses across 12 verified selections">
+  <defs>
+    <clipPath id="card"><rect x="0" y="0" width="720" height="170" rx="12"/></clipPath>
+  </defs>
+  <rect x="0.5" y="0.5" width="719" height="169" rx="12" fill="#1a1a19" stroke="#ffffff21"/>
+  <circle cx="26" cy="26" r="5" fill="#ffffff2e"/>
+  <circle cx="44" cy="26" r="5" fill="#ffffff1f"/>
+  <circle cx="62" cy="26" r="5" fill="#ffffff14"/>
+
+  <g clip-path="url(#card)">
+    <g stroke="#ffffff17" stroke-width="1.5" fill="none">
+      <path d="M497 143 L471 100 M471 100 L505 62 M505 62 L472 24 M505 62 L553 20 M553 20 L607 34 M607 34 L648 12 M648 12 L700 26 M607 34 L586 66 M700 26 L706 74 M666 96 L706 74 M666 96 L697 132 M697 132 L649 154 M649 154 L597 140 M597 140 L560 158 M497 143 L540 122 M540 122 L597 140 M471 100 L540 122 M553 20 L586 66"/>
+    </g>
+    <g stroke="#0ca30c" stroke-opacity="0.75" stroke-width="2" fill="none">
+      <path d="M540 122 L586 66 M586 66 L640 92 M640 92 L666 96 M586 66 L620 46"/>
+    </g>
+    <g fill="#26261f" stroke="#ffffff30" stroke-width="1.5">
+      <circle cx="497" cy="143" r="6"/>
+      <circle cx="471" cy="100" r="6"/>
+      <circle cx="505" cy="62" r="6"/>
+      <circle cx="472" cy="24" r="6"/>
+      <circle cx="553" cy="20" r="6"/>
+      <circle cx="607" cy="34" r="6"/>
+      <circle cx="648" cy="12" r="6"/>
+      <circle cx="700" cy="26" r="6"/>
+      <circle cx="706" cy="74" r="6"/>
+      <circle cx="697" cy="132" r="6"/>
+      <circle cx="649" cy="154" r="6"/>
+      <circle cx="597" cy="140" r="6"/>
+      <circle cx="560" cy="158" r="6"/>
+    </g>
+    <circle cx="540" cy="122" r="8" fill="#0ca30c"/>
+    <circle cx="540" cy="122" r="13" fill="none" stroke="#0ca30c59" stroke-width="2"/>
+    <circle cx="586" cy="66" r="7" fill="#0ca30c"/>
+    <circle cx="620" cy="46" r="7" fill="#0ca30c"/>
+    <circle cx="640" cy="92" r="7" fill="#0ca30c"/>
+    <circle cx="666" cy="96" r="7" fill="#0ca30c"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="32" y="86" font-size="21" fill="#0ca30c" font-weight="700">✓</text>
+    <text x="58" y="86" font-size="19" fill="#c3c2b7">selection accuracy</text>
+    <text x="292" y="86" font-size="21" fill="#ffffff" font-weight="700">100%</text>
+    <rect x="372" y="68" width="64" height="26" rx="6" fill="#0ca30c26"/>
+    <text x="404" y="86" font-size="15" fill="#17c817" font-weight="700" text-anchor="middle">PASS</text>
+
+    <text x="58" y="116" font-size="15" fill="#c3c2b7">0 misses · 12 verified selections</text>
+    <text x="58" y="142" font-size="12.5" fill="#78776f">replay-measured + live CI checkpoints · 2026-07-06</text>
+  </g>
+</svg>

@@ -3,5 +3,5 @@
 # (no-op on machines without the sibling — badge stays at last committed value).
 # One-time setup per clone: git config core.hooksPath .githooks
 node scripts/update-evidence-badge.mjs || exit 0
-git add _evidence/badge.json 2>/dev/null || true
+git add _evidence/hero.svg 2>/dev/null || true
 exit 0

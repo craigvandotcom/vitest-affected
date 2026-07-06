@@ -66,8 +66,8 @@ The master plan lives at `_backlog/intelligent-test-selection.md`. Beads are the
 
 ## Evidence badge
 
-`_evidence/badge-misses.json` + `badge-verified.json` back the README's live
-miss-record badges (shields endpoints).
+`_evidence/hero.svg` is the README's live miss-record hero card (embedded via
+raw.githubusercontent, regenerated with current numbers).
 Refresh it via `node scripts/update-evidence-badge.mjs` — reads the sibling
 body-compass-app evidence log; no-ops when the sibling is absent. Wired as a
 pre-commit hook: one-time `git config core.hooksPath .githooks` per clone.
