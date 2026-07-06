@@ -63,3 +63,10 @@ The master plan lives at `_backlog/intelligent-test-selection.md`. Beads are the
 - `node_modules/` paths are never included in the dependency graph
 - Graph maps use `Map<string, Set<string>>` with absolute file paths
 - Test fixtures live in `test/fixtures/` with known dependency structures (simple, diamond, circular)
+
+## Evidence badge
+
+`_evidence/badge.json` backs the README's live miss-record badge (shields endpoint).
+Refresh it via `node scripts/update-evidence-badge.mjs` — reads the sibling
+body-compass-app evidence log; no-ops when the sibling is absent. Wired as a
+pre-commit hook: one-time `git config core.hooksPath .githooks` per clone.
