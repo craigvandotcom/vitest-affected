@@ -215,8 +215,15 @@ export async function main(argv: string[]): Promise<string> {
       }
     })();
   };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
+  // `.on`, NOT `.once`: the re-entrancy guard (signalHandled) already makes a
+  // repeat signal a no-op, but `.once` REMOVES the listener after the first fire —
+  // a second Ctrl-C would then reach Node's default handler and hard-kill the
+  // process mid-teardown (orphaning workers + a half-deleted clone, the exact
+  // failure this machinery exists to prevent). Keeping the listener installed
+  // routes every repeat back through the guard, where it is absorbed as a no-op.
+  // The finally block removes both listeners on exit.
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 
   try {
     const dirs = createRunDir(workdir);
@@ -237,6 +244,15 @@ export async function main(argv: string[]): Promise<string> {
     // would be laundered into 'flaky'); its outcomes become the baseline.
     let prevOutcomes: Map<string, string> | null = null;
     for (const sha of chain) {
+      // SIGNAL GATE (loop head). The signal handler runs ASYNC — it awaits
+      // killTrackedChildren before removing the clone — so the walk loop must not
+      // keep advancing underneath it. Without this gate the current child dies
+      // fast under SIGTERM, `await runCommit` returns, and the loop rolls into the
+      // NEXT commit's resetClone/installDeps/spawnDisabledRerun — spawning work on
+      // (or a child against) a clone the handler is about to rmSync, and orphaning
+      // any child spawned after the handler's kill snapshot. Stop the moment a
+      // signal is latched; the handler owns teardown + the exit code.
+      if (signalHandled) break;
       const changedFiles = await getCommitChangedFiles(cloneDir, sha);
       const cls = classifyCommit(sha, changedFiles);
       if (cls.skip) {
@@ -269,6 +285,10 @@ export async function main(argv: string[]): Promise<string> {
         continue;
       }
 
+      // SIGNAL GATE (post-install resumption). The install above awaits for
+      // minutes; a signal can land inside it. Do not spawn the ~320s run child
+      // onto a clone the handler is tearing down.
+      if (signalHandled) break;
       const result = await runCommit({
         cloneDir,
         sha,
@@ -285,6 +305,13 @@ export async function main(argv: string[]): Promise<string> {
         changedFiles,
       });
       process.stdout.write(`[replay] ${sha} ${result.status} (${result.reason})\n`);
+
+      // SIGNAL GATE (post-run resumption). A signal almost always lands DURING the
+      // run child above; when it dies under SIGTERM `await runCommit` returns here.
+      // The flake guard below spawns a fresh disabled-rerun child — do not, or it
+      // survives the handler's kill snapshot and is orphaned when the clone is
+      // removed. Break BEFORE spawning.
+      if (signalHandled) break;
 
       // FLAKE GUARD — wired here, where per-commit outcomes are first available:
       // a NEW failure (failed at C, not at C-1) is re-run ONCE with the plugin
@@ -318,6 +345,15 @@ export async function main(argv: string[]): Promise<string> {
         if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
       }
     }
+
+    // SIGNAL GATE (post-loop). If a signal latched mid-walk, one of the gates
+    // above broke us out of the loop while the handler tears down. Do NOT run the
+    // analysis — it reads the clone (rootDir: cloneDir) the handler is removing,
+    // and the handler owns the interrupted exit code. Return the run dir; the
+    // finally-block cleanup is idempotent and no child is live (the gates stopped
+    // all further spawns), so the handler's killTrackedChildren + rmSync race
+    // nothing.
+    if (signalHandled) return dirs.runDir;
 
     // ANALYSIS (A2b) — turn the raw artifacts into the honest measurement. The
     // degeneration guard (zero selective decisions across the walk) throws here,

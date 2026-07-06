@@ -21,6 +21,17 @@ import type { ResultPromise } from 'execa';
 const active = new Set<ResultPromise>();
 
 /**
+ * Bound on how long we wait for SIGKILL'd survivors to actually be reaped before
+ * returning. SIGKILL is not catchable or ignorable, so the child WILL die — this
+ * only covers reap latency (the OS delivering the signal + Node settling execa's
+ * promise). Kept short so teardown can never hang: a child stuck in an
+ * uninterruptible syscall (D-state) could otherwise defer its exit indefinitely,
+ * and blocking the caller (→ clone deletion → process exit) on that is worse than
+ * proceeding after a couple of seconds.
+ */
+const SIGKILL_REAP_MS = 2 * 1000;
+
+/**
  * Register an execa subprocess as live and return it unchanged (so call sites
  * can `trackChild(execa(...))` inline). Auto-unregisters when the subprocess
  * settles — success, failure, or kill — so the registry never retains dead
@@ -41,11 +52,22 @@ export function trackChild<T extends ResultPromise>(child: T): T {
 }
 
 /**
- * Terminate every tracked child and wait — bounded by `graceMs` — for them to
- * exit. Sends SIGTERM first (execa then escalates to SIGKILL after
- * CHILD_FORCE_KILL_MS via each spawn's `forceKillAfterDelay`), races the
- * children's exit against the grace window, then SIGKILLs any survivor so the
- * caller can safely delete the clone and exit without orphaning workers.
+ * Terminate every tracked child and, before returning, ensure none is still live
+ * — so the caller can delete the clone and exit without orphaning workers.
+ *
+ * Guarantee on return: every child tracked at entry has either exited or been
+ * SIGKILL'd AND awaited to settle (bounded by SIGKILL_REAP_MS for reap latency).
+ * SIGKILL is not catchable, so a "survivor" past that bound is one wedged in an
+ * uninterruptible syscall, not one that escaped the signal.
+ *
+ * Sequence:
+ *   1. SIGTERM every child (execa self-escalates to SIGKILL after
+ *      CHILD_FORCE_KILL_MS via each spawn's `forceKillAfterDelay`).
+ *   2. Race their settled exits against the `graceMs` grace window.
+ *   3. SIGKILL any survivor (belt-and-suspenders backstop from the handler side).
+ *   4. AWAIT the survivors' settled promises — bounded by SIGKILL_REAP_MS — so a
+ *      not-yet-reaped worker pool cannot still hold the clone open when the caller
+ *      rmSync's it.
  * Never throws — a kill on an already-dead child is swallowed.
  */
 export async function killTrackedChildren(graceMs: number): Promise<void> {
@@ -77,11 +99,30 @@ export async function killTrackedChildren(graceMs: number): Promise<void> {
   // spawn side is configured per-spawn via `forceKillAfterDelay`
   // (CHILD_FORCE_KILL_MS); this is the belt-and-suspenders backstop from the
   // handler side so the clone can be deleted without a live worker pool.
-  for (const child of active) {
+  const survivors = [...active];
+  for (const child of survivors) {
     try {
       child.kill('SIGKILL');
     } catch {
       /* already exited */
     }
+  }
+  if (survivors.length === 0) return;
+  // SIGKILL is delivered asynchronously and execa's promise settles a tick later
+  // still — returning here (→ caller rmSync + process.exit) the instant after
+  // .kill() would race deletion against a worker pool that has not yet released
+  // the clone. Await the survivors' settled exits so the doc-comment guarantee
+  // holds. Bounded by SIGKILL_REAP_MS so a D-state child can't hang teardown.
+  let reapTimer: NodeJS.Timeout | undefined;
+  const reaped = Promise.allSettled(survivors.map((c) => Promise.resolve(c)));
+  const reapGrace = new Promise<void>((resolve) => {
+    reapTimer = setTimeout(resolve, SIGKILL_REAP_MS);
+    // Do not let the reap timer keep the event loop alive on its own.
+    reapTimer.unref?.();
+  });
+  try {
+    await Promise.race([reaped, reapGrace]);
+  } finally {
+    if (reapTimer) clearTimeout(reapTimer);
   }
 }

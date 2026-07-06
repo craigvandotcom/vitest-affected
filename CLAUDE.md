@@ -17,7 +17,7 @@ Stack: TypeScript, Vitest plugin API, oxc-parser, oxc-resolver, tinyglobby
 | Test (single file) | `npx vitest run test/path/to/file.test.ts` |
 | Type-check | `tsc --noEmit` |
 | Lint | `tsc --noEmit` (TypeScript strict is the linter) |
-| Quality gate | `npm run build && tsc --noEmit && npx vitest run` |
+| Quality gate | `npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run` |
 
 No separate eslint/prettier/biome — TypeScript strict mode is the only static analysis.
 
@@ -32,6 +32,7 @@ src/
 ├── explain-cli.ts    # `vitest-affected-explain` bin — ad hoc CLI against on-disk cache + git state
 ├── runtime-merge.ts  # mergeRuntimeEdges — folds Vitest's importDurations into the reverse graph
 ├── graph/
+│   ├── types.ts      # ReverseMap — canonical domain type
 │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports for changed files
 │   ├── cache.ts      # v3 cache (rootDir-relative paths; v1/v2 read-migrated): loadCachedReverseMap / saveCacheSync
 │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs

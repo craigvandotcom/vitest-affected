@@ -20,7 +20,7 @@
 | **Type-check**   | `tsc --noEmit`                                       |
 | **Format**       | N/A (no formatter configured)                        |
 | **Build**        | `npm run build`                                      |
-| **Quality gate** | `npm run build && tsc --noEmit && npx vitest run`    |
+| **Quality gate** | `npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run`    |
 
 ## Architecture
 
@@ -34,6 +34,7 @@ vitest-affected/
 │   ├── explain-cli.ts    # `vitest-affected-explain` bin — ad hoc CLI against on-disk cache + git state
 │   ├── runtime-merge.ts  # mergeRuntimeEdges — folds Vitest's importDurations into the reverse graph
 │   ├── graph/
+│   │   ├── types.ts      # ReverseMap — canonical domain type (source file → transitively-importing test files)
 │   │   ├── builder.ts    # oxc-parser + oxc-resolver → deltaParseNewImports(changedFiles, cachedReverse) → new import targets
 │   │   ├── cache.ts      # v3 cache (rootDir-relative paths; v1/v2 read-time migrated) — loadCachedReverseMap/saveCacheSync
 │   │   └── normalize.ts  # Strip Vite query strings, \0 prefixes, /@fs/ from module IDs; realpath canonicalization

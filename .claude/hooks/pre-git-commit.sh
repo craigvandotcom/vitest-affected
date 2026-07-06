@@ -73,7 +73,7 @@ run_check "3/4" "Type checking tests" "npx tsc -p tsconfig.test.json --noEmit" |
 }
 
 # 4. Tests (cannot auto-fix)
-run_check "4/4" "Running tests" "npx vitest run" || {
+run_check "4/4" "Running tests" "VITEST_AFFECTED_DISABLED=1 npx vitest run" || {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
   echo "TIPS FOR FIXING TEST FAILURES:" >&2
   echo "  • Run 'npx vitest run test/path/to/file.test.ts' for a specific test" >&2

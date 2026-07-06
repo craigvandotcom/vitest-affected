@@ -8,6 +8,6 @@ This project is **vitest-affected** — an intelligent test selection plugin for
 
 Stack: TypeScript, Vitest plugin API, oxc-parser, oxc-resolver, tinyglobby
 
-Quality gate: `npm run build && tsc --noEmit && npx vitest run`
+Quality gate: `npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run`
 
 Task workflow: `/plan-init` → `/plan-refine-internal` → `/beadify` → `/bead-refine` → `/bead-work` → `/bead-land`
