@@ -3,6 +3,7 @@ import { parseSync } from 'oxc-parser';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { toCanonicalPath } from './normalize.js';
+import type { ReverseMap } from './types.js';
 
 const BINARY_EXTENSIONS = new Set([
   '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.tiff',
@@ -217,7 +218,7 @@ export function resolveFileImports(
  */
 export function deltaParseNewImports(
   changedFiles: string[],
-  cachedReverse: Map<string, Set<string>>,
+  cachedReverse: ReverseMap,
   rootDir: string,
   verbose?: boolean,
   aliasEntries?: AliasEntry[],

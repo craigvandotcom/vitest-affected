@@ -6,15 +6,23 @@ import { toCanonicalPath } from './graph/normalize.js';
 
 const execFile = promisify(execFileCb);
 
-// Disable Node's 1MB default stdout cap. A large changeset (a giant diff range,
-// or codegen touching 10k+ files) overflows the default and makes execFile
-// reject with "maxBuffer length exceeded" — which the per-command `.catch(() => [])`
-// below would swallow into an empty file list, silently UNDER-selecting tests.
-// The safety invariant is over-select on failure, never silently under-select, so
-// git output is never capped (an unbounded diff cannot get us tests wrong; only
-// truncation can). A pathological OOM would crash → propagate → full-suite
-// fallback, which is the safe side.
-const GIT_STDOUT_MAX_BUFFER = Infinity;
+// Raise Node's 1MB default stdout cap to a large finite bound. A big changeset
+// (a giant diff range, or codegen touching 10k+ files) overflows the 1MB default
+// and makes execFile reject with "maxBuffer length exceeded".
+//
+// The cap is finite ON PURPOSE. `Infinity` would let git's stdout buffer grow
+// unbounded until the process dies with an UNCATCHABLE V8 heap OOM — which no
+// try/catch can intercept, so the plugin's full-suite fallback never runs. A
+// finite cap instead makes overflow throw a CATCHABLE error:
+//   - committed path (no `.catch`): rejects → propagates through Promise.all →
+//     getChangedFiles throws → the plugin's catch-all falls back to the full suite;
+//   - staged/unstaged paths (per-command `.catch(() => [])`): the throw is caught
+//     locally and that source degrades to [].
+// Either way the outcome is a real error the plugin can act on — over-select via
+// full-suite fallback — rather than the whole test process dying. 256MB is far
+// above any realistic `--name-only` diff (paths only, no contents) yet still a
+// bound V8 can honor without OOM.
+const GIT_STDOUT_MAX_BUFFER = 256 * 1024 * 1024;
 
 async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise<{ stdout: string }> {
   try {
@@ -110,7 +118,12 @@ export async function getChangedFiles(
 
   // Step 4: Parallel git commands
   //
-  // Committed changes (ref-based): use git diff with ref...HEAD
+  // Committed changes (ref-based): use git diff with ref...HEAD and --no-renames so
+  //   a rename surfaces as its A (new path) + D (old path) pair. WITHOUT --no-renames,
+  //   git's default rename detection collapses A→B into a single entry showing only the
+  //   NEW path, so the OLD path never enters `changed`/`deleted` and the cached
+  //   `old → [tests]` reverse edges never seed BFS — an under-selection. This mirrors
+  //   the staged path's diff-index A+D behaviour below.
   // Staged changes: use diff-index --cached which reports renames as A+D entries (unlike
   //   git diff --cached which merges renames into a single R entry with --name-only)
   // Unstaged changes: ls-files --others --modified reports untracked and modified tracked files
@@ -125,7 +138,7 @@ export async function getChangedFiles(
   // it reject propagates through Promise.all → getChangedFiles throws → the
   // plugin's catch-all falls back to the full suite (the safe, loud outcome).
   const committedPromise: Promise<string[]> = ref !== undefined
-    ? exec('git', ['diff', '--name-only', '--diff-filter=ACMRD', `${ref}...HEAD`], { cwd: gitRoot })
+    ? exec('git', ['diff', '--name-only', '--no-renames', '--diff-filter=ACMD', `${ref}...HEAD`], { cwd: gitRoot })
         .then(r => r.stdout.trim().split('\n').filter(Boolean))
     : Promise.resolve([]);
 

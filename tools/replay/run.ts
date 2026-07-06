@@ -13,19 +13,20 @@ import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execa } from 'execa';
 import {
   getFirstParentChain,
   getCommitChangedFiles,
   classifyCommit,
   getLockfileHash,
   shouldReinstall,
-  ensureInstall,
 } from './walker.js';
 import {
   resolveWorkdirRoot,
   symlinkDist,
   cloneConsumer,
   createRunDir,
+  removeClone,
   CONSUMER_DIRNAME,
 } from './workdir.js';
 import { runCommit } from './exec.js';
@@ -48,6 +49,8 @@ export interface CliArgs {
   analyzeOnly?: string;
   /** Clone root override for --analyze-only path resolution. */
   root?: string;
+  /** Keep the multi-GB consumer clone after the walk (for debugging). */
+  keepWorkdir?: boolean;
 }
 
 export const USAGE = `vitest-affected replay harness
@@ -67,6 +70,9 @@ Options:
                        run dir (walks are ~320s/commit; analysis iterates fast).
   --root <path>        Clone root for --analyze-only path resolution (defaults
                        to <runDir>/../../${CONSUMER_DIRNAME}, the A2a layout).
+  --keep-workdir       Do NOT delete the multi-GB consumer clone after the walk
+                       (default: the clone is torn down; run artifacts survive).
+                       Use when debugging a walk against the clone's final state.
   -h, --help           Show this help.
 
 Notes:
@@ -108,6 +114,9 @@ export function parseArgs(argv: string[]): CliArgs {
         break;
       case '--root':
         args.root = argv[++i];
+        break;
+      case '--keep-workdir':
+        args.keepWorkdir = true;
         break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -172,137 +181,224 @@ export async function main(argv: string[]): Promise<string> {
   const workdir = resolveWorkdirRoot();
   symlinkDist(workdir, distPath);
   const cloneDir = await cloneConsumer(workdir, repo);
-  const dirs = createRunDir(workdir);
+  // Teardown: the consumer clone is multi-GB and per-run. Remove it on ANY exit
+  // (normal, thrown, or signal) unless --keep-workdir is set — ONLY the clone
+  // goes; run artifacts under <workdir>/runs survive. Idempotent so the finally
+  // block and the signal handlers can't double-free.
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned || args.keepWorkdir) return;
+    cleaned = true;
+    removeClone(cloneDir);
+  };
+  const onSignal = (sig: NodeJS.Signals): void => {
+    cleanup();
+    // Reflect the interruption in the exit code (128 + signal number) — a walk
+    // killed with Ctrl-C must not exit 0 and look clean.
+    process.exit(sig === 'SIGINT' ? 130 : 143);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
 
-  let chain = await getFirstParentChain(cloneDir, range);
-  if (typeof args.sample === 'number') {
-    chain = chain.slice(-args.sample);
-  }
+  try {
+    const dirs = createRunDir(workdir);
 
-  process.stdout.write(
-    `[replay] workdir=${workdir}\n[replay] run=${dirs.runDir}\n[replay] commits=${chain.length}\n`,
-  );
-
-  let prevLockHash: string | null = null;
-  // Outcomes at the previous ok commit — the C-1 side of the flake guard.
-  // null = no baseline yet: the FIRST measurable commit must NOT flake-check
-  // (every failure would spuriously look "new" and a baseline-broken test
-  // would be laundered into 'flaky'); its outcomes become the baseline.
-  let prevOutcomes: Map<string, string> | null = null;
-  for (const sha of chain) {
-    const changedFiles = await getCommitChangedFiles(cloneDir, sha);
-    const cls = classifyCommit(sha, changedFiles);
-    if (cls.skip) {
-      await appendLedger(dirs.ledgerPath, {
-        sha,
-        status: 'skipped',
-        reason: `config/lockfile touched: ${cls.skipTriggers.join(', ')}`,
-        timings: { totalMs: 0 },
-        changedFiles,
-      });
-      process.stdout.write(`[replay] ${sha} SKIPPED (${cls.skipTriggers.join(', ')})\n`);
-      continue;
+    let chain = await getFirstParentChain(cloneDir, range);
+    if (typeof args.sample === 'number') {
+      chain = chain.slice(-args.sample);
     }
 
-    // Checkout must happen before hashing the lockfile at this commit; runCommit
-    // does the checkout, so mirror the ref state here for install policy.
-    try {
-      await ensureInstallForCommit(cloneDir, sha, prevLockHash).then((h) => {
-        prevLockHash = h;
-      });
-    } catch (err) {
-      await appendLedger(dirs.ledgerPath, {
-        sha,
-        status: 'BROKEN',
-        reason: `install failed: ${err instanceof Error ? err.message : String(err)}`,
-        timings: { totalMs: 0 },
-        changedFiles,
-      });
-      process.stdout.write(`[replay] ${sha} BROKEN (install)\n`);
-      continue;
-    }
+    process.stdout.write(
+      `[replay] workdir=${workdir}\n[replay] run=${dirs.runDir}\n[replay] commits=${chain.length}\n`,
+    );
 
-    const result = await runCommit({
-      cloneDir,
-      sha,
-      statsDir: dirs.statsDir,
-      outcomesDir: dirs.outcomesDir,
-      graphsDir: dirs.graphsDir,
-    });
-    await appendLedger(dirs.ledgerPath, {
-      sha: result.sha,
-      status: result.status,
-      reason: result.reason,
-      timings: { totalMs: result.totalMs },
-      ...(result.decision ? { decision: result.decision } : {}),
-      changedFiles,
-    });
-    process.stdout.write(`[replay] ${sha} ${result.status} (${result.reason})\n`);
-
-    // FLAKE GUARD — wired here, where per-commit outcomes are first available:
-    // a NEW failure (failed at C, not at C-1) is re-run ONCE with the plugin
-    // fully disabled (no cache/stats side effects). Re-runs are logged to
-    // flake-log.jsonl; the analysis excludes logged flakes from the
-    // outcome-confirmed tier.
-    if (result.status === 'ok' && result.outcomesPath) {
-      const curOutcomes = parseOutcomes(
-        await readFile(result.outcomesPath, 'utf-8'),
-      );
-      const flake = await flakeCheckCommit(sha, prevOutcomes, curOutcomes, () =>
-        spawnDisabledRerun(cloneDir),
-      );
-      if (flake.reran) {
-        const logEntry: FlakeLogEntry = {
+    let prevLockHash: string | null = null;
+    // Outcomes at the previous ok commit — the C-1 side of the flake guard.
+    // null = no baseline yet: the FIRST measurable commit must NOT flake-check
+    // (every failure would spuriously look "new" and a baseline-broken test
+    // would be laundered into 'flaky'); its outcomes become the baseline.
+    let prevOutcomes: Map<string, string> | null = null;
+    for (const sha of chain) {
+      const changedFiles = await getCommitChangedFiles(cloneDir, sha);
+      const cls = classifyCommit(sha, changedFiles);
+      if (cls.skip) {
+        await appendLedger(dirs.ledgerPath, {
           sha,
-          newFailures: flake.newFailures,
-          confirmed: flake.confirmed,
-          flaky: flake.flaky,
-        };
-        await appendFile(
-          path.join(dirs.runDir, 'flake-log.jsonl'),
-          JSON.stringify(logEntry) + '\n',
-          'utf-8',
-        );
-        process.stdout.write(
-          `[replay] ${sha} flake-guard re-run: ${flake.newFailures.length} new failure(s), ` +
-            `${flake.confirmed.length} confirmed, ${flake.flaky.length} flaky\n`,
-        );
+          status: 'skipped',
+          reason: `config/lockfile touched: ${cls.skipTriggers.join(', ')}`,
+          timings: { totalMs: 0 },
+          changedFiles,
+        });
+        process.stdout.write(`[replay] ${sha} SKIPPED (${cls.skipTriggers.join(', ')})\n`);
+        continue;
       }
-      if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
+
+      // Checkout must happen before hashing the lockfile at this commit; runCommit
+      // does the checkout, so mirror the ref state here for install policy.
+      try {
+        await ensureInstallForCommit(cloneDir, sha, prevLockHash).then((h) => {
+          prevLockHash = h;
+        });
+      } catch (err) {
+        await appendLedger(dirs.ledgerPath, {
+          sha,
+          status: 'BROKEN',
+          reason: `install failed: ${err instanceof Error ? err.message : String(err)}`,
+          timings: { totalMs: 0 },
+          changedFiles,
+        });
+        process.stdout.write(`[replay] ${sha} BROKEN (install)\n`);
+        continue;
+      }
+
+      const result = await runCommit({
+        cloneDir,
+        sha,
+        statsDir: dirs.statsDir,
+        outcomesDir: dirs.outcomesDir,
+        graphsDir: dirs.graphsDir,
+      });
+      await appendLedger(dirs.ledgerPath, {
+        sha: result.sha,
+        status: result.status,
+        reason: result.reason,
+        timings: { totalMs: result.totalMs },
+        ...(result.decision ? { decision: result.decision } : {}),
+        changedFiles,
+      });
+      process.stdout.write(`[replay] ${sha} ${result.status} (${result.reason})\n`);
+
+      // FLAKE GUARD — wired here, where per-commit outcomes are first available:
+      // a NEW failure (failed at C, not at C-1) is re-run ONCE with the plugin
+      // fully disabled (no cache/stats side effects). Re-runs are logged to
+      // flake-log.jsonl; the analysis excludes logged flakes from the
+      // outcome-confirmed tier.
+      if (result.status === 'ok' && result.outcomesPath) {
+        const curOutcomes = parseOutcomes(
+          await readFile(result.outcomesPath, 'utf-8'),
+        );
+        const flake = await flakeCheckCommit(sha, prevOutcomes, curOutcomes, () =>
+          spawnDisabledRerun(cloneDir),
+        );
+        if (flake.reran) {
+          const logEntry: FlakeLogEntry = {
+            sha,
+            newFailures: flake.newFailures,
+            confirmed: flake.confirmed,
+            flaky: flake.flaky,
+          };
+          await appendFile(
+            path.join(dirs.runDir, 'flake-log.jsonl'),
+            JSON.stringify(logEntry) + '\n',
+            'utf-8',
+          );
+          process.stdout.write(
+            `[replay] ${sha} flake-guard re-run: ${flake.newFailures.length} new failure(s), ` +
+              `${flake.confirmed.length} confirmed, ${flake.flaky.length} flaky\n`,
+          );
+        }
+        if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
+      }
     }
+
+    // ANALYSIS (A2b) — turn the raw artifacts into the honest measurement. The
+    // degeneration guard (zero selective decisions across the walk) throws here,
+    // surfacing on the report path (CLI exits non-zero) — but only AFTER the
+    // diagnosis analysis.md has been written into the run dir (analyzeAndReport),
+    // so the expensive walk stays diagnosable and re-analyzable without a
+    // re-walk (--analyze-only).
+    const reportPath = await analyzeAndReport({
+      runDir: dirs.runDir,
+      rootDir: cloneDir,
+    });
+    process.stdout.write(`[replay] analysis report: ${reportPath}\n`);
+
+    return dirs.runDir;
+  } finally {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    cleanup();
   }
-
-  // ANALYSIS (A2b) — turn the raw artifacts into the honest measurement. The
-  // degeneration guard (zero selective decisions across the walk) throws here,
-  // surfacing on the report path (CLI exits non-zero) — but only AFTER the
-  // diagnosis analysis.md has been written into the run dir (analyzeAndReport),
-  // so the expensive walk stays diagnosable and re-analyzable without a
-  // re-walk (--analyze-only).
-  const reportPath = await analyzeAndReport({
-    runDir: dirs.runDir,
-    rootDir: cloneDir,
-  });
-  process.stdout.write(`[replay] analysis report: ${reportPath}\n`);
-
-  return dirs.runDir;
 }
 
 /**
- * Checkout the commit and reconcile the install: reinstall when the lockfile
- * hash changed. Returns the lockfile hash observed at this commit (the new
- * prev-hash for the next iteration).
+ * Reset the commit's clone, checkout the commit, and reconcile the install:
+ * reinstall when the lockfile hash changed. Returns the lockfile hash observed at
+ * this commit (the new prev-hash for the next iteration).
  */
 async function ensureInstallForCommit(
   cloneDir: string,
   sha: string,
   prevLockHash: string | null,
 ): Promise<string | null> {
+  // Reset the throwaway clone to a pristine tree BEFORE checking out this commit.
+  // A previous commit's `pnpm install` (or any non-frozen dependency resolve) can
+  // leave the tracked lockfile / working tree dirty; without this reset the next
+  // `checkout --detach` aborts ("local changes would be overwritten") and every
+  // later commit cascades to BROKEN for the rest of a multi-hour walk. Scoped to
+  // cloneDir — a disposable clone under the OS temp dir (resolveWorkdirRoot /
+  // cloneConsumer in workdir.ts) — so a hard reset + clean is safe.
+  await resetClone(cloneDir);
+
   // A detached checkout is needed to read the lockfile at this commit; runCommit
   // re-detaches at the same sha, so this is idempotent.
   await runGit(cloneDir, ['checkout', '--detach', sha]);
   const curHash = await getLockfileHash(cloneDir);
-  await ensureInstall(cloneDir, shouldReinstall(prevLockHash, curHash));
+  await installDeps(cloneDir, shouldReinstall(prevLockHash, curHash));
   return curHash;
+}
+
+/**
+ * Reset the disposable consumer clone to a pristine tree: discard tracked-file
+ * modifications (`git reset --hard`) and remove untracked, non-ignored files
+ * (`git clean -fd` — WITHOUT `-x`, so gitignored node_modules / plugin caches
+ * survive and stay off the critical path). cloneDir is a throwaway clone under the
+ * OS temp dir (workdir.ts), so a destructive reset is safe here.
+ */
+async function resetClone(cloneDir: string): Promise<void> {
+  await runGit(cloneDir, ['reset', '--hard']);
+  await runGit(cloneDir, ['clean', '-fd']);
+}
+
+/**
+ * Install dependencies in the clone, preferring a FROZEN lockfile so pnpm never
+ * rewrites the tracked pnpm-lock.yaml mid-walk (that rewrite is what dirtied the
+ * tree and cascaded later checkouts to BROKEN). When the lockfile legitimately
+ * does not match package.json at THIS historical commit, `--frozen-lockfile`
+ * refuses (ERR_PNPM_OUTDATED_LOCKFILE) — a normal fact of walking old history,
+ * not a harness failure — so we fall back to a non-frozen install for that commit
+ * (the next iteration's resetClone discards any resulting lockfile rewrite). Any
+ * OTHER failure throws, preserving the caller's install → BROKEN taxonomy.
+ */
+async function installDeps(cloneDir: string, reinstall: boolean): Promise<void> {
+  if (!reinstall) return;
+  try {
+    await execa('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], {
+      cwd: cloneDir,
+    });
+    return;
+  } catch (err) {
+    if (!isFrozenLockfileMismatch(err)) throw err;
+  }
+  // Legitimate lockfile / package.json drift at this commit — resolve normally.
+  await execa('pnpm', ['install', '--prefer-offline'], { cwd: cloneDir });
+}
+
+/**
+ * True when an execa error looks like pnpm refusing a frozen install because the
+ * lockfile is out of sync with package.json (the ONE failure we retry non-frozen,
+ * vs. genuine install failures which must propagate to BROKEN).
+ */
+function isFrozenLockfileMismatch(err: unknown): boolean {
+  if (!(err && typeof err === 'object')) return false;
+  const parts: string[] = [];
+  for (const key of ['stderr', 'stdout', 'shortMessage', 'message'] as const) {
+    const value = (err as Record<string, unknown>)[key];
+    if (typeof value === 'string') parts.push(value);
+  }
+  return /ERR_PNPM_OUTDATED_LOCKFILE|frozen-lockfile|lockfile[^\n]*(?:up to date|out of date|not match|outdated)/i.test(
+    parts.join('\n'),
+  );
 }
 
 async function appendLedger(

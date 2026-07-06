@@ -14,6 +14,7 @@ import { bfsAffectedTestsWithProvenance } from './selector.js';
 import type { SelectionTrail } from './selector.js';
 import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
 import { mergeRuntimeEdges } from './runtime-merge.js';
+import type { ReverseMap } from './graph/types.js';
 
 /**
  * Narrow shape of the Vitest 4 `experimental.importDurations` config block.
@@ -190,7 +191,7 @@ const ZERO_EDGE_STARVATION_MODULE_THRESHOLD = 5;
  */
 export function createRuntimeReporter(
   onEdgesCollected: (
-    edges: Map<string, Set<string>>,
+    edges: ReverseMap,
     wasFullSuiteRun: boolean,
   ) => void,
   diagnostics: {
@@ -225,7 +226,7 @@ export function createRuntimeReporter(
   setSelectedTests: (tests: string[]) => void;
 } {
   let rootDir: string | null = null;
-  const runtimeReverse = new Map<string, Set<string>>();
+  const runtimeReverse: ReverseMap = new Map();
   // Canonical paths of every test module observed this run — the ran-tests set
   // for selection self-verify. Reset at each (non-interrupted) run end,
   // mirroring runtimeReverse.
@@ -516,7 +517,7 @@ function buildExplain(
 
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   // Hoisted state — shared between config() and configureVitest()
-  let reverse: Map<string, Set<string>> = new Map();
+  let reverse: ReverseMap = new Map();
   let cacheDir: string | undefined;
 
   return {

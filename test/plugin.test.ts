@@ -1,10 +1,11 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
+import { createMockContext, cleanupTempDirs } from './_helpers.js';
 
 const tempDirs: string[] = [];
 
@@ -24,10 +25,7 @@ afterEach(() => {
   } else {
     delete process.env.VITEST_AFFECTED_DISABLED;
   }
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 /**
@@ -64,27 +62,6 @@ function setupOrphanFixture(): { tmpDir: string; orphanPath: string } {
   return { tmpDir, orphanPath: path.join(tmpDir, 'src', 'orphan.ts') };
 }
 
-/**
- * Create a mock vitest/project context for direct plugin testing.
- * Returns the project.config object so tests can assert mutations.
- */
-function createMockContext(rootDir: string, globalSetup?: string | string[]) {
-  const projectConfig = {
-    include: ['tests/**/*.test.ts'],
-    exclude: [] as string[],
-    setupFiles: [] as string[],
-    globalSetup,
-  };
-  const mockProject = { config: projectConfig };
-  const mockVitest = {
-    config: { root: rootDir, watch: false },
-    projects: [mockProject],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: () => {},
-  };
-  return { vitest: mockVitest, project: mockProject, projectConfig };
-}
-
 describe('allowNoTests option', () => {
   test('zero affected tests with allowNoTests: true sets include to empty array', async () => {
     const { tmpDir, orphanPath } = setupOrphanFixture();
@@ -97,7 +74,7 @@ describe('allowNoTests option', () => {
 
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
 
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
 
@@ -118,7 +95,7 @@ describe('allowNoTests option', () => {
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
     const originalInclude = [...projectConfig.include];
 
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
 
@@ -136,7 +113,7 @@ describe('fullSuiteTriggers option', () => {
     tmpDir: string,
   ) {
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
     await hook({ vitest, project });
@@ -236,7 +213,7 @@ describe('env-drift recipe (T2c decision): fullSuiteTriggers, not CONFIG_BASENAM
     tmpDir: string,
   ) {
     const { vitest, project, projectConfig } = createMockContext(tmpDir);
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
     await hook({ vitest, project });
@@ -299,8 +276,8 @@ describe('globalSetup full-suite trigger', () => {
     tmpDir: string,
     globalSetup: string | string[],
   ) {
-    const { vitest, project, projectConfig } = createMockContext(tmpDir, globalSetup);
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const { vitest, project, projectConfig } = createMockContext(tmpDir, { globalSetup });
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
     await hook({ vitest, project });
@@ -408,7 +385,7 @@ describe('setup/globalSetup triggers evaluate the RAW changed set (pre-filter)',
       reporters: [] as unknown[],
       onFilterWatchedSpecification: () => {},
     };
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
     await hook({ vitest, project });
@@ -502,7 +479,7 @@ describe('symlinked rootDir canonicalization', () => {
     });
     const { vitest, project, projectConfig } = createMockContext(aliasDir);
 
-    const hook = (plugin as Record<string, unknown>).configureVitest as (
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (
       ctx: { vitest: typeof vitest; project: typeof project },
     ) => Promise<void>;
     await hook({ vitest, project });

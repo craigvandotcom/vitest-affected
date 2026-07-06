@@ -39,12 +39,15 @@ const logPath = path.resolve(
   '../body-compass-app/_ci-evidence/vitest-affected-divergence-log.jsonl'
 );
 
-const REPLAY_BASELINE = { misses: 0, selectiveDecisions: 12 };
+// Baseline is decision-shaped (see _plans/research/2026-07-05-a4-walk/analysis.md):
+// 0 missed selective DECISIONS and 0 missed test FILES across 12 selective decisions.
+const REPLAY_BASELINE = { missedDecisions: 0, missedFiles: 0, selectiveDecisions: 12 };
 const seedMode = process.argv.includes('--seed');
 
 let checkpoints = 0;
-let liveSelective = 0;
-let liveMisses = 0;
+let liveSelective = 0; // count of shadow-selective DECISIONS
+let liveMissedDecisions = 0; // shadow-selective decisions with >=1 missed file (0/1 per line)
+let liveMissedFiles = 0; // total missed FILE count (kept for display, not the accuracy metric)
 
 if (!seedMode) {
   if (!existsSync(logPath)) {
@@ -63,15 +66,29 @@ if (!seedMode) {
       continue;
     }
     checkpoints++;
-    if (obj.decisionAction === 'shadow-selective') liveSelective++;
-    if ((obj.missedFileCount ?? 0) > 0) liveMisses += obj.missedFileCount;
+    // Miss accrual is guarded to shadow-selective lines EXACTLY as liveSelective
+    // is: a shadow-full-suite line can never miss (divergence is structurally
+    // impossible when the shadow ran the whole suite), so a stray missedFileCount
+    // on one must not inflate the record with no matching verified increment.
+    if (obj.decisionAction === 'shadow-selective') {
+      liveSelective++;
+      const missedFiles = (obj.missedFileCount ?? 0) > 0 ? obj.missedFileCount : 0;
+      if (missedFiles > 0) {
+        liveMissedDecisions++; // one missed DECISION, regardless of how many files
+        liveMissedFiles += missedFiles; // aggregate missed-FILE count
+      }
+    }
   }
 }
 
-const misses = REPLAY_BASELINE.misses + liveMisses;
+// Accuracy is DECISIONS-over-DECISIONS: missed selective decisions vs verified
+// selective decisions (never files-over-decisions — that mixes units and can go
+// negative). The total missed-FILE count is kept alongside for honest display.
+const missedDecisions = REPLAY_BASELINE.missedDecisions + liveMissedDecisions;
 const verified = REPLAY_BASELINE.selectiveDecisions + liveSelective;
+const missedFiles = REPLAY_BASELINE.missedFiles + liveMissedFiles;
 const asOf = new Date().toISOString().slice(0, 10);
-const clean = misses === 0;
+const clean = missedDecisions === 0;
 
 // Validated palette (dataviz reference): status good #0ca30c (5.19:1 on the
 // dark card), serious #ec835a; text #ffffff / #c3c2b7 / #78776f on #1a1a19.
@@ -79,12 +96,17 @@ const accent = clean ? '#0ca30c' : '#ec835a';
 const accentBright = clean ? '#17c817' : '#ec835a';
 const mark = clean ? '✓' : '✗';
 const verdict = clean ? 'PASS' : 'FAIL';
+const rawPct =
+  verified === 0 ? null : ((verified - missedDecisions) / verified) * 100;
+// Clamp defensively: the rendered percentage can never fall outside [0, 100]
+// regardless of malformed input.
+const clampedPct = rawPct === null ? null : Math.min(100, Math.max(0, rawPct));
 const pct =
-  verified === 0
+  clampedPct === null
     ? '—'
-    : `${(((verified - misses) / verified) * 100).toFixed(misses === 0 ? 0 : 1)}%`;
+    : `${clampedPct.toFixed(missedDecisions === 0 ? 0 : 1)}%`;
 
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="170" viewBox="0 0 720 170" role="img" aria-label="selection accuracy ${pct}, ${verdict}: ${misses} misses across ${verified} verified selections">
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="170" viewBox="0 0 720 170" role="img" aria-label="selection accuracy ${pct}, ${verdict}: ${missedDecisions} missed decisions across ${verified} verified selections">
   <defs>
     <clipPath id="card"><rect x="0" y="0" width="720" height="170" rx="12"/></clipPath>
   </defs>
@@ -130,7 +152,7 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="170" vi
     <rect x="372" y="68" width="64" height="26" rx="6" fill="${accent}26"/>
     <text x="404" y="86" font-size="15" fill="${accentBright}" font-weight="700" text-anchor="middle">${verdict}</text>
 
-    <text x="58" y="116" font-size="15" fill="#c3c2b7">${misses} misses · ${verified} verified selections</text>
+    <text x="58" y="116" font-size="15" fill="#c3c2b7">${missedDecisions} misses · ${verified} verified selections</text>
     <text x="58" y="142" font-size="12.5" fill="#78776f">replay-measured + live CI checkpoints · ${asOf}</text>
   </g>
 </svg>
@@ -138,5 +160,5 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="170" vi
 
 writeFileSync(heroPath, svg);
 console.log(
-  `[evidence-hero] ${verdict} — ${misses} misses / ${verified} verified / ${checkpoints} live checkpoints (${asOf}) → ${heroPath}`
+  `[evidence-hero] ${verdict} — ${missedDecisions} missed decision(s) (${missedFiles} missed file(s)) / ${verified} verified / ${checkpoints} live checkpoints (${asOf}) → ${heroPath}`
 );

@@ -1,3 +1,5 @@
+import type { ReverseMap } from './graph/types.js';
+
 /**
  * Provenance for a single selected test: WHY it was selected.
  * - `seed`  — the changed/deleted file the BFS started from that first reached
@@ -25,7 +27,7 @@ export interface SelectionTrail {
  */
 export function bfsAffectedTestsWithProvenance(
   changedFiles: string[],
-  reverse: Map<string, Set<string>>,
+  reverse: ReverseMap,
   isTestFile: (path: string) => boolean,
 ): { tests: string[]; provenance: Map<string, SelectionTrail> } {
   const visited = new Set<string>();
@@ -75,7 +77,7 @@ export function bfsAffectedTestsWithProvenance(
 
 export function bfsAffectedTests(
   changedFiles: string[],
-  reverse: Map<string, Set<string>>,
+  reverse: ReverseMap,
   isTestFile: (path: string) => boolean
 ): string[] {
   return bfsAffectedTestsWithProvenance(changedFiles, reverse, isTestFile).tests;

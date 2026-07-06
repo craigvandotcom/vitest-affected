@@ -1,11 +1,10 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
-import type { AliasEntry } from '../src/graph/builder.js';
+import { createMockContext, runHook, makeTempDir, cleanupTempDirs } from './_helpers.js';
 
 // ===========================================================================
 // INTEGRATION: resolve.alias TRACKED promise (README §"Coverage matrix").
@@ -40,10 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   if (savedEnv !== undefined) process.env.VITEST_AFFECTED_DISABLED = savedEnv;
   else delete process.env.VITEST_AFFECTED_DISABLED;
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 /**
@@ -67,11 +63,10 @@ function setupAliasFixture(): {
   baseTest: string;
   probeTest: string;
 } {
-  // realpath up front: the plugin canonicalizes every path it emits, and macOS
-  // tmpdir is a /var → /private/var symlink. Canonicalize the root so expected
-  // paths line up with the plugin's canonical include mutation.
-  const rootDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-alias-int-')));
-  tempDirs.push(rootDir);
+  // makeTempDir realpaths up front: the plugin canonicalizes every path it emits,
+  // and macOS tmpdir is a /var → /private/var symlink. Canonicalize the root so
+  // expected paths line up with the plugin's canonical include mutation.
+  const rootDir = makeTempDir(tempDirs, 'vitest-affected-alias-int-');
 
   mkdirSync(path.join(rootDir, 'src'), { recursive: true });
   mkdirSync(path.join(rootDir, 'tests'), { recursive: true });
@@ -112,43 +107,10 @@ function setupAliasFixture(): {
   return { rootDir, baseSrc, consumerSrc, baseTest, probeTest };
 }
 
-/**
- * Mock configureVitest context. Mirrors plugin.test.ts's createMockContext
- * exactly, with one addition: an optional `vite` field on the project carrying
- * `config.resolve.alias` — the real Vitest TestProject.vite → ViteDevServer
- * shape. `undefined` reproduces the standard unit-test mock (no vite server).
- */
-function createMockContext(rootDir: string, alias?: AliasEntry[]) {
-  const projectConfig = {
-    include: ['tests/**/*.test.ts'],
-    exclude: [] as string[],
-    setupFiles: [] as string[],
-    globalSetup: undefined as string | string[] | undefined,
-  };
-  const mockProject = {
-    config: projectConfig,
-    ...(alias !== undefined
-      ? { vite: { config: { resolve: { alias } } } }
-      : {}),
-  };
-  const mockVitest = {
-    config: { root: rootDir, watch: false },
-    projects: [mockProject],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: () => {},
-  };
-  return { vitest: mockVitest, project: mockProject, projectConfig };
-}
-
-async function runHook(
-  plugin: ReturnType<typeof vitestAffected>,
-  ctx: ReturnType<typeof createMockContext>,
-): Promise<void> {
-  const hook = (plugin as Record<string, unknown>).configureVitest as (
-    c: { vitest: typeof ctx.vitest; project: typeof ctx.project },
-  ) => Promise<void>;
-  await hook({ vitest: ctx.vitest, project: ctx.project });
-}
+// The shared createMockContext attaches project.vite.config.resolve.alias when
+// the `alias` option is provided — the real Vitest TestProject.vite →
+// ViteDevServer shape. Omitting it reproduces the standard unit-test mock (no
+// vite server, undefined/no-op branch).
 
 describe('resolve.alias TRACKED — integration through configureVitest', () => {
   test('WITH project.vite.config.resolve.alias: brand-new aliased import selects the aliased test', async () => {
@@ -159,9 +121,9 @@ describe('resolve.alias TRACKED — integration through configureVitest', () => 
       cache: true,
     });
 
-    const ctx = createMockContext(rootDir, [
-      { find: '@fresh/probe', replacement: probeTest },
-    ]);
+    const ctx = createMockContext(rootDir, {
+      alias: [{ find: '@fresh/probe', replacement: probeTest }],
+    });
 
     await runHook(plugin, ctx);
 

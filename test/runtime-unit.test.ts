@@ -1,23 +1,9 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect } from 'vitest';
-import type { TestModule } from 'vitest/node';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import { createRuntimeReporter } from '../src/plugin.js';
 import { mergeRuntimeEdges, type ReverseMap } from '../src/runtime-merge.js';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function createMockTestModule(
-  moduleId: string,
-  importDurations: Record<string, { selfTime: number; totalTime: number }>,
-): TestModule {
-  return {
-    moduleId,
-    diagnostic: () => ({ importDurations }),
-  } as unknown as TestModule;
-}
+import { createMockTestModule } from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // createRuntimeReporter

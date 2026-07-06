@@ -1,15 +1,11 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
-import {
-  mkdirSync,
-  mkdtempSync,
-  writeFileSync,
-  rmSync,
-} from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
+import { createMockContext, runHook, cleanupTempDirs } from './_helpers.js';
 
 // ---------------------------------------------------------------------------
 // Env save/restore (same pattern as plugin.test.ts)
@@ -28,14 +24,7 @@ afterEach(() => {
   } else {
     delete process.env.VITEST_AFFECTED_DISABLED;
   }
-  for (const dir of tempDirs) {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch {
-      /* best-effort */
-    }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 const tempDirs: string[] = [];
@@ -84,45 +73,6 @@ function setupWatchFixture(): {
   };
 }
 
-function createWatchMockContext(rootDir: string) {
-  const projectConfig = {
-    include: ['tests/**/*.test.ts'],
-    exclude: [] as string[],
-    setupFiles: [] as string[],
-  };
-  const mockProject = { config: projectConfig };
-
-  let filterCallback: ((spec: { moduleId: string }) => boolean) | null = null;
-
-  const mockVitest = {
-    config: { root: rootDir, watch: true },
-    projects: [mockProject],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: (cb: (spec: { moduleId: string }) => boolean) => {
-      filterCallback = cb;
-    },
-  };
-
-  return {
-    vitest: mockVitest,
-    project: mockProject,
-    projectConfig,
-    getFilterCallback: () => filterCallback,
-  };
-}
-
-async function runHook(
-  plugin: ReturnType<typeof vitestAffected>,
-  vitest: ReturnType<typeof createWatchMockContext>['vitest'],
-  project: ReturnType<typeof createWatchMockContext>['project'],
-): Promise<void> {
-  const hook = (plugin as Record<string, unknown>).configureVitest as (ctx: {
-    vitest: typeof vitest;
-    project: typeof project;
-  }) => Promise<void>;
-  await hook({ vitest, project });
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -137,14 +87,14 @@ describe('watch mode: pass-through filter', () => {
     reverse.set(mainTs, new Set([mainTestTs]));
     saveCacheSync(cacheDir, reverse);
 
-    const { vitest, project, getFilterCallback } = createWatchMockContext(tmpDir);
+    const { vitest, project, getFilterCallback } = createMockContext(tmpDir, { watch: true });
 
     const plugin = vitestAffected({
       changedFiles: [],
       cache: true,
     });
 
-    await runHook(plugin, vitest, project);
+    await runHook(plugin, { vitest, project });
 
     // The callback should have been registered
     expect(getFilterCallback()).not.toBeNull();
@@ -177,7 +127,7 @@ describe('watch mode: pass-through filter', () => {
     };
 
     const plugin = vitestAffected({ changedFiles: [], cache: true });
-    const hook = (plugin as Record<string, unknown>).configureVitest as (ctx: {
+    const hook = (plugin as unknown as Record<string, unknown>).configureVitest as (ctx: {
       vitest: typeof mockVitest;
       project: typeof mockProject;
     }) => Promise<void>;
@@ -194,10 +144,10 @@ describe('watch mode: pass-through filter', () => {
     reverse.set(mainTs, new Set([mainTestTs]));
     saveCacheSync(cacheDir, reverse);
 
-    const { vitest, project, getFilterCallback } = createWatchMockContext(tmpDir);
+    const { vitest, project, getFilterCallback } = createMockContext(tmpDir, { watch: true });
 
     const plugin = vitestAffected({ changedFiles: [], cache: true });
-    await runHook(plugin, vitest, project);
+    await runHook(plugin, { vitest, project });
 
     const filter = getFilterCallback();
     expect(filter).not.toBeNull();

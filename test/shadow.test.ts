@@ -1,18 +1,17 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import {
-  mkdirSync,
-  mkdtempSync,
-  writeFileSync,
-  rmSync,
-  readFileSync,
-  existsSync,
-  realpathSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
+import {
+  createMockContext,
+  runHook,
+  readStats,
+  lastStat,
+  makeTempDir,
+  cleanupTempDirs,
+} from './_helpers.js';
 
 const tempDirs: string[] = [];
 
@@ -37,10 +36,7 @@ afterEach(() => {
     if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
     else delete process.env[k];
   }
-  for (const dir of tempDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-  }
-  tempDirs.length = 0;
+  cleanupTempDirs(tempDirs);
 });
 
 // ---------------------------------------------------------------------------
@@ -56,11 +52,7 @@ function setupProject(withCache: boolean): {
   mainPath: string;
   testPath: string;
 } {
-  // realpathSync: os.tmpdir() sits behind a symlink on macOS (/var -> /private/var);
-  // the plugin canonicalizes all paths, so the fixture's expected literals must be
-  // canonical too or every comparison diverges by symlink alias.
-  const tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-shadow-')));
-  tempDirs.push(tmpDir);
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-shadow-');
 
   mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
   mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
@@ -81,56 +73,6 @@ function setupProject(withCache: boolean): {
   }
 
   return { tmpDir, mainPath, testPath };
-}
-
-/** Mock { vitest, project } context; returns the mutable projectConfig too. */
-function createMockContext(
-  rootDir: string,
-  overrides: {
-    include?: string[];
-    projects?: unknown[];
-    root?: unknown;
-  } = {},
-) {
-  const projectConfig = {
-    include: overrides.include ?? ['tests/**/*.test.ts'],
-    exclude: [] as string[],
-    setupFiles: [] as string[],
-  };
-  const mockProject = { config: projectConfig };
-  const mockVitest = {
-    config: { root: 'root' in overrides ? overrides.root : rootDir, watch: false },
-    projects: overrides.projects ?? [mockProject],
-    reporters: [] as unknown[],
-    onFilterWatchedSpecification: () => {},
-  };
-  return { vitest: mockVitest, project: mockProject, projectConfig };
-}
-
-/** Invoke the configureVitest hook against a mock context. */
-async function runHook(
-  plugin: ReturnType<typeof vitestAffected>,
-  ctx: { vitest: unknown; project: unknown },
-): Promise<void> {
-  const hook = (plugin as Record<string, unknown>).configureVitest as (
-    c: { vitest: unknown; project: unknown },
-  ) => Promise<void>;
-  await hook(ctx);
-}
-
-/** Parse every JSON line of a stats file. */
-function readStats(statsFile: string): Array<Record<string, unknown>> {
-  if (!existsSync(statsFile)) return [];
-  return readFileSync(statsFile, 'utf-8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
-}
-
-function lastStat(statsFile: string): Record<string, unknown> {
-  const lines = readStats(statsFile);
-  return lines[lines.length - 1];
 }
 
 // ---------------------------------------------------------------------------

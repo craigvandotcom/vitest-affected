@@ -6,6 +6,7 @@
  * tree-shakeable library export.
  */
 import { bfsAffectedTestsWithProvenance } from './selector.js';
+import type { ReverseMap } from './graph/types.js';
 
 /**
  * Default test-file matcher used by the CLI in place of the project's Vitest
@@ -33,7 +34,7 @@ export interface ExplainResult {
 export function explainSelection(
   testFile: string,
   seeds: string[],
-  reverse: Map<string, Set<string>>,
+  reverse: ReverseMap,
   isTestFile: (p: string) => boolean = (p) => DEFAULT_TEST_MATCHER.test(p),
 ): ExplainResult {
   if (!isTestFile(testFile)) {

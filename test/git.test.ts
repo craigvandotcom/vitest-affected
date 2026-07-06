@@ -240,4 +240,29 @@ describe('getChangedFiles', () => {
     // old.ts no longer exists → deleted
     expect(result.deleted).toContain(path.join(dir, 'old.ts'));
   });
+
+  // 13. COMMITTED rename (ref-based): both old and new path must surface.
+  // git's DEFAULT rename detection collapses a committed A→B rename into a single
+  // --name-only entry showing only the NEW path, so the OLD path would never enter
+  // `deleted` and its cached `old → [tests]` reverse edges would never seed BFS —
+  // a silent under-selection. `--no-renames` splits the rename back into A + D.
+  // Regression guard for the committed-diff path (the staged path was already
+  // covered by test 10, which exercises the working tree, not ref...HEAD).
+  test('committed rename surfaces BOTH old (deleted) and new (changed) paths', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'renamed-old.ts'), 'export const x = 1;\n');
+    await git(['add', 'renamed-old.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Rename AND commit it, so the change is committed (not in the working tree).
+    await git(['mv', 'renamed-old.ts', 'renamed-new.ts'], dir);
+    await git(['commit', '-m', 'rename'], dir);
+
+    // ref points BEFORE the rename → the committed diff HEAD~1...HEAD is the rename.
+    const result = await getChangedFiles(dir, 'HEAD~1');
+    // new path exists on disk → changed/added
+    expect(result.changed).toContain(path.join(dir, 'renamed-new.ts'));
+    // old path no longer exists → deleted (this is what default rename detection drops)
+    expect(result.deleted).toContain(path.join(dir, 'renamed-old.ts'));
+  });
 });
