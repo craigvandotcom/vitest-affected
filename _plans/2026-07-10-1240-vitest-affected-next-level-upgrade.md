@@ -1,7 +1,8 @@
 ---
-status: refined
+status: loop-ready
 refinement_rounds: 4
 refinement_tier: medium
+plan_clean_rounds: 3
 source_backlog: none (born from 2026-07-09/10 correctness-audit conversation)
 approved_at: 2026-07-10
 ---
@@ -14,7 +15,7 @@ Take vitest-affected from "good heuristic" to "trustworthy sole merge gate" now 
 affected-only per merge with ONE full suite at end of ac-loop. Close BCA's ~27 unguarded
 blind-channel targets (~24 converted to `?raw` static imports; the 3 whole-tree scanner tests
 always-run via a new minimal `alwaysRunTests` plugin option — 1.6s combined), fix the builder
-query-strip gap, regression-pin the unpinned behaviors, verify the SHA-anchor monitoring wiring
+query-handling gap, regression-pin the unpinned behaviors, verify the SHA-anchor monitoring wiring
 (landed as `ebabefa8`, 2026-07-10), and add a checkpoint-freshness gate to ac-publish (ancestor +
 evidence-only-commits semantics). The full `extraDependencies` config-map feature is CUT from this
 wave (user decision 2026-07-10 after round-2 evidence); its completed design is banked in
@@ -114,7 +115,7 @@ extraDependencies design — see Decision Log #11; retained as its record):
 - Every one of BCA's ~27 blind-channel targets is closed: editing a formerly-invisible dependency
   either selects its test via a real (`?raw`) import edge, or the test is in `alwaysRunTests` and
   runs regardless — proven by tests.
-- The audit-ranked unpinned behaviors have regression tests (6 audit pins + query-strip pin).
+- The audit-ranked unpinned behaviors have regression tests (6 audit pins + query-handling pin).
 - BCA's loop-close full run produces `shadow-selective` checkpoints over real batch diffs.
 - ac-publish refuses when any real (non-evidence) commit landed after the last checkpoint, and
   finds the existing loop-close run instead of redundantly re-firing.
@@ -123,7 +124,7 @@ extraDependencies design — see Decision Log #11; retained as its record):
 
 ## Technical Specification
 
-### A. Plugin: `alwaysRunTests` + builder query-strip (vitest-affected)
+### A. Plugin: `alwaysRunTests` + builder query-handling (vitest-affected)
 
 **CUT (user decision 2026-07-10):** the full `extraDependencies` config map. Replaced by the
 minimal option actually needed once `?raw` conversions cover the single-file targets:
@@ -143,30 +144,32 @@ alwaysRunTests?: string[];
 ```
 
 Data flow (two small, independent changes):
-1. **alwaysRunTests union** — at selection finalization, covering BOTH selective-path
-   `project.config.include` write sites (round-3 Builder, Critical: plugin.ts:993 — the
-   `allowNoTests` zero-affected branch — AND plugin.ts:1060 — the normal `validTests > 0`
-   branch; union before whichever writes). Canonicalize each configured path
-   (`toCanonicalPath(path.isAbsolute(p) ? p : path.resolve(rootDir, p))` — same boundary as
-   `options.changedFiles` at plugin.ts:780-782), verify on-disk existence (missing → warn +
-   full-suite `reason: 'always-run-config-error'`), union into the selected set (dedup). With
-   `allowNoTests` + zero affected, include becomes exactly the alwaysRun list (not `[]`).
-   Threshold interaction (round-3 Breaker, documented as INTENTIONAL): threshold evaluates at
-   plugin.ts:1020-1033 BEFORE the union — alwaysRunTests entries are exempt from the ratio check
-   (a bounded, user-declared list; exempting it cannot meaningfully change the ratio). The union
-   must also flow through `setSelectedTests` (plugin.ts:1057-1071) — round-3 Breaker High:
-   updating only `include` leaves the selection self-verify heartbeat comparing against the
-   pre-union set, firing a spurious `selection-mismatch` on every run that executes an alwaysRun
-   test. The decision line's `selectedFiles`/`selectedCount` reflect the union; the every-exit
-   one-decision-line contract is unchanged; shadow mode never mutates include. The persisted
-   cache is untouched (this never touches `reverse`).
-2. **builder.ts query handling** — corrected round 3 (Breaker, Critical: naive stripping is
-   self-defeating — post-strip `.css` hits the binary-exclusion list and drops the seed anyway).
-   Correct semantics: when a specifier carries a query suffix (`?raw`/`?url`/…), it is a REAL
-   module import regardless of the underlying extension — strip the query for RESOLUTION but
-   BYPASS `isBinarySpecifier` exclusion for query-suffixed specifiers. Bare `./x.css` stays
-   excluded as before. Small fix + regression pin. This makes `?raw`-converted tests statically
-   seedable in addition to the runtime edge they already get.
+1. **alwaysRunTests union** — at selection finalization. Requirements:
+   - Cover BOTH selective-path `project.config.include` write sites: plugin.ts:993 (the
+     `allowNoTests` zero-affected branch) AND plugin.ts:1060 (the normal `validTests > 0`
+     branch) — union before whichever writes. With `allowNoTests` + zero affected, include
+     becomes exactly the alwaysRun list (never `[]`).
+   - Canonicalize each configured path via
+     `toCanonicalPath(path.isAbsolute(p) ? p : path.resolve(rootDir, p))` — the same boundary
+     as `options.changedFiles` (plugin.ts:780-782).
+   - Verify on-disk existence: missing path → warn + full-suite
+     `reason: 'always-run-config-error'`.
+   - Union with dedup into the selected set.
+   - Threshold (plugin.ts:1020-1033) evaluates BEFORE the union and alwaysRunTests entries are
+     INTENTIONALLY exempt from the ratio check — a bounded, user-declared list cannot
+     meaningfully change the ratio.
+   - The union must also flow through `setSelectedTests` (plugin.ts:1057-1071) — updating only
+     `include` would leave the selection self-verify heartbeat comparing against the pre-union
+     set and fire a spurious `selection-mismatch` on every run that executes an alwaysRun test.
+   - The decision line's `selectedFiles` reflects the union; the every-exit one-decision-line
+     contract is unchanged; shadow mode never mutates include; the persisted cache is untouched
+     (this never touches `reverse`).
+2. **builder.ts query-handling** — a specifier carrying a query suffix (`?raw`/`?url`/…) is a
+   REAL module import regardless of the underlying extension: strip the query for RESOLUTION but
+   BYPASS `isBinarySpecifier` exclusion for query-suffixed specifiers. (Naive stripping alone is
+   self-defeating: post-strip `.css` hits the binary-exclusion list and drops the seed anyway.)
+   Bare `./x.css` stays excluded as before. Small fix + regression pin. This makes
+   `?raw`-converted tests statically seedable in addition to the runtime edge they already get.
 
 Deferred (design banked, Decision Log #11): the full `extraDependencies` config map — per-test
 declared reverse edges, rule matching, copy-on-write effective-map composition, scoped
@@ -175,14 +178,14 @@ demonstrates the need.
 
 ### B. Regression pinning (vitest-affected, tests only)
 
-Pin (6, trimmed round 2 — cross-round consensus cut `require()` and `vi.doMock`: the former pins
-a permanent absence, the latter duplicates the vi.mock boundary suite at runtime.test.ts:567-598):
-barrels/re-exports; tsconfig `paths`/`baseUrl` native resolution; `.json` followed edge;
-plain-quote dynamic import literal + `${}` template skip; shallow-clone guard FIRES (real shallow
-repo); plugin-level lockfile→full-suite e2e decision. Plus one added round 2: query-suffixed
-specifier (`./x.css?raw`) statically seeds after the builder.ts query-strip fix (Section A note).
+Pin 7 behaviors: barrels/re-exports; tsconfig `paths`/`baseUrl` native resolution; `.json`
+followed edge; plain-quote dynamic import literal + `${}` template skip; shallow-clone guard
+FIRES (real shallow repo); plugin-level lockfile→full-suite e2e decision; query-suffixed
+specifier (`./x.css?raw`) statically seeds after the query-handling fix (Section A item 2).
+(`require()` and `vi.doMock` pins were considered and cut — the former pins a permanent absence,
+the latter duplicates the vi.mock boundary suite at runtime.test.ts:567-598.)
 
-### C. BCA wiring — ALREADY LANDED; verify + observe (corrected round 1, Builder Critical)
+### C. BCA wiring — ALREADY LANDED; verify + observe
 
 The wiring shipped in BCA commit `ebabefa8` (2026-07-10 08:45, bead bd-mnj98 — which also engaged
 affected-mode on PR runs): `vitest.config.mts` reads `VITEST_AFFECTED_REF`, `quality-gate.yml`
@@ -192,18 +195,17 @@ Phase 1 is now: verify `ebabefa8` content matches the plan's intent, then observ
 post-wiring loop-close run and confirm its checkpoint line is `shadow-selective` with
 `selectedCount > 0`.
 
-### D. BCA blind-channel closure — per-target decision tree (rescoped round 1, Trimmer Critical)
+### D. BCA blind-channel closure — per-target decision tree
 
 BCA's own 2026-07-05 fixture-trigger audit (`_plans/research/2026-07-05-fixture-trigger-audit.md:123-152`)
 already recommended converting single-file `fs.readFileSync` reads to Vite `?raw` static imports.
-Corrected round 2 (Breaker, verified): vitest-affected tracks these as real edges via the
-RUNTIME path only (normalizeModuleId strips the query at plugin.ts; the edge forms the first time
-the test executes and self-heals from there — the conversion commit itself selects the test as its
-own seed, so no unprotected window). The STATIC seed path currently drops `?raw` specifiers safely
-(extname `.css?raw` bypasses isBinarySpecifier; oxc-resolver errors → `continue` at builder.ts:211)
-— so Phase 2 gains a small plugin fix: strip query suffixes from specifiers in builder.ts before
-classification/resolution, with a regression pin. Consumption is a decision tree per target,
-cheapest mechanism first:
+vitest-affected tracks these as real edges via the RUNTIME path (normalizeModuleId strips the
+query in plugin.ts; the edge forms the first time the test executes and self-heals from there —
+the conversion commit itself selects the test as its own seed, so no unprotected window). The
+STATIC seed path currently drops `?raw` specifiers safely (extname `.css?raw` bypasses
+isBinarySpecifier; oxc-resolver errors → `continue` at builder.ts:211) — Phase 2's query-handling
+fix (Section A item 2) makes them statically seedable too. Consumption is a decision tree per
+target, cheapest mechanism first:
 
 1. **`?raw` static import** (~24 targets, the audit's rows 9-23,25,28,30-32 + convertible
    stragglers): single/few-file raw reads (`lib/db/symptoms.ts`, `app/globals.css`,
@@ -217,7 +219,7 @@ cheapest mechanism first:
 Any target that resists `?raw` conversion in practice joins the `alwaysRunTests` list (bounded,
 visible cost) rather than resurrecting per-target machinery.
 
-### E. ac-publish checkpoint-freshness gate (agent-compounds) — semantics fixed round 1 (Breaker Critical)
+### E. ac-publish checkpoint-freshness gate (agent-compounds)
 
 One bash check inserted into Phase 1a (SKILL.md:79-94), after `RELEASE_SHA` is pinned. Literal
 `.sha == RELEASE_SHA` can NEVER pass: divergence-check.mjs records `sha: GITHUB_SHA` (tested
@@ -226,17 +228,17 @@ commit past the recorded SHA after every legitimate checkpoint. Correct check:
 
 ```bash
 set -euo pipefail   # a git/pathspec failure REFUSES, never silently passes
-# `|| refuse` attached DIRECTLY to each assignment (round-4 Breaker): under set -e a bare
-# VAR=$(cmd) failure aborts before any refuse message — accidentally fail-closed but silent.
-# Attaching the test exempts the assignment from -e and routes through the actionable message.
+# `|| refuse` is attached DIRECTLY to each assignment: under set -e a bare VAR=$(cmd) failure
+# aborts before any refuse message — accidentally fail-closed but silent. Attaching the test
+# exempts the assignment from -e and routes through the actionable message.
 LOG_SHA=$(tail -1 _ci-evidence/vitest-affected-divergence-log.jsonl | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).sha') \
   || refuse "evidence log missing/corrupt"
 # (1) checkpoint must be an ancestor of the release SHA
 git merge-base --is-ancestor "$LOG_SHA" "$RELEASE_SHA" || refuse "checkpoint $LOG_SHA not an ancestor of $RELEASE_SHA"
 # (2) everything after the checkpoint must be evidence-persistence only.
-# ':(exclude)' long-form pathspec — round-3 Breaker reproduced ':!_ci-evidence' throwing
-# "Unimplemented pathspec magic" on git 2.49, and $(…) capture would swallow the error and
-# read empty = pass: the gate would fail OPEN. Long form verified live on BCA's git (round 4).
+# ':(exclude)' long-form pathspec REQUIRED — the ':!' short form throws "Unimplemented pathspec
+# magic" on git 2.49, and $(…) capture would swallow the error and read empty = pass: the gate
+# would fail OPEN. Long form verified live against BCA's git.
 NON_EVIDENCE=$(git log --format='%H' "$LOG_SHA..$RELEASE_SHA" -- . ':(exclude)_ci-evidence' ':(exclude).beads') \
   || refuse "git log pathspec evaluation failed"
 [ -z "$NON_EVIDENCE" ] || refuse "real (non-evidence) commit(s) after checkpoint: $NON_EVIDENCE"
@@ -246,14 +248,20 @@ Missing/empty/corrupt log → refuse (fail-closed). On refusal route to the exis
 fix-and-re-pin loop. Guard the whole check to repos that have the evidence log (BCA only),
 mirroring the existing `quality-gate.yml` existence guard.
 
-**Trust boundary (round-2 Breaker, Critical):** this gate defends against STALENESS, not forgery —
+**Deliverable form:** the gate logic ships as `body-compass-app/scripts/ci/publish-checkpoint-gate.mjs`
+(a standalone, unit-testable Node script mirroring the divergence-check.mjs pattern — the bash
+above is its logic SPEC, not the shipped artifact). ac-publish's SKILL.md Phase 1a inserts a thin
+guarded invocation: if the repo has the script, run it with `--release-sha "$RELEASE_SHA"` and
+treat non-zero exit as refuse. One implementation, no duplicated logic across repos.
+
+**Trust boundary:** this gate defends against STALENESS, not forgery —
 path-scope cannot verify a log line's provenance (routine `.beads/`-only commits are common in BCA
-history, and a hand-edited `_ci-evidence/` commit would pass the path check). Light sanity checks
-added: the last line must parse, carry a non-null `runId`, and its `sha` must be a reachable
-commit. Full provenance (cross-checking `runId` against `gh run view`) is deliberately out of
+history, and a hand-edited `_ci-evidence/` commit would pass the path check). Light sanity checks,
+implemented in the .mjs script (the bash spec above shows only the core ancestry/path checks):
+the last line must parse, carry a non-null `runId`, and its `sha` must be a reachable commit. Full provenance (cross-checking `runId` against `gh run view`) is deliberately out of
 scope — the threat model is agent/script error, not adversarial commits to one's own repo.
 
-**Companion fix (round-2 Builder, High):** the EXISTING Phase 1a lookup
+**Companion fix:** the EXISTING Phase 1a lookup
 `gh run list --workflow=quality-gate.yml --commit "$RELEASE_SHA"` (SKILL.md:87-96) has the same
 exact-SHA flaw this section fixes — `RELEASE_SHA` sits ON TOP of the evidence commit, so the
 lookup can essentially never match the loop-close run and every publish silently re-fires a full
@@ -271,6 +279,10 @@ the checkpoint's SHA (`LOG_SHA`) instead of `RELEASE_SHA`.
 4. Publish-gate script: exit 0 on the normal post-checkpoint state (ancestor + evidence-only
    commits after); exit 1 + actionable message when any real commit landed after the checkpoint,
    on non-ancestry, or on missing/corrupt log (unit-tested against fixture repos/logs).
+5. BCA closure lands end-to-end: the `?raw` conversions merged (spot-checked via
+   `vitest-affected-explain` on a converted target), `alwaysRunTests` present in BCA's config
+   with the 3 scanners, the backlog sketch annotated, and the sibling checkout `ref:`-pinned —
+   i.e. Phase 4's Done-when checks all pass.
 
 ## Test Specifications
 
@@ -279,7 +291,7 @@ test_specs:
   silver_bullet:
     file: 'test/blind-channel-closure.test.ts'
     type: 'Integration'
-    description: 'Both closure mechanisms proven end-to-end: a ?raw-imported file edit selects its test; an alwaysRunTests entry rides every selective run. PREREQUISITES (round-3 Builder): add a raw-importable asset to a fixture (test/fixtures/simple or a new fixture) and extend the integration harness (setupFixture at test/integration.test.ts:44-70 hardcodes plugin config) to accept plugin options'
+    description: 'Both closure mechanisms proven end-to-end: a ?raw-imported file edit selects its test; an alwaysRunTests entry rides every selective run. PREREQUISITES: add a raw-importable asset to a fixture (test/fixtures/simple or a new fixture) and extend the integration harness (setupFixture at test/integration.test.ts:44-70 hardcodes plugin config) to accept plugin options'
     assertions:
       - "Fixture: test T imports data file W via './w.txt?raw' (no other edge); warm cache from a prior run"
       - 'Changing W → selection includes T (the ?raw edge is live)'
@@ -288,7 +300,7 @@ test_specs:
       - 'Without alwaysRunTests: same diff → S NOT selected (proves the union came from the option)'
 
   supporting_tests:
-    - name: 'alwaysRunTests + query-strip unit'
+    - name: 'alwaysRunTests + query-handling unit'
       file: 'test/blind-channel-closure.test.ts'
       type: 'Unit'
       cases:
@@ -310,7 +322,7 @@ test_specs:
         - "plain-quote import('./x') captured; `${expr}` template skipped"
         - 'shallow clone + ref → throws the shallow-clone error (guard FIRES, real shallow repo)'
         - 'changed package-lock.json → full-suite decision at plugin level'
-        - "query-suffixed specifier './x.css?raw' resolves to the real file in static seeding (post query-strip fix)"
+        - "query-suffixed specifier './x.css?raw' resolves to the real file in static seeding (post query-handling fix)"
     - name: 'Publish-gate script'
       file: 'body-compass-app scripts/ci/publish-checkpoint-gate.mjs (+ inline tests or smoke)'
       type: 'Unit'
@@ -332,27 +344,32 @@ loop-close run.
 `decisionAction: "shadow-selective"` and `selectedCount > 0` (or a documented legitimate
 full-suite reason), and the run logged `[shadow-anchor] diff base = last checkpoint <sha>`.
 
-### Phase 2: alwaysRunTests option + builder query-strip (vitest-affected)
-Option type + JSDoc, selection-finalization union, fail-closed missing-path handling; specifier
-query-strip in builder.ts.
+### Phase 2: alwaysRunTests option + builder query-handling (vitest-affected)
+Option type + JSDoc, selection-finalization union (both write sites + setSelectedTests),
+fail-closed missing-path handling; specifier query-handling in builder.ts. Includes the test
+prerequisites the Silver Bullet depends on: a raw-importable fixture asset and integration-harness
+plugin-option injection (see Test Specifications).
 **Done when:** Silver Bullet + unit specs green; full quality gate green.
 
 ### Phase 3: Regression pinning (vitest-affected)
-The 7 pinned behaviors above (6 audit pins post-trim + the query-strip pin).
+The 7 pinned behaviors above (6 audit pins post-trim + the query-handling pin).
 **Done when:** all new tests green AND each new test demonstrably fails when its pinned mechanism
 is reverted (spot-check via temporary mutation during review).
 
 ### Phase 4: Merge plugin → then BCA blind-channel closure (ORDERING HARD CONSTRAINT for 4b)
 4a. Convert the ~24 single-file fs-read targets to `?raw` static imports (BCA-side, per the
 2026-07-05 audit's candidate rows — NO plugin dependency, can start before Phases 2-3 merge).
-4b. After vitest-affected main has the option (BCA CI builds sibling dist from main HEAD): add
-`alwaysRunTests` with the 3 whole-tree scanners (+ any 4a stragglers). Also annotate
-`_backlog/intelligent-test-selection.md:227`'s old inverted
-sketch as superseded by this plan (round-1 Builder High — one API shape in the pipeline), and PIN
-the sibling checkout (round-2 Breaker High): `quality-gate.yml`'s vitest-affected checkout gets an
-explicit `ref:` recorded in BCA (the SHA its config was validated against, bumped deliberately) —
-today it builds main HEAD at checkout time, so a BCA PR can silently retest against a different
-plugin commit between pushes. (Longer-term: npm-versioned dependency per `_plans/publicize-plugin.md`.)
+4b. After vitest-affected main has the option (BCA CI builds sibling dist from main HEAD), three
+deliverables:
+   - Add `alwaysRunTests` to BCA's vitest.config.mts with the 3 whole-tree scanners (+ any 4a
+     stragglers).
+   - Annotate `_backlog/intelligent-test-selection.md:227`'s old inverted sketch as superseded
+     by this plan — one API shape in the pipeline.
+   - PIN the sibling checkout: `quality-gate.yml`'s vitest-affected checkout gets an explicit
+     `ref:` recorded in BCA (the SHA its config was validated against, bumped deliberately) —
+     today it builds main HEAD at checkout time, so a BCA PR can silently retest against a
+     different plugin commit between pushes. (Longer-term: npm-versioned dependency per
+     `_backlog/publicize-plugin.md`.)
 **Done when:** BCA quality gate green; changing `app/globals.css` locally selects
 `globals-css-light-mode.test.ts` (via `?raw` edge after a full run, shown by
 `vitest-affected-explain` or a selective run); a selective run on an unrelated diff includes the
@@ -376,8 +393,8 @@ run (no redundant full-run fire).
 |---|---|
 | `?raw` conversion changes test semantics (content served by Vite transform vs raw disk read) | Per-file review during 4a; any test where the loaded content differs (e.g. needs untransformed bytes) stays on the alwaysRunTests list instead |
 | alwaysRunTests list rots (scanner test renamed) | Fail-closed: missing path → warn + full suite (3 entries, consumer's own config — rare and loud) |
-| Cold-cache window on a `?raw` edge (edge forms at first executed run) | Self-healing: the conversion commit selects the test as its own seed; query-strip fix makes static seeding work too |
-| Cross-repo ordering mistake | Phase 4 ordering is explicit; wrong order fails loudly at BCA TS gate (constraint 7 evidence) |
+| Cold-cache window on a `?raw` edge (edge forms at first executed run) | Self-healing: the conversion commit selects the test as its own seed; query-handling fix makes static seeding work too |
+| Cross-repo ordering mistake | Phase 4 ordering is explicit; wrong order fails loudly at BCA TS gate (see the cross-repo ordering bullet in Context & Research) |
 | Publish gate false-positives (log updated by CI push racing local main) | Gate compares against `RELEASE_SHA` pinned at publish start; failure path is the existing re-pin loop |
 | Shadow/stats contract break | every-exit tests already pin the contract; new early-return emits one line (spec'd) |
 
@@ -418,7 +435,7 @@ run (no redundant full-run fire).
     complete extraDependencies design (Assumptions 1-4: rule-matching semantics, per-run in-memory
     recompute, scoped fail-closed, literal keys; plus the round-1 copy-on-write composeLookup spec
     and the three call-site enumeration) is recorded in this document and buildable later if a
-    published-plugin consumer (see `_plans/publicize-plugin.md`) demonstrates the need. Trigger to
+    published-plugin consumer (see `_backlog/publicize-plugin.md`) demonstrates the need. Trigger to
     revisit: a real consumer with fs-read tests they cannot restructure to `?raw`.
 
 ## Phased Rollout
@@ -432,7 +449,7 @@ Restructured round 2 (cross-round consensus):
 
 ## Dependencies / Blockers
 
-- No new libraries (alwaysRunTests is a union + existsSync; query-strip is string handling).
+- No new libraries (alwaysRunTests is a union + existsSync; query-handling is string handling).
 - Merge-conflict watch: open bead `va-hygiene-20260706-deferred-wlm.1` ("refactor configureVitest
   into a staged discriminated-result pipeline") touches the same function Phase 2 edits —
   coordinate or sequence the bead behind this wave.
@@ -470,7 +487,7 @@ consumption PR; publish-gate script unit cases; first real loop-close checkpoint
 - **Changes:** 7 applied (1 Critical, 4 High, 2 cross-round consensus)
 - **Key fixes:** Gate trust boundary documented + sanity checks (staleness, not forgery — .beads-only
   commits are routine). ?raw claim corrected: runtime-path-only today; Phase 2 gains the builder.ts
-  query-strip fix + pin. extraDependencyConfigErrors added to the decision line (autonomous-loop
+  query-handling fix + pin. extraDependencyConfigErrors added to the decision line (autonomous-loop
   visibility). Existing ac-publish Phase 1a lookup repointed to LOG_SHA (same exact-SHA flaw as the
   gate, found in neighboring code). Sibling checkout pinned (ref: in quality-gate.yml). Wave split:
   chores (1, 5, 4a) vs feature wave (2-3 → 4b). require()/vi.doMock pins cut (cross-round).
@@ -482,7 +499,7 @@ consumption PR; publish-gate script unit cases; first real loop-close checkpoint
 ### Design decision (user, 2026-07-10, between rounds 2 and 3)
 
 - **extraDependencies CUT; design banked (Decision Log #11).** Wave rescoped: `?raw` conversions
-  (~24) + minimal `alwaysRunTests` option (3 scanners, 1.6s) + query-strip fix + pins + gate.
+  (~24) + minimal `alwaysRunTests` option (3 scanners, 1.6s) + query-handling fix + pins + gate.
   Plan sections rewritten accordingly (Summary, A, D, Outcome, specs, Phases 2/4, Risks).
 
 ### Round 3 (Medium: Builder, Breaker, Trimmer — 3x Opus, on the rescoped plan)
