@@ -1,5 +1,7 @@
 ---
-status: loop-ready
+status: beadified
+beadified_at: 2026-07-10
+epic: va-pw0
 refinement_rounds: 4
 refinement_tier: medium
 plan_clean_rounds: 3
