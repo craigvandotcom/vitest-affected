@@ -398,3 +398,130 @@ describe('new Worker(new URL(...)) extraction (T2b)', () => {
     expect(newTargets.some(t => t.endsWith('worker.ts'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regression pins — the 4 statics-seeding mechanisms below already work in
+// src/graph/builder.ts but had zero direct coverage. Each block pins one
+// mechanism, and each was validated by temporarily disabling the mechanism
+// (test observed RED) and restoring it (test observed GREEN), so a regression
+// in any of them cannot pass silently.
+// ---------------------------------------------------------------------------
+
+describe('barrel / re-export seed edges', () => {
+  test('export * from and export { x } from both produce seed edges', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-barrel-'));
+    tempDirs.push(tmpDir);
+    const barrelFile = path.join(tmpDir, 'barrel.ts');
+    const starTargetFile = path.join(tmpDir, 'star-target.ts');
+    const namedTargetFile = path.join(tmpDir, 'named-target.ts');
+    const source = `export * from './star-target';\nexport { thing } from './named-target';\n`;
+    writeFileSync(barrelFile, source);
+    writeFileSync(starTargetFile, 'export const starThing = 1;\n');
+    writeFileSync(namedTargetFile, 'export const thing = 1;\n');
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(barrelFile, source, tmpDir, resolver);
+
+    expect(results.some(r => r.endsWith('star-target.ts'))).toBe(true);
+    expect(results.some(r => r.endsWith('named-target.ts'))).toBe(true);
+    expect(results).toHaveLength(2);
+  });
+});
+
+describe('tsconfig paths/baseUrl resolution', () => {
+  test('an aliased specifier resolves via tsconfig baseUrl + paths', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-tsconfig-paths-'));
+    tempDirs.push(tmpDir);
+    writeFileSync(
+      path.join(tmpDir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: '.',
+          paths: { '@lib/*': ['lib/*'] },
+        },
+      }),
+    );
+    mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
+    const utilFile = path.join(tmpDir, 'lib', 'util.ts');
+    writeFileSync(utilFile, 'export const util = 1;\n');
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const source = `import { util } from '@lib/util';\nexport const x = util;\n`;
+    writeFileSync(entryFile, source);
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith(path.join('lib', 'util.ts'))).toBe(true);
+  });
+});
+
+describe('.json import seed edge', () => {
+  test('importing a .json file (explicit extension) yields a resolved seed edge', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-json-import-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const dataFile = path.join(tmpDir, 'data.json');
+    const source = `import data from './data.json';\nexport const x = data;\n`;
+    writeFileSync(entryFile, source);
+    writeFileSync(dataFile, '{"a":1}\n');
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith('data.json')).toBe(true);
+  });
+
+  // An explicit-extension specifier ('./data.json') resolves through
+  // oxc-resolver regardless of the configured `extensions` list — that list
+  // only participates in EXTENSIONLESS resolution. This sub-test pins the
+  // actual mechanism the resolver's `extensions: [...,'.json']` entry
+  // guards: resolving a bare specifier ('./data') to a sibling .json file.
+  test('extensionless specifier resolves to a sibling .json file via the resolver extensions list', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-json-extensionless-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const dataFile = path.join(tmpDir, 'data.json');
+    const source = `import data from './data';\nexport const x = data;\n`;
+    writeFileSync(entryFile, source);
+    writeFileSync(dataFile, '{"a":1}\n');
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith('data.json')).toBe(true);
+  });
+});
+
+describe('dynamic import literal forms', () => {
+  test('single-quote import() literal is captured', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const source = "const mod = import('./b');\nexport const a = 1;\n";
+    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith('b.ts')).toBe(true);
+  });
+
+  test('double-quote import() literal is captured', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const source = 'const mod = import("./b");\nexport const a = 1;\n';
+    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    expect(results).toHaveLength(1);
+    expect(results[0].endsWith('b.ts')).toBe(true);
+  });
+
+  test('template-literal import() with an expression is skipped (non-resolvable)', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const source = 'const name = "b";\nconst mod = import(`./${name}`);\nexport const a = 1;\n';
+    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    expect(results).toHaveLength(0);
+  });
+});
