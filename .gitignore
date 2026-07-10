@@ -9,3 +9,14 @@ coverage/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Agent harness layer — synced locally from agent-compounds (internal tooling),
+# never published. Public agent context = AGENTS.md/CLAUDE.md + the project skill
+# .claude/skills/vitest-plugin-dev (dev guidance useful to contributors).
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/vitest-plugin-dev/
+.agents/
+.factory/
+.codex/
