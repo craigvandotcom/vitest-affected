@@ -105,6 +105,28 @@ export interface VitestAffectedOptions {
    */
   fullSuiteTriggers?: Array<string | RegExp>;
   /**
+   * Test files that are always unioned into the selected set on every
+   * SELECTIVE run, unconditionally — a bounded, user-declared list for tests
+   * whose dependency surface is effectively the whole tree (repo-wide
+   * scanners, snapshot-everything suites) where no single import edge is
+   * meaningful and the cost of always paying for them is accepted. Each entry
+   * is a path (absolute or rootDir-relative) to a single test file, resolved
+   * and canonicalized exactly like `changedFiles`.
+   *
+   * FAILURE DIRECTION: checked once, right after `rootDir` resolves — if any
+   * entry does not exist on disk, the plugin warns loudly and falls back to
+   * the full suite for that run (reason `always-run-config-error`) rather
+   * than silently dropping the guarantee for a typo'd or moved path.
+   *
+   * The union is applied AFTER the affected/total threshold check — these
+   * entries are intentionally exempt from that ratio gate — but IS reflected
+   * in `project.config.include`, the self-verify heartbeat's selected set
+   * (via `setSelectedTests`), and the decision line's `selectedFiles`. A
+   * no-op on FULL-SUITE decisions (already included by definition) and never
+   * mutates `include` under shadow mode. Default: none (opt-in).
+   */
+  alwaysRunTests?: string[];
+  /**
    * When true, a `selective` DECISION stats line additionally carries an
    * `explain` field: `{ [testPath]: { seed, chain } }` — for every selected
    * test, the changed/deleted seed it was reached from and the full edge chain
@@ -497,6 +519,15 @@ function checkFullSuiteConfigField(
 }
 
 /**
+ * Union the graph-selected tests with the configured alwaysRunTests list,
+ * de-duplicated. Both inputs are already canonicalized, so a plain Set is
+ * sufficient (no path-normalization needed at this join point).
+ */
+function unionAlwaysRun(selected: string[], alwaysRunTests: string[]): string[] {
+  return [...new Set([...selected, ...alwaysRunTests])];
+}
+
+/**
  * Build the `explain` field for a set of selected tests, filtered to the
  * provenance the BFS recorded. Returns undefined when explain is off so the field
  * never appears on default stats lines.
@@ -596,6 +627,31 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // toplevel — a silent under-selection.
         const rootDir = toCanonicalPath(vitest.config.root);
         statsCtx.rootDir = rootDir;
+
+        // 4a. alwaysRunTests missing-path guard. Canonicalize each configured
+        // entry the same way options.changedFiles is (step 6 below) so it
+        // converges with graph keys. A typo'd or moved path must fail closed to
+        // the full suite rather than silently drop the always-run guarantee for
+        // that entry. Its own early-return, separate from the pre-rootDir
+        // workspace/config-shape guards above: this check needs rootDir to
+        // canonicalize relative entries, so it cannot run before rootDir exists.
+        let alwaysRunTests: string[] = [];
+        if (options.alwaysRunTests?.length) {
+          const resolvedAlwaysRun = options.alwaysRunTests.map((p) =>
+            toCanonicalPath(path.isAbsolute(p) ? p : path.resolve(rootDir, p)),
+          );
+          const missing = resolvedAlwaysRun.filter((p) => !existsSync(p));
+          if (missing.length > 0) {
+            console.warn(
+              `[vitest-affected] alwaysRunTests path(s) not found on disk: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
+            );
+            emitStats(statsCtx, 'full-suite', 'always-run-config-error', {
+              durationMs: Date.now() - startMs,
+            });
+            return;
+          }
+          alwaysRunTests = resolvedAlwaysRun;
+        }
 
         // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
         // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
@@ -988,19 +1044,24 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // 14. Threshold check
         if (affectedTests.length === 0) {
           if (options.allowNoTests) {
+            // Union in alwaysRunTests: with zero BFS-affected tests, include
+            // must become exactly the alwaysRun list — never [] — when the
+            // option is configured.
+            const selected = unionAlwaysRun([], alwaysRunTests);
             // Shadow guards the mutation site: compute the decision, never apply it.
             if (!shadow) {
-              project.config.include = [];
-              // Record the (empty) selected set so self-verify catches a future
-              // Vitest that runs everything on an empty include.
-              setSelectedTests([]);
+              project.config.include = selected;
+              // Record the selected set so self-verify catches a future Vitest
+              // that runs something outside it (an empty include, or a run
+              // that ignores the alwaysRunTests union).
+              setSelectedTests(selected);
             }
             emitStats(statsCtx, 'selective', 'allow-no-tests', {
               changedFiles: changed.length, deletedFiles: deleted.length,
               ignoredFiles: ignoredCount,
               affectedTests: 0, totalTests: testFiles.length,
               graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-              selectedFiles: [],
+              selectedFiles: selected,
               explain: buildExplain([], options.explain, provenance),
             });
             return;
@@ -1017,6 +1078,9 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           return;
         }
 
+        // alwaysRunTests entries are intentionally exempt from this ratio check —
+        // they are a bounded, user-declared list unioned in only after this
+        // decision, not part of the graph-driven affected count it gates.
         const ratio = affectedTests.length / testFiles.length;
         const threshold = options.threshold ?? 1.0;
         if (ratio > threshold) {
@@ -1055,18 +1119,20 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 17. Apply results
         if (validTests.length > 0) {
+          // Union in alwaysRunTests, de-duplicated against the BFS-selected set.
+          const selected = unionAlwaysRun(validTests, alwaysRunTests);
           // Shadow guards the mutation site: compute the selection, never apply it.
           if (!shadow) {
-            project.config.include = validTests;
+            project.config.include = selected;
             // Record the selected set for the reporter's post-run self-verify.
-            setSelectedTests(validTests);
+            setSelectedTests(selected);
           }
           emitStats(statsCtx, 'selective', undefined, {
             changedFiles: changed.length, deletedFiles: deleted.length,
             ignoredFiles: ignoredCount,
             affectedTests: validTests.length, totalTests: testFiles.length,
             graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            selectedFiles: validTests,
+            selectedFiles: selected,
             explain: buildExplain(validTests, options.explain, provenance),
           });
         } else {

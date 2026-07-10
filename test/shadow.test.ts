@@ -293,6 +293,29 @@ describe('every-exit emission contract', () => {
     expect(lines[0].reason).toBe('no-test-files');
   });
 
+  test('alwaysRunTests missing-path guard emits one line', async () => {
+    const { tmpDir, mainPath } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const original = [...projectConfig.include];
+
+    await runHook(
+      vitestAffected({
+        changedFiles: [mainPath],
+        cache: true,
+        statsFile,
+        alwaysRunTests: [path.join(tmpDir, 'tests', 'does-not-exist.test.ts')],
+      }),
+      { vitest, project },
+    );
+
+    // Full-suite fallback: include is left untouched.
+    expect(projectConfig.include).toEqual(original);
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('always-run-config-error');
+  });
+
   test('catch-all emits reason "error" (stats path resolved above the try)', async () => {
     const { tmpDir } = setupProject(true);
     const statsFile = path.join(tmpDir, 'stats.jsonl');

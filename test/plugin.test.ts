@@ -3,9 +3,18 @@ import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
-import { createMockContext, cleanupTempDirs } from './_helpers.js';
+import {
+  createMockContext,
+  cleanupTempDirs,
+  runHook,
+  readStats,
+  lastStat,
+  createMockTestModule,
+  makeTempDir,
+} from './_helpers.js';
 
 const tempDirs: string[] = [];
 
@@ -188,6 +197,152 @@ describe('fullSuiteTriggers option', () => {
       tmpDir,
     );
     expect(projectConfig.include).toEqual([]);
+  });
+});
+
+/**
+ * Fixture for alwaysRunTests coverage: main.ts → main.test.ts (cached edge),
+ * an orphan.ts with zero dependents (drives the allowNoTests zero-affected
+ * branch), and always.test.ts — a standalone test file with no dependency
+ * edge to anything, standing in for a repo-wide scanner the alwaysRunTests
+ * option is meant to cover.
+ */
+function setupAlwaysRunFixture(): {
+  tmpDir: string;
+  mainPath: string;
+  testPath: string;
+  orphanPath: string;
+  alwaysPath: string;
+} {
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-alwaysrun-');
+
+  mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+  mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
+
+  writeFileSync(path.join(tmpDir, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+  writeFileSync(path.join(tmpDir, 'src', 'main.ts'), 'export const main = 1;\n');
+  writeFileSync(path.join(tmpDir, 'src', 'orphan.ts'), 'export const orphan = 1;\n');
+
+  const testPath = path.join(tmpDir, 'tests', 'main.test.ts');
+  writeFileSync(
+    testPath,
+    'import { main } from "../src/main";\nimport { test, expect } from "vitest";\ntest("main", () => expect(main).toBe(1));\n',
+  );
+
+  const alwaysPath = path.join(tmpDir, 'tests', 'always.test.ts');
+  writeFileSync(
+    alwaysPath,
+    'import { test, expect } from "vitest";\ntest("always", () => expect(1).toBe(1));\n',
+  );
+
+  const cacheDir = path.join(tmpDir, '.vitest-affected');
+  const reverse = new Map<string, Set<string>>();
+  reverse.set(path.join(tmpDir, 'src', 'main.ts'), new Set([testPath]));
+  saveCacheSync(cacheDir, reverse);
+
+  return {
+    tmpDir,
+    mainPath: path.join(tmpDir, 'src', 'main.ts'),
+    testPath,
+    orphanPath: path.join(tmpDir, 'src', 'orphan.ts'),
+    alwaysPath,
+  };
+}
+
+describe('alwaysRunTests option', () => {
+  test('union lands in include and setSelectedTests at the normal write site', async () => {
+    const { tmpDir, mainPath, testPath, alwaysPath } = setupAlwaysRunFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({
+        changedFiles: [mainPath],
+        cache: true,
+        statsFile,
+        alwaysRunTests: [alwaysPath],
+      }),
+      { vitest, project },
+    );
+
+    // Union at the normal write site: the BFS-affected test plus the
+    // always-run entry — both, regardless of order.
+    expect(new Set(projectConfig.include)).toEqual(new Set([testPath, alwaysPath]));
+
+    // The union must also have flowed through setSelectedTests: simulate BOTH
+    // tests running and confirm self-verify does NOT flag the always-run
+    // entry as a stray — it would if setSelectedTests had only recorded the
+    // BFS-affected set.
+    const reporter = (vitest.reporters as Reporter[]).find(
+      (r) => typeof r.onTestRunEnd === 'function',
+    )!;
+    const mainMod = createMockTestModule(testPath, {});
+    const alwaysMod = createMockTestModule(alwaysPath, {});
+    reporter.onTestModuleEnd!(mainMod);
+    reporter.onTestModuleEnd!(alwaysMod);
+    reporter.onTestRunEnd!([mainMod, alwaysMod], [], 'passed' as TestRunEndReason);
+
+    const mismatches = readStats(statsFile).filter((l) => l.reason === 'selection-mismatch');
+    expect(mismatches).toHaveLength(0);
+
+    // The same union is reflected in the decision line's selectedFiles —
+    // surfaced only under shadow mode (writeStatsLine strips it otherwise) —
+    // so re-run in shadow against the same cache-backed fixture to observe it.
+    const shadowStatsFile = path.join(tmpDir, 'shadow-stats.jsonl');
+    const shadowCtx = createMockContext(tmpDir);
+    await runHook(
+      vitestAffected({
+        shadow: true,
+        changedFiles: [mainPath],
+        cache: true,
+        statsFile: shadowStatsFile,
+        alwaysRunTests: [alwaysPath],
+      }),
+      { vitest: shadowCtx.vitest, project: shadowCtx.project },
+    );
+    expect(lastStat(shadowStatsFile).selectedFiles).toEqual(
+      expect.arrayContaining([testPath, alwaysPath]),
+    );
+  });
+
+  test('allowNoTests + zero affected + alwaysRunTests: include becomes the alwaysRun list, not []', async () => {
+    const { tmpDir, orphanPath, alwaysPath } = setupAlwaysRunFixture();
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({
+        allowNoTests: true,
+        changedFiles: [orphanPath],
+        cache: true,
+        alwaysRunTests: [alwaysPath],
+      }),
+      { vitest, project },
+    );
+
+    expect(projectConfig.include).toEqual([alwaysPath]);
+  });
+
+  test('a missing alwaysRunTests path falls back to the full suite with reason always-run-config-error', async () => {
+    const { tmpDir, mainPath } = setupAlwaysRunFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const originalInclude = [...projectConfig.include];
+
+    await runHook(
+      vitestAffected({
+        changedFiles: [mainPath],
+        cache: true,
+        statsFile,
+        alwaysRunTests: [path.join(tmpDir, 'tests', 'does-not-exist.test.ts')],
+      }),
+      { vitest, project },
+    );
+
+    // Full-suite fallback: include is left untouched.
+    expect(projectConfig.include).toEqual(originalInclude);
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('always-run-config-error');
   });
 });
 
