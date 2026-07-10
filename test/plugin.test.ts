@@ -644,3 +644,36 @@ describe('symlinked rootDir canonicalization', () => {
     expect(projectConfig.include).toEqual([canonicalTest]);
   });
 });
+
+describe('lockfile change → full suite (regression pin)', () => {
+  // CONFIG_BASENAMES (src/plugin.ts) includes package-lock.json: a lockfile
+  // change affects the entire dependency tree, invisible to the import graph,
+  // so it must force a full-suite run rather than selective BFS. Asserted
+  // end-to-end through configureVitest (not just changed-files.test.ts's
+  // filter-preservation coverage) so the decision line itself — reason
+  // config-change — is pinned, mirroring the fullSuiteTriggers describe above.
+  test('a changed package-lock.json produces a full-suite decision with reason config-change', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const lockPath = path.join(tmpDir, 'package-lock.json');
+    writeFileSync(lockPath, '{"name":"fixture","lockfileVersion":3}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const originalInclude = [...projectConfig.include];
+
+    await runHook(
+      vitestAffected({
+        changedFiles: [lockPath],
+        cache: true,
+        statsFile,
+      }),
+      { vitest, project },
+    );
+
+    // config-change short-circuits before selection ever runs — include is
+    // left untouched (the full suite the caller's own config.include already
+    // describes), not overwritten with an empty or partial selection.
+    expect(projectConfig.include).toEqual(originalInclude);
+    expect(lastStat(statsFile).reason).toBe('config-change');
+  });
+});
