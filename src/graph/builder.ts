@@ -19,6 +19,24 @@ function isBinarySpecifier(specifier: string): boolean {
 }
 
 /**
+ * Strips a Vite query suffix (`?raw`, `?url`, `?inline`, ...) from a
+ * specifier for resolution purposes. oxc-resolver has no notion of Vite's
+ * query-string module variants — it can only resolve the bare on-disk path
+ * (`./x.css`), never the suffixed form (`./x.css?raw`) — so the suffix must
+ * be stripped before every `resolver.sync` call.
+ *
+ * Splitting on the FIRST `?` (not the last) matches URL semantics: a
+ * specifier can only have one query component, and everything from that
+ * point on — including any further `?`/`#` characters a pathological query
+ * value might contain — belongs to it.
+ */
+function stripQuerySuffix(specifier: string): { bare: string; hadQuery: boolean } {
+  const queryIndex = specifier.indexOf('?');
+  if (queryIndex === -1) return { bare: specifier, hadQuery: false };
+  return { bare: specifier.slice(0, queryIndex), hadQuery: true };
+}
+
+/**
  * Matches `new Worker(new URL('./specifier', import.meta.url))` and
  * `new SharedWorker(new URL('./specifier', import.meta.url))` — a
  * NewExpression construct that oxc-parser's staticImports/dynamicImports/
@@ -149,7 +167,6 @@ export function resolveFileImports(
   // Static imports — skip type-only
   for (const imp of mod.staticImports) {
     if (imp.entries.length > 0 && imp.entries.every(e => e.isType)) continue;
-    if (isBinarySpecifier(imp.moduleRequest.value)) continue;
     specifiers.push(imp.moduleRequest.value);
   }
 
@@ -160,9 +177,7 @@ export function resolveFileImports(
       const specifier = raw.slice(1, -1);
       // Skip template literals with expressions — non-resolvable
       if (specifier.includes('${')) continue;
-      if (!isBinarySpecifier(specifier)) {
-        specifiers.push(specifier);
-      }
+      specifiers.push(specifier);
     }
   }
 
@@ -170,9 +185,7 @@ export function resolveFileImports(
   for (const exp of mod.staticExports) {
     for (const entry of exp.entries) {
       if (entry.moduleRequest && !entry.isType) {
-        if (!isBinarySpecifier(entry.moduleRequest.value)) {
-          specifiers.push(entry.moduleRequest.value);
-        }
+        specifiers.push(entry.moduleRequest.value);
       }
     }
   }
@@ -192,9 +205,7 @@ export function resolveFileImports(
   // vi.importActual BY-DESIGN edge-presence note in runtime-merge.ts: static
   // parsing seeds, runtime observation is the source of truth.
   for (const specifier of extractWorkerSpecifiers(source)) {
-    if (!isBinarySpecifier(specifier)) {
-      specifiers.push(specifier);
-    }
+    specifiers.push(specifier);
   }
 
   const dir = path.dirname(file);
@@ -207,7 +218,16 @@ export function resolveFileImports(
   const rootPrefix = canonicalRoot.endsWith('/') ? canonicalRoot : canonicalRoot + '/';
 
   for (const specifier of specifiers) {
-    const result = resolver.sync(dir, specifier);
+    // A Vite query suffix (`?raw`, `?url`, ...) marks a genuine module
+    // import regardless of the underlying extension — e.g. './x.css?raw'
+    // is a real import Vite will serve, unlike a bare './x.css' stylesheet
+    // import (excluded below as a binary/non-JS asset). Bypass the binary
+    // exclusion for query-suffixed specifiers, but ALWAYS resolve the bare
+    // (query-stripped) path — oxc-resolver has no notion of Vite's query
+    // variants and fails to resolve the suffixed form outright.
+    const { bare, hadQuery } = stripQuerySuffix(specifier);
+    if (!hadQuery && isBinarySpecifier(bare)) continue;
+    const result = resolver.sync(dir, bare);
     if (result.error) continue;
     if (!result.path) continue;
     // Canonicalize resolver output (memoized — repeated deps cost one realpath)

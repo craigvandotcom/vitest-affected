@@ -74,6 +74,43 @@ describe('resolveFileImports', () => {
     expect(results).toHaveLength(0);
   });
 
+  test('bare .css import (no query suffix) is still excluded as binary', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-bare-css-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const source = `import './x.css';\nexport const a = 1;\n`;
+    writeFileSync(entryFile, source);
+    writeFileSync(path.join(tmpDir, 'x.css'), 'body { color: red; }\n');
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    expect(results).toHaveLength(0);
+  });
+
+  test('query-suffixed specifiers (?raw, ?url) resolve to the real on-disk files, bypassing binary exclusion', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-query-suffix-'));
+    tempDirs.push(tmpDir);
+    const entryFile = path.join(tmpDir, 'entry.ts');
+    const cssFile = path.join(tmpDir, 'x.css');
+    const tsFile = path.join(tmpDir, 'y.ts');
+    const source = `import css from './x.css?raw';\nimport url from './y.ts?url';\nexport const a = 1;\n`;
+    writeFileSync(entryFile, source);
+    writeFileSync(cssFile, 'body { color: red; }\n');
+    writeFileSync(tsFile, 'export const y = 1;\n');
+
+    const resolver = createResolver(tmpDir);
+    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    // '.css?raw' must resolve to the real x.css file — binary exclusion is
+    // bypassed because the query suffix marks it as a genuine Vite module
+    // import, and the query is stripped before resolution so oxc-resolver
+    // can find the file on disk.
+    expect(results.some(r => r.endsWith('x.css'))).toBe(true);
+    // '.ts?url' must resolve to the real y.ts file — the query is stripped
+    // before resolution (oxc-resolver cannot resolve a suffixed specifier).
+    expect(results.some(r => r.endsWith('y.ts'))).toBe(true);
+    expect(results).toHaveLength(2);
+  });
+
   test('.js extension imports resolve to .ts files (ESM convention)', () => {
     const simpleDir = fixtureDir('simple');
     const resolver = createResolver(simpleDir);
