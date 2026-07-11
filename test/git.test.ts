@@ -303,4 +303,42 @@ describe('getChangedFiles', () => {
     expect(result.changed).toContain(realpathSync(path.join(dir, 'shifty.ts')));
     expect(result.deleted).not.toContain(realpathSync(path.join(dir, 'shifty.ts')));
   });
+
+  // 15. Shallow-clone guard FIRES (regression pin). Counterpart to test 12
+  // above (which pins the guard's non-firing path on a normal repo): this
+  // pins the guard's actual firing path on a GENUINELY shallow clone. A
+  // `git clone --depth 1` of an origin with >=2 commits is truncated history
+  // (a 1-commit origin would clone whole and never be shallow), so the clone
+  // is verified shallow before asserting. With a ref supplied, getChangedFiles
+  // must throw the loud `vitest-affected: shallow clone detected` error rather
+  // than attempt (and silently botch) a ref-based diff it cannot compute.
+  test('shallow-clone guard fires: getChangedFiles throws on a genuinely shallow clone when a ref is provided', async () => {
+    // Origin repo with two commits so a --depth 1 clone truncates real history.
+    const origin = await makeTempRepo();
+    writeFileSync(path.join(origin, 'a.ts'), 'export const a = 1;\n');
+    await git(['add', 'a.ts'], origin);
+    await git(['commit', '-m', 'first'], origin);
+
+    writeFileSync(path.join(origin, 'a.ts'), 'export const a = 2;\n');
+    await git(['add', 'a.ts'], origin);
+    await git(['commit', '-m', 'second'], origin);
+
+    // Clone parent dir: `git clone` creates the target dir itself, so pass an
+    // as-yet-nonexistent subpath rather than mkdtempSync-ing the clone dir directly.
+    const cloneParent = realpathSync(mkdtempSync(path.join(tmpdir(), 'vitest-affected-shallow-clone-')));
+    tempDirs.push(cloneParent);
+    const clone = path.join(cloneParent, 'clone');
+    await git(['clone', '--depth', '1', `file://${origin}`, clone], cloneParent);
+
+    // Sanity: the clone is genuinely shallow — otherwise this test would pass
+    // for the wrong reason (guard never reached).
+    const { stdout: shallow } = await git(['rev-parse', '--is-shallow-repository'], clone);
+    expect(shallow.trim()).toBe('true');
+
+    // Any ref triggers the guard path — the guard fires before ref resolution
+    // is even attempted (src/git.ts step 2, before step 2b).
+    await expect(getChangedFiles(clone, 'HEAD')).rejects.toThrow(
+      /vitest-affected: shallow clone detected/,
+    );
+  });
 });
