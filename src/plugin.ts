@@ -2,7 +2,7 @@
 import type { Plugin } from 'vite';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule } from 'vitest/node';
-import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
+import { existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'tinyglobby';
 import { deltaParseNewImports } from './graph/builder.js';
@@ -484,6 +484,30 @@ function emitStats(
 }
 
 /**
+ * Resolve a possibly-relative config-supplied path against `rootDir` and
+ * canonicalize it — the shared convergence step so caller-provided paths
+ * (changedFiles, alwaysRunTests, setupFiles/globalSetup entries) land on the
+ * same path identity as every other graph key.
+ */
+function resolveConfigPath(rootDir: string, p: string): string {
+  return toCanonicalPath(path.isAbsolute(p) ? p : path.resolve(rootDir, p));
+}
+
+/**
+ * True when `p` exists on disk AND is a regular file — not a directory or
+ * other non-file entry. Swallows the stat error for a missing path rather
+ * than letting it propagate, since "doesn't exist" and "isn't a file" are
+ * both just "not usable" to every caller.
+ */
+function isExistingFile(p: string): boolean {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Twin-block helper: resolve a `string | string[]` config field
  * (setupFiles/globalSetup) into a canonicalized Set, check it against the RAW
  * changed+deleted set, and on a hit warn + emit the full-suite stats line.
@@ -504,7 +528,7 @@ function checkFullSuiteConfigField(
   const fieldRaw = rawField ?? [];
   const fieldSet = new Set(
     (Array.isArray(fieldRaw) ? fieldRaw : [fieldRaw]).map((f) =>
-      toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
+      resolveConfigPath(rootDir, f),
     ),
   );
   if (rawChanged.some((f) => fieldSet.has(f))) {
@@ -638,12 +662,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         let alwaysRunTests: string[] = [];
         if (options.alwaysRunTests?.length) {
           const resolvedAlwaysRun = options.alwaysRunTests.map((p) =>
-            toCanonicalPath(path.isAbsolute(p) ? p : path.resolve(rootDir, p)),
+            resolveConfigPath(rootDir, p),
           );
-          const missing = resolvedAlwaysRun.filter((p) => !existsSync(p));
+          // Entries must be FILES, not directories or other non-file entries —
+          // a directory would silently never match a single BFS-selected test
+          // and would blow up downstream logic that treats every entry as a
+          // test module path.
+          const missing = resolvedAlwaysRun.filter((p) => !isExistingFile(p));
           if (missing.length > 0) {
             console.warn(
-              `[vitest-affected] alwaysRunTests path(s) not found on disk: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
+              `[vitest-affected] alwaysRunTests path(s) not found or not a file: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
             );
             emitStats(statsCtx, 'full-suite', 'always-run-config-error', {
               durationMs: Date.now() - startMs,
@@ -833,9 +861,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         if (changedFromCaller) {
           // Resolve relative paths to rootDir and canonicalize so caller-provided
           // paths converge with graph keys the same way git-derived ones do.
-          const resolved = options.changedFiles!.map((f) =>
-            toCanonicalPath(path.isAbsolute(f) ? f : path.resolve(rootDir, f)),
-          );
+          const resolved = options.changedFiles!.map((f) => resolveConfigPath(rootDir, f));
           changed = resolved.filter((f) => existsSync(f));
           deleted = resolved.filter((f) => !existsSync(f));
         } else {
@@ -1018,6 +1044,33 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
         })).map((f) => toCanonicalPath(f));
 
+        const testFileSet = new Set(testFiles);
+
+        // 12a. alwaysRunTests membership guard. An entry that exists on disk
+        // but sits outside this project's include/exclude patterns would ride
+        // selective-run unions just fine, but a FULL-SUITE decision runs
+        // project.config.include verbatim — never alwaysRunTests — so that
+        // same entry would silently NOT run whenever the plugin falls back to
+        // the full suite. Validating membership against the glob here keeps
+        // the option's "always runs" guarantee symmetric across both decision
+        // branches, rather than trusting mere on-disk existence (step 4a).
+        // Placed before the no-test-files and BFS steps below consume
+        // testFiles, so an out-of-pattern entry fails closed before either.
+        if (alwaysRunTests.length > 0) {
+          const outsidePatterns = alwaysRunTests.filter((p) => !testFileSet.has(p));
+          if (outsidePatterns.length > 0) {
+            console.warn(
+              `[vitest-affected] alwaysRunTests path(s) not matched by this project's include/exclude patterns: ${outsidePatterns.slice(0, 5).map(safeLabel).join(', ')}${outsidePatterns.length > 5 ? ` (+${outsidePatterns.length - 5} more)` : ''} — running full suite`,
+            );
+            emitStats(statsCtx, 'full-suite', 'always-run-config-error', {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            });
+            return;
+          }
+        }
+
         if (testFiles.length === 0) {
           console.warn(
             '[vitest-affected] No test files matched include patterns — running full suite',
@@ -1029,8 +1082,6 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           });
           return;
         }
-
-        const testFileSet = new Set(testFiles);
 
         // 13. BFS: find affected tests (with provenance — the explain trail).
         // Provenance is always computed (cheap: a parent map + a chain walk per

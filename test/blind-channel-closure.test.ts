@@ -34,6 +34,7 @@ import {
   writeFileSync,
   rmSync,
   realpathSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -153,9 +154,17 @@ async function runVitest(
   }
 }
 
-beforeAll(async () => {
-  await execa('npm', ['run', 'build'], { cwd: projectRoot });
-}, 60_000);
+// dist/ freshness is the quality gate's job (`npm run build`), not this
+// suite's — invoking the build here would race test/integration.test.ts's
+// identical `npm run build` call against the same dist/ output when both
+// files run concurrently. Fail fast with a clear pointer instead.
+beforeAll(() => {
+  if (!existsSync(distPath)) {
+    throw new Error(
+      `dist/index.js not found at ${distPath} — run \`npm run build\` before running this suite.`,
+    );
+  }
+});
 
 describe('Silver Bullet: blind-channel closure end-to-end', () => {
   test(
@@ -511,6 +520,91 @@ describe('Case 7 — a missing alwaysRunTests path warns and falls back to the f
           cache: true,
           statsFile,
           alwaysRunTests: [path.join(tmpDir, 'tests', 'does-not-exist.test.ts')],
+        }),
+        { vitest, project },
+      );
+
+      // Full-suite fallback: include is left untouched.
+      expect(projectConfig.include).toEqual(original);
+
+      expect(warnSpy).toHaveBeenCalled();
+      expect(
+        warnSpy.mock.calls.some((call) => String(call[0]).includes('alwaysRunTests')),
+      ).toBe(true);
+
+      const lines = readStats(statsFile);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].action).toBe('full-suite');
+      expect(lines[0].reason).toBe('always-run-config-error');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Case 8 — a DIRECTORY alwaysRunTests entry warns and falls back to the full suite
+// ---------------------------------------------------------------------------
+
+describe('Case 8 — a directory alwaysRunTests entry warns and falls back to the full suite', () => {
+  test('reason is always-run-config-error: entries must be files, not directories', async () => {
+    const { tmpDir, mainPath } = setupAlwaysRunFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const original = [...projectConfig.include];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await runHook(
+        vitestAffected({
+          changedFiles: [mainPath],
+          cache: true,
+          statsFile,
+          alwaysRunTests: [path.join(tmpDir, 'tests')], // exists, but is a directory
+        }),
+        { vitest, project },
+      );
+
+      // Full-suite fallback: include is left untouched.
+      expect(projectConfig.include).toEqual(original);
+
+      expect(warnSpy).toHaveBeenCalled();
+      expect(
+        warnSpy.mock.calls.some((call) => String(call[0]).includes('alwaysRunTests')),
+      ).toBe(true);
+
+      const lines = readStats(statsFile);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].action).toBe('full-suite');
+      expect(lines[0].reason).toBe('always-run-config-error');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Case 9 — an alwaysRunTests file outside the project's include patterns warns
+// and falls back to the full suite
+// ---------------------------------------------------------------------------
+
+describe("Case 9 — an alwaysRunTests file outside the project's include patterns warns and falls back to the full suite", () => {
+  test('reason is always-run-config-error: an existing file that the include glob never matches fails closed', async () => {
+    const { tmpDir, mainPath } = setupAlwaysRunFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const original = [...projectConfig.include];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await runHook(
+        vitestAffected({
+          changedFiles: [mainPath],
+          cache: true,
+          statsFile,
+          // mainPath exists and is a file, but sits under src/, outside the
+          // default 'tests/**/*.test.ts' include pattern.
+          alwaysRunTests: [mainPath],
         }),
         { vitest, project },
       );
