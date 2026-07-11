@@ -9,7 +9,7 @@
 // documents.
 import { describe, test, expect, afterEach, beforeAll } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execa } from 'execa';
 import { saveCacheSync } from '../src/graph/cache.js';
 import { makeTempDir, cleanupTempDirs } from './_helpers.js';
@@ -31,11 +31,17 @@ function runBin(args: string[], cwd?: string) {
   });
 }
 
-beforeAll(async () => {
-  // dist/ is normally already built by the quality gate; build defensively so a
-  // cold checkout still has the bin this test spawns.
-  await execa('npm', ['run', 'build'], { cwd: projectRoot });
-}, 60_000);
+beforeAll(() => {
+  // dist/ freshness is the quality gate's job (`npm run build` runs first, in
+  // CI and locally) — building here would race the other dist-consuming
+  // suites' identical build calls against the same dist/ output under parallel
+  // file execution. Fail fast with a clear pointer instead.
+  if (!existsSync(BIN)) {
+    throw new Error(
+      `${BIN} not found — run \`npm run build\` before running this suite.`,
+    );
+  }
+});
 
 // ===========================================================================
 // (1) ARGV / EXIT-CODE SURFACE.

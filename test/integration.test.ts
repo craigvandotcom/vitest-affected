@@ -120,9 +120,17 @@ async function runVitest(
   return report;
 }
 
-beforeAll(async () => {
-  await execa('npm', ['run', 'build'], { cwd: projectRoot });
-}, 60_000);
+beforeAll(() => {
+  // dist/ freshness is the quality gate's job (`npm run build` runs first, in
+  // CI and locally) — building here would race the other dist-consuming
+  // suites' identical build calls against the same dist/ output under parallel
+  // file execution. Fail fast with a clear pointer instead.
+  if (!existsSync(distPath)) {
+    throw new Error(
+      `dist/index.js not found at ${distPath} — run \`npm run build\` before running this suite.`,
+    );
+  }
+});
 
 describe('integration: plugin orchestration', () => {
   /**

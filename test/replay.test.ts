@@ -295,11 +295,19 @@ function testBasenames(map: ReverseMap, suffix: string): string[] {
 
 const WALK_TIMEOUT = 180_000;
 
-beforeAll(async () => {
+beforeAll(() => {
   // The analysis layer imports mergeRuntimeEdges/ReverseMap from dist at module
-  // load; the fixtures load the plugin from the sibling dist. Build once.
-  await execa('npm', ['run', 'build'], { cwd: projectRoot });
-}, 120_000);
+  // load; the fixtures load the plugin from the sibling dist. dist/ freshness
+  // is the quality gate's job (`npm run build` runs first, in CI and locally)
+  // — building here would race the other dist-consuming suites' identical
+  // build calls against the same dist/ output under parallel file execution,
+  // letting a child process read a half-written artifact. Fail fast instead.
+  if (!existsSync(path.join(distPath, 'index.js'))) {
+    throw new Error(
+      `dist/index.js not found under ${distPath} — run \`npm run build\` before running this suite.`,
+    );
+  }
+});
 
 // ===========================================================================
 // PLANTED-MISS FIXTURE — the silver bullet.
