@@ -726,576 +726,576 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
     ctx;
   let reverse: ReverseMap = new Map();
   let cacheDir: string | undefined;
-        // Root-anchor the stats path as early as possible (wlm.13), but INSIDE
-        // the try so a throwing `vitest.config` getter (the exact threat model
-        // the every-exit tests exercise) falls into the catch-all full-suite
-        // fallback rather than crashing the run — the plugin's safety invariant.
-        // The disabled check below emits NOTHING and the first emitter is the
-        // workspace guard (step 3), so anchoring here still lands before ANY
-        // stats line. Without it, with cwd != config root and a relative/default
-        // statsFile, the workspace guard (step 3) and config-shape guard (step 4)
-        // would write their decision line under <cwd>/.vitest-affected/stats.jsonl
-        // while every normal line lands under <root>/..., and a harness segmenting
-        // on full-suite fallback events would silently lose exactly those two.
-        if (vitest.config?.root) {
-          statsCtx.rootDir = toCanonicalPath(vitest.config.root);
-        }
+  // Root-anchor the stats path as early as possible (wlm.13), but INSIDE
+  // the try so a throwing `vitest.config` getter (the exact threat model
+  // the every-exit tests exercise) falls into the catch-all full-suite
+  // fallback rather than crashing the run — the plugin's safety invariant.
+  // The disabled check below emits NOTHING and the first emitter is the
+  // workspace guard (step 3), so anchoring here still lands before ANY
+  // stats line. Without it, with cwd != config root and a relative/default
+  // statsFile, the workspace guard (step 3) and config-shape guard (step 4)
+  // would write their decision line under <cwd>/.vitest-affected/stats.jsonl
+  // while every normal line lands under <root>/..., and a harness segmenting
+  // on full-suite fallback events would silently lose exactly those two.
+  if (vitest.config?.root) {
+    statsCtx.rootDir = toCanonicalPath(vitest.config.root);
+  }
 
-        // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
-        if (disabled) {
-          return null;
-        }
+  // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
+  if (disabled) {
+    return null;
+  }
 
-        // 3. Workspace guard
-        if (vitest.projects.length > 1) {
-          console.warn(
-            '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'workspace',
-            extra: { durationMs: Date.now() - startMs },
-          };
-        }
+  // 3. Workspace guard
+  if (vitest.projects.length > 1) {
+    console.warn(
+      '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'workspace',
+      extra: { durationMs: Date.now() - startMs },
+    };
+  }
 
-        // 4. Config shape validation
-        if (
-          !vitest.config ||
-          !vitest.config.root ||
-          !project.config ||
-          !project.config.include
-        ) {
-          console.warn(
-            '[vitest-affected] Unexpected config shape — running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'config-shape',
-            extra: { durationMs: Date.now() - startMs },
-          };
-        }
+  // 4. Config shape validation
+  if (
+    !vitest.config ||
+    !vitest.config.root ||
+    !project.config ||
+    !project.config.include
+  ) {
+    console.warn(
+      '[vitest-affected] Unexpected config shape — running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'config-shape',
+      extra: { durationMs: Date.now() - startMs },
+    };
+  }
 
-        // Canonicalize once at the source: every downstream graph key (cache
-        // load, resolver output, reporter module paths, changed-file resolution,
-        // test-file glob) is built from or compared against this rootDir. A
-        // symlinked project root (or macOS's /var → /private/var temp alias)
-        // would otherwise desync those keys from git-derived changed-file paths,
-        // which git itself resolves through symlinks when locating the repo
-        // toplevel — a silent under-selection.
-        const rootDir = toCanonicalPath(vitest.config.root);
-        statsCtx.rootDir = rootDir;
+  // Canonicalize once at the source: every downstream graph key (cache
+  // load, resolver output, reporter module paths, changed-file resolution,
+  // test-file glob) is built from or compared against this rootDir. A
+  // symlinked project root (or macOS's /var → /private/var temp alias)
+  // would otherwise desync those keys from git-derived changed-file paths,
+  // which git itself resolves through symlinks when locating the repo
+  // toplevel — a silent under-selection.
+  const rootDir = toCanonicalPath(vitest.config.root);
+  statsCtx.rootDir = rootDir;
 
-        // 4a. alwaysRunTests missing-path guard. Canonicalize each configured
-        // entry the same way options.changedFiles is (step 6 below) so it
-        // converges with graph keys. A typo'd or moved path must fail closed to
-        // the full suite rather than silently drop the always-run guarantee for
-        // that entry. Its own early-return, separate from the pre-rootDir
-        // workspace/config-shape guards above: this check needs rootDir to
-        // canonicalize relative entries, so it cannot run before rootDir exists.
-        let alwaysRunTests: string[] = [];
-        if (options.alwaysRunTests?.length) {
-          const resolvedAlwaysRun = options.alwaysRunTests.map((p) =>
-            resolveConfigPath(rootDir, p),
-          );
-          // Entries must be FILES, not directories or other non-file entries —
-          // a directory would silently never match a single BFS-selected test
-          // and would blow up downstream logic that treats every entry as a
-          // test module path.
-          const missing = resolvedAlwaysRun.filter((p) => !isExistingFile(p));
-          if (missing.length > 0) {
-            console.warn(
-              `[vitest-affected] alwaysRunTests path(s) not found or not a file: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
-            );
-            return {
-              action: 'full-suite',
-              reason: 'always-run-config-error',
-              extra: { durationMs: Date.now() - startMs },
-            };
-          }
-          alwaysRunTests = resolvedAlwaysRun;
-        }
+  // 4a. alwaysRunTests missing-path guard. Canonicalize each configured
+  // entry the same way options.changedFiles is (step 6 below) so it
+  // converges with graph keys. A typo'd or moved path must fail closed to
+  // the full suite rather than silently drop the always-run guarantee for
+  // that entry. Its own early-return, separate from the pre-rootDir
+  // workspace/config-shape guards above: this check needs rootDir to
+  // canonicalize relative entries, so it cannot run before rootDir exists.
+  let alwaysRunTests: string[] = [];
+  if (options.alwaysRunTests?.length) {
+    const resolvedAlwaysRun = options.alwaysRunTests.map((p) =>
+      resolveConfigPath(rootDir, p),
+    );
+    // Entries must be FILES, not directories or other non-file entries —
+    // a directory would silently never match a single BFS-selected test
+    // and would blow up downstream logic that treats every entry as a
+    // test module path.
+    const missing = resolvedAlwaysRun.filter((p) => !isExistingFile(p));
+    if (missing.length > 0) {
+      console.warn(
+        `[vitest-affected] alwaysRunTests path(s) not found or not a file: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
+      );
+      return {
+        action: 'full-suite',
+        reason: 'always-run-config-error',
+        extra: { durationMs: Date.now() - startMs },
+      };
+    }
+    alwaysRunTests = resolvedAlwaysRun;
+  }
 
-        // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
-        // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
-        // cache never populates → silent full-suite fallback forever). Force-enable
-        // here. Spread to avoid mutating the default object reference, which is
-        // shared across workspace projects in v4 (cli-api: line ~10293).
-        // On Vitest 3.2.x this field is harmless: getImportDurations() ignores it.
-        const exp = (project.config as { experimental?: ExperimentalImportDurations })
-          .experimental;
-        if (exp && exp.importDurations !== undefined) {
-          // IMPORTDURATIONS SHAPE-CHECK. importDurations is explicitly
-          // experimental upstream and was recently expanded (print/failOnDanger/
-          // thresholds) — shape drift is expected, not hypothetical. We tolerate
-          // ADDITIVE drift (unknown/new fields) but bail loudly on STRUCTURAL
-          // drift that would break the force-enable write below: importDurations
-          // must be a plain object, and if `limit` is present it must be a
-          // number (we overwrite it). Anything else means we cannot trust the
-          // runtime import data → full-suite fallback, never a silent no-op.
-          const id: unknown = exp.importDurations;
-          const isPlainObject =
-            typeof id === 'object' && id !== null && !Array.isArray(id);
-          const limitOk =
-            isPlainObject &&
-            (!('limit' in (id as object)) ||
-              typeof (id as { limit?: unknown }).limit === 'number');
-          if (!isPlainObject || !limitOk) {
-            console.warn(
-              '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
-            );
-            return {
-              action: 'full-suite',
-              reason: 'import-durations-shape',
-              extra: {
-                graphSize: reverse.size, durationMs: Date.now() - startMs,
-              },
-            };
-          }
-        }
-        if (exp) {
-          exp.importDurations = {
-            ...exp.importDurations,
-            limit: Number.MAX_SAFE_INTEGER,
-          };
-        }
+  // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
+  // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
+  // cache never populates → silent full-suite fallback forever). Force-enable
+  // here. Spread to avoid mutating the default object reference, which is
+  // shared across workspace projects in v4 (cli-api: line ~10293).
+  // On Vitest 3.2.x this field is harmless: getImportDurations() ignores it.
+  const exp = (project.config as { experimental?: ExperimentalImportDurations })
+    .experimental;
+  if (exp && exp.importDurations !== undefined) {
+    // IMPORTDURATIONS SHAPE-CHECK. importDurations is explicitly
+    // experimental upstream and was recently expanded (print/failOnDanger/
+    // thresholds) — shape drift is expected, not hypothetical. We tolerate
+    // ADDITIVE drift (unknown/new fields) but bail loudly on STRUCTURAL
+    // drift that would break the force-enable write below: importDurations
+    // must be a plain object, and if `limit` is present it must be a
+    // number (we overwrite it). Anything else means we cannot trust the
+    // runtime import data → full-suite fallback, never a silent no-op.
+    const id: unknown = exp.importDurations;
+    const isPlainObject =
+      typeof id === 'object' && id !== null && !Array.isArray(id);
+    const limitOk =
+      isPlainObject &&
+      (!('limit' in (id as object)) ||
+        typeof (id as { limit?: unknown }).limit === 'number');
+    if (!isPlainObject || !limitOk) {
+      console.warn(
+        '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
+      );
+      return {
+        action: 'full-suite',
+        reason: 'import-durations-shape',
+        extra: {
+          graphSize: reverse.size, durationMs: Date.now() - startMs,
+        },
+      };
+    }
+  }
+  if (exp) {
+    exp.importDurations = {
+      ...exp.importDurations,
+      limit: Number.MAX_SAFE_INTEGER,
+    };
+  }
 
-        // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
-        cacheDir = path.join(rootDir, '.vitest-affected');
+  // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
+  cacheDir = path.join(rootDir, '.vitest-affected');
 
-        let cacheHit: boolean;
-        // Staleness metadata — mutable `let` so the reporter closure can update
-        // it across watch-mode re-runs. Defaults to no-baseline zeros.
-        let cacheMeta: CacheMeta = { lastFullRebuild: 0, runCount: 0 };
-        if (options.cache !== false) {
-          ({ reverse, hit: cacheHit, meta: cacheMeta } = loadCachedReverseMap(cacheDir, rootDir, verbose));
-        } else {
-          reverse = new Map();
-          cacheHit = false;
-        }
+  let cacheHit: boolean;
+  // Staleness metadata — mutable `let` so the reporter closure can update
+  // it across watch-mode re-runs. Defaults to no-baseline zeros.
+  let cacheMeta: CacheMeta = { lastFullRebuild: 0, runCount: 0 };
+  if (options.cache !== false) {
+    ({ reverse, hit: cacheHit, meta: cacheMeta } = loadCachedReverseMap(cacheDir, rootDir, verbose));
+  } else {
+    reverse = new Map();
+    cacheHit = false;
+  }
 
-        // STALENESS RECONCILIATION — emitted PRE-run because the trigger (cache
-        // metadata) is known now, not after the run. Only fires when a baseline
-        // exists (lastFullRebuild > 0): a freshly-migrated v2/v1 cache or a
-        // pre-metadata v3 cache has none, so it is not flagged until its first
-        // full-suite run seeds the timestamp. A WARNING only — never a forced
-        // full suite (that would surprise a user mid-flow); the normal decision
-        // line still follows.
-        const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
-        const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
-        if (cacheMeta.lastFullRebuild > 0) {
-          const cacheAgeDays = (Date.now() - cacheMeta.lastFullRebuild) / MS_PER_DAY;
-          const agedOut = cacheAgeDays > staleCacheDays;
-          const runOut = cacheMeta.runCount > maxSelectiveRuns;
-          if (agedOut || runOut) {
-            console.warn(
-              `[vitest-affected] CACHE STALE: the dependency graph was last fully rebuilt ${cacheAgeDays.toFixed(1)} day(s) ago across ${cacheMeta.runCount} selective run(s) ` +
-                `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
-                'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
-            );
-            emitStats(statsCtx, 'heartbeat', 'cache-stale', {
-              staleCacheDays,
-              cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
-              selectiveRunCount: cacheMeta.runCount,
-            }, false);
-          }
-        }
+  // STALENESS RECONCILIATION — emitted PRE-run because the trigger (cache
+  // metadata) is known now, not after the run. Only fires when a baseline
+  // exists (lastFullRebuild > 0): a freshly-migrated v2/v1 cache or a
+  // pre-metadata v3 cache has none, so it is not flagged until its first
+  // full-suite run seeds the timestamp. A WARNING only — never a forced
+  // full suite (that would surprise a user mid-flow); the normal decision
+  // line still follows.
+  const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
+  const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
+  if (cacheMeta.lastFullRebuild > 0) {
+    const cacheAgeDays = (Date.now() - cacheMeta.lastFullRebuild) / MS_PER_DAY;
+    const agedOut = cacheAgeDays > staleCacheDays;
+    const runOut = cacheMeta.runCount > maxSelectiveRuns;
+    if (agedOut || runOut) {
+      console.warn(
+        `[vitest-affected] CACHE STALE: the dependency graph was last fully rebuilt ${cacheAgeDays.toFixed(1)} day(s) ago across ${cacheMeta.runCount} selective run(s) ` +
+          `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
+          'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
+      );
+      emitStats(statsCtx, 'heartbeat', 'cache-stale', {
+        staleCacheDays,
+        cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
+        selectiveRunCount: cacheMeta.runCount,
+      }, false);
+    }
+  }
 
-        // Inject runtime reporter that merges runtime edges into cached reverse
-        // map. On selective runs only a subset of tests execute, so it merges
-        // new edges into the existing cache rather than replacing it (which
-        // would destroy graph data for tests that didn't run this time).
-        const { setSelectedTests } = installRuntimeReporter(
-          vitest,
-          rootDir,
-          statsCtx,
-          reverse,
-          cacheDir,
-          cacheMeta,
-        );
+  // Inject runtime reporter that merges runtime edges into cached reverse
+  // map. On selective runs only a subset of tests execute, so it merges
+  // new edges into the existing cache rather than replacing it (which
+  // would destroy graph data for tests that didn't run this time).
+  const { setSelectedTests } = installRuntimeReporter(
+    vitest,
+    rootDir,
+    statsCtx,
+    reverse,
+    cacheDir,
+    cacheMeta,
+  );
 
-        // Register watch-mode filter: pass-through (Vitest's own module graph handles it)
-        if (vitest.config.watch) {
-          vitest.onFilterWatchedSpecification(() => true);
-        }
+  // Register watch-mode filter: pass-through (Vitest's own module graph handles it)
+  if (vitest.config.watch) {
+    vitest.onFilterWatchedSpecification(() => true);
+  }
 
-        // 6. Get changed files
-        let changed: string[];
-        let deleted: string[];
-        const changedFromCaller = options.changedFiles !== undefined;
+  // 6. Get changed files
+  let changed: string[];
+  let deleted: string[];
+  const changedFromCaller = options.changedFiles !== undefined;
 
-        if (changedFromCaller) {
-          // Resolve relative paths to rootDir and canonicalize so caller-provided
-          // paths converge with graph keys the same way git-derived ones do.
-          const resolved = options.changedFiles!.map((f) => resolveConfigPath(rootDir, f));
-          changed = resolved.filter((f) => existsSync(f));
-          deleted = resolved.filter((f) => !existsSync(f));
-        } else {
-          const result = await getChangedFiles(rootDir, options.ref);
-          changed = result.changed;
-          deleted = result.deleted;
-        }
+  if (changedFromCaller) {
+    // Resolve relative paths to rootDir and canonicalize so caller-provided
+    // paths converge with graph keys the same way git-derived ones do.
+    const resolved = options.changedFiles!.map((f) => resolveConfigPath(rootDir, f));
+    changed = resolved.filter((f) => existsSync(f));
+    deleted = resolved.filter((f) => !existsSync(f));
+  } else {
+    const result = await getChangedFiles(rootDir, options.ref);
+    changed = result.changed;
+    deleted = result.deleted;
+  }
 
-        // 6a. Full-suite triggers — checked on the RAW changed set before the
-        // relevance filter below, since a trigger (e.g. a `.md` or `.yaml`
-        // fixture) may have an extension the filter would otherwise drop. These
-        // cover dependencies invisible to the import graph (fs-read fixtures,
-        // assets), where the safe failure mode is to over-run.
-        if (options.fullSuiteTriggers?.length) {
-          const triggerHit = [...changed, ...deleted].find((f) =>
-            matchesAnyRule(toRepoRelative(f, rootDir), options.fullSuiteTriggers!),
-          );
-          if (triggerHit) {
-            console.warn(
-              `[vitest-affected] Full-suite trigger matched (${safeLabel(toRepoRelative(triggerHit, rootDir))}) — running full suite`,
-            );
-            return {
-              action: 'full-suite',
-              reason: 'full-suite-trigger',
-              extra: {
-                changedFiles: changed.length, deletedFiles: deleted.length,
-                graphSize: reverse.size, durationMs: Date.now() - startMs,
-              },
-            };
-          }
-        }
+  // 6a. Full-suite triggers — checked on the RAW changed set before the
+  // relevance filter below, since a trigger (e.g. a `.md` or `.yaml`
+  // fixture) may have an extension the filter would otherwise drop. These
+  // cover dependencies invisible to the import graph (fs-read fixtures,
+  // assets), where the safe failure mode is to over-run.
+  if (options.fullSuiteTriggers?.length) {
+    const triggerHit = [...changed, ...deleted].find((f) =>
+      matchesAnyRule(toRepoRelative(f, rootDir), options.fullSuiteTriggers!),
+    );
+    if (triggerHit) {
+      console.warn(
+        `[vitest-affected] Full-suite trigger matched (${safeLabel(toRepoRelative(triggerHit, rootDir))}) — running full suite`,
+      );
+      return {
+        action: 'full-suite',
+        reason: 'full-suite-trigger',
+        extra: {
+          changedFiles: changed.length, deletedFiles: deleted.length,
+          graphSize: reverse.size, durationMs: Date.now() - startMs,
+        },
+      };
+    }
+  }
 
-        // 6a-bis. setupFiles / globalSetup changes → full suite, evaluated on
-        // the RAW changed+deleted set BEFORE relevance filtering — identical
-        // placement and reasoning to 6a. A setup or globalSetup file feeds every
-        // test, so an ignoreChangedFiles rule (or an irrelevant-extension drop)
-        // matching one must NOT silently under-select; the safe failure mode is
-        // to over-run. changedFiles/deletedFiles counts are the raw counts here,
-        // matching 6a's behavior.
-        const rawChangedForSetup = [...changed, ...deleted];
+  // 6a-bis. setupFiles / globalSetup changes → full suite, evaluated on
+  // the RAW changed+deleted set BEFORE relevance filtering — identical
+  // placement and reasoning to 6a. A setup or globalSetup file feeds every
+  // test, so an ignoreChangedFiles rule (or an irrelevant-extension drop)
+  // matching one must NOT silently under-select; the safe failure mode is
+  // to over-run. changedFiles/deletedFiles counts are the raw counts here,
+  // matching 6a's behavior.
+  const rawChangedForSetup = [...changed, ...deleted];
 
-        const setupDecision = checkFullSuiteConfigField(
-          project.config.setupFiles,
-          '[vitest-affected] Setup file change detected — running full suite',
-          'setup-file-change',
-          rootDir, rawChangedForSetup, changed.length, deleted.length,
-          reverse.size, startMs,
-        );
-        if (setupDecision) return setupDecision;
+  const setupDecision = checkFullSuiteConfigField(
+    project.config.setupFiles,
+    '[vitest-affected] Setup file change detected — running full suite',
+    'setup-file-change',
+    rootDir, rawChangedForSetup, changed.length, deleted.length,
+    reverse.size, startMs,
+  );
+  if (setupDecision) return setupDecision;
 
-        // globalSetup is a sibling of setupFiles on the resolved config — same
-        // string | string[] shape, same relative-path-resolution requirement,
-        // same "invisible to the import graph" reasoning. Mirrored exactly.
-        const globalSetupDecision = checkFullSuiteConfigField(
-          project.config.globalSetup,
-          '[vitest-affected] Global setup file change detected — running full suite',
-          'global-setup-change',
-          rootDir, rawChangedForSetup, changed.length, deleted.length,
-          reverse.size, startMs,
-        );
-        if (globalSetupDecision) return globalSetupDecision;
+  // globalSetup is a sibling of setupFiles on the resolved config — same
+  // string | string[] shape, same relative-path-resolution requirement,
+  // same "invisible to the import graph" reasoning. Mirrored exactly.
+  const globalSetupDecision = checkFullSuiteConfigField(
+    project.config.globalSetup,
+    '[vitest-affected] Global setup file change detected — running full suite',
+    'global-setup-change',
+    rootDir, rawChangedForSetup, changed.length, deleted.length,
+    reverse.size, startMs,
+  );
+  if (globalSetupDecision) return globalSetupDecision;
 
-        // 6b. Filter irrelevant changed/deleted files before any graph analysis.
-        // Caller-provided changedFiles still get filtered unless explicitly opted out.
-        let ignoredCount = 0;
-        if (!(changedFromCaller && options.respectProvidedChangedFiles)) {
-          const filtered = filterRelevantChangedFiles(
-            { changed, deleted },
-            rootDir,
-            {
-              ignoreChangedFiles: options.ignoreChangedFiles,
-              includeChangedExtensions: options.includeChangedExtensions,
-              configBasenames: CONFIG_BASENAMES,
-              // The cache is already loaded (step 5) by this point — pass the
-              // reverse map so a changed/deleted file already tracked as a
-              // graph key (e.g. a CSS-module edge the runtime reporter
-              // recorded) survives the extension allowlist. See
-              // ChangedFileFilterOptions.graphMembership.
-              graphMembership: reverse,
-            },
-          );
-          ignoredCount = filtered.ignored.length;
-          changed = filtered.changed;
-          deleted = filtered.deleted;
-          if (verbose && ignoredCount > 0) {
-            console.warn(
-              `[vitest-affected] ignored ${ignoredCount} changed file(s) before graph analysis`,
-            );
-          }
-        }
+  // 6b. Filter irrelevant changed/deleted files before any graph analysis.
+  // Caller-provided changedFiles still get filtered unless explicitly opted out.
+  let ignoredCount = 0;
+  if (!(changedFromCaller && options.respectProvidedChangedFiles)) {
+    const filtered = filterRelevantChangedFiles(
+      { changed, deleted },
+      rootDir,
+      {
+        ignoreChangedFiles: options.ignoreChangedFiles,
+        includeChangedExtensions: options.includeChangedExtensions,
+        configBasenames: CONFIG_BASENAMES,
+        // The cache is already loaded (step 5) by this point — pass the
+        // reverse map so a changed/deleted file already tracked as a
+        // graph key (e.g. a CSS-module edge the runtime reporter
+        // recorded) survives the extension allowlist. See
+        // ChangedFileFilterOptions.graphMembership.
+        graphMembership: reverse,
+      },
+    );
+    ignoredCount = filtered.ignored.length;
+    changed = filtered.changed;
+    deleted = filtered.deleted;
+    if (verbose && ignoredCount > 0) {
+      console.warn(
+        `[vitest-affected] ignored ${ignoredCount} changed file(s) before graph analysis`,
+      );
+    }
+  }
 
-        // 7. No changes check — run full suite
-        if (changed.length === 0 && deleted.length === 0) {
-          return {
-            action: 'full-suite',
-            reason: 'no-changes',
-            extra: {
-              changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
-              graphSize: reverse.size,
-              durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 7. No changes check — run full suite
+  if (changed.length === 0 && deleted.length === 0) {
+    return {
+      action: 'full-suite',
+      reason: 'no-changes',
+      extra: {
+        changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
+        graphSize: reverse.size,
+        durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // 8. Deleted file handling — treat as BFS seeds
-        if (deleted.length > 0 && verbose) {
-          console.warn(
-            `[vitest-affected] ${deleted.length} deleted file(s) — will include as BFS seeds`,
-          );
-        }
+  // 8. Deleted file handling — treat as BFS seeds
+  if (deleted.length > 0 && verbose) {
+    console.warn(
+      `[vitest-affected] ${deleted.length} deleted file(s) — will include as BFS seeds`,
+    );
+  }
 
-        // 9. Force-rerun check: config file or setupFiles changes → full suite
-        const allChangedFiles = [...changed, ...deleted];
-        // Root-anchored: only a config at the repo root (or a shared workspace
-        // config above rootDir) forces a full suite. A nested
-        // packages/foo/package.json must NOT negate selection — route the
-        // absolute path through toRepoRelative and share the predicate with the
-        // relevance filter (changed-files.ts) so the two sites never drift.
-        const hasConfigChange = allChangedFiles.some((f) =>
-          isRootConfigFile(toRepoRelative(f, rootDir), CONFIG_BASENAMES),
-        );
-        if (hasConfigChange) {
-          console.warn(
-            '[vitest-affected] Config file change detected — running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'config-change',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              graphSize: reverse.size, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 9. Force-rerun check: config file or setupFiles changes → full suite
+  const allChangedFiles = [...changed, ...deleted];
+  // Root-anchored: only a config at the repo root (or a shared workspace
+  // config above rootDir) forces a full suite. A nested
+  // packages/foo/package.json must NOT negate selection — route the
+  // absolute path through toRepoRelative and share the predicate with the
+  // relevance filter (changed-files.ts) so the two sites never drift.
+  const hasConfigChange = allChangedFiles.some((f) =>
+    isRootConfigFile(toRepoRelative(f, rootDir), CONFIG_BASENAMES),
+  );
+  if (hasConfigChange) {
+    console.warn(
+      '[vitest-affected] Config file change detected — running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'config-change',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        graphSize: reverse.size, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // 10. Cache miss → full suite (first run collects runtime data)
-        if (!cacheHit) {
-          if (verbose) {
-            console.warn(
-              '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
-            );
-          }
-          return {
-            action: 'full-suite',
-            reason: 'cache-miss',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              graphSize: 0, cacheHit: false,
-              durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 10. Cache miss → full suite (first run collects runtime data)
+  if (!cacheHit) {
+    if (verbose) {
+      console.warn(
+        '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
+      );
+    }
+    return {
+      action: 'full-suite',
+      reason: 'cache-miss',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        graphSize: 0, cacheHit: false,
+        durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // 11. Delta parse: find new imports in changed files not yet in cache.
-        // Feed resolve.alias (Vite/Vitest config, resolved form) into the
-        // resolver so the static parser can see Vite-only aliases (e.g. stub
-        // packages) that tsconfig paths don't cover. project.vite is the
-        // per-project Vite dev server; its resolved config always exposes
-        // resolve.alias as Alias[] (string finds usable, RegExp finds are
-        // skipped — see createResolver). Optional-chained defensively: unit
-        // tests exercise this hook with plain mock `project` objects that
-        // don't carry a `vite` server at all — undefined here is the correct
-        // "no alias data available" case, not an error.
-        const resolveAlias = project.vite?.config?.resolve?.alias;
-        const extraSeeds = deltaParseNewImports(changed, reverse, rootDir, verbose, resolveAlias);
-        const bfsSeeds = [...allChangedFiles, ...extraSeeds];
+  // 11. Delta parse: find new imports in changed files not yet in cache.
+  // Feed resolve.alias (Vite/Vitest config, resolved form) into the
+  // resolver so the static parser can see Vite-only aliases (e.g. stub
+  // packages) that tsconfig paths don't cover. project.vite is the
+  // per-project Vite dev server; its resolved config always exposes
+  // resolve.alias as Alias[] (string finds usable, RegExp finds are
+  // skipped — see createResolver). Optional-chained defensively: unit
+  // tests exercise this hook with plain mock `project` objects that
+  // don't carry a `vite` server at all — undefined here is the correct
+  // "no alias data available" case, not an error.
+  const resolveAlias = project.vite?.config?.resolve?.alias;
+  const extraSeeds = deltaParseNewImports(changed, reverse, rootDir, verbose, resolveAlias);
+  const bfsSeeds = [...allChangedFiles, ...extraSeeds];
 
-        // 12. Glob test files using project.config.include patterns
-        const includePatterns = project.config.include;
-        if (!includePatterns || includePatterns.length === 0) {
-          console.warn(
-            '[vitest-affected] No include patterns configured — running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'no-include-patterns',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 12. Glob test files using project.config.include patterns
+  const includePatterns = project.config.include;
+  if (!includePatterns || includePatterns.length === 0) {
+    console.warn(
+      '[vitest-affected] No include patterns configured — running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'no-include-patterns',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // Canonicalize glob results so they converge with graph keys built off
-        // the same (canonicalized) rootDir. rootDir is already canonical, so
-        // for the common (non-symlinked) layout each realpath memo-hits or
-        // resolves to itself.
-        const testFiles = (await glob(includePatterns, {
-          cwd: rootDir,
-          absolute: true,
-          ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
-        })).map((f) => toCanonicalPath(f));
+  // Canonicalize glob results so they converge with graph keys built off
+  // the same (canonicalized) rootDir. rootDir is already canonical, so
+  // for the common (non-symlinked) layout each realpath memo-hits or
+  // resolves to itself.
+  const testFiles = (await glob(includePatterns, {
+    cwd: rootDir,
+    absolute: true,
+    ignore: [...(project.config.exclude ?? []), '**/node_modules/**'],
+  })).map((f) => toCanonicalPath(f));
 
-        const testFileSet = new Set(testFiles);
+  const testFileSet = new Set(testFiles);
 
-        // 12a. alwaysRunTests membership guard. An entry that exists on disk
-        // but sits outside this project's include/exclude patterns would ride
-        // selective-run unions just fine, but a FULL-SUITE decision runs
-        // project.config.include verbatim — never alwaysRunTests — so that
-        // same entry would silently NOT run whenever the plugin falls back to
-        // the full suite. Validating membership against the glob here keeps
-        // the option's "always runs" guarantee symmetric across both decision
-        // branches, rather than trusting mere on-disk existence (step 4a).
-        // Placed before the no-test-files and BFS steps below consume
-        // testFiles, so an out-of-pattern entry fails closed before either.
-        if (alwaysRunTests.length > 0) {
-          const outsidePatterns = alwaysRunTests.filter((p) => !testFileSet.has(p));
-          if (outsidePatterns.length > 0) {
-            console.warn(
-              `[vitest-affected] alwaysRunTests path(s) not matched by this project's include/exclude patterns: ${outsidePatterns.slice(0, 5).map(safeLabel).join(', ')}${outsidePatterns.length > 5 ? ` (+${outsidePatterns.length - 5} more)` : ''} — running full suite`,
-            );
-            return {
-              action: 'full-suite',
-              reason: 'always-run-config-error',
-              extra: {
-                changedFiles: changed.length, deletedFiles: deleted.length,
-                ignoredFiles: ignoredCount,
-                graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-              },
-            };
-          }
-        }
+  // 12a. alwaysRunTests membership guard. An entry that exists on disk
+  // but sits outside this project's include/exclude patterns would ride
+  // selective-run unions just fine, but a FULL-SUITE decision runs
+  // project.config.include verbatim — never alwaysRunTests — so that
+  // same entry would silently NOT run whenever the plugin falls back to
+  // the full suite. Validating membership against the glob here keeps
+  // the option's "always runs" guarantee symmetric across both decision
+  // branches, rather than trusting mere on-disk existence (step 4a).
+  // Placed before the no-test-files and BFS steps below consume
+  // testFiles, so an out-of-pattern entry fails closed before either.
+  if (alwaysRunTests.length > 0) {
+    const outsidePatterns = alwaysRunTests.filter((p) => !testFileSet.has(p));
+    if (outsidePatterns.length > 0) {
+      console.warn(
+        `[vitest-affected] alwaysRunTests path(s) not matched by this project's include/exclude patterns: ${outsidePatterns.slice(0, 5).map(safeLabel).join(', ')}${outsidePatterns.length > 5 ? ` (+${outsidePatterns.length - 5} more)` : ''} — running full suite`,
+      );
+      return {
+        action: 'full-suite',
+        reason: 'always-run-config-error',
+        extra: {
+          changedFiles: changed.length, deletedFiles: deleted.length,
+          ignoredFiles: ignoredCount,
+          graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+        },
+      };
+    }
+  }
 
-        if (testFiles.length === 0) {
-          console.warn(
-            '[vitest-affected] No test files matched include patterns — running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'no-test-files',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  if (testFiles.length === 0) {
+    console.warn(
+      '[vitest-affected] No test files matched include patterns — running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'no-test-files',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // 13. BFS: find affected tests (with provenance — the explain trail).
-        // Provenance is always computed (cheap: a parent map + a chain walk per
-        // test) but only surfaced in the stats line when options.explain is set.
-        const { tests: affectedTests, provenance } = bfsAffectedTestsWithProvenance(
-          bfsSeeds,
-          reverse,
-          (f) => testFileSet.has(f),
-        );
+  // 13. BFS: find affected tests (with provenance — the explain trail).
+  // Provenance is always computed (cheap: a parent map + a chain walk per
+  // test) but only surfaced in the stats line when options.explain is set.
+  const { tests: affectedTests, provenance } = bfsAffectedTestsWithProvenance(
+    bfsSeeds,
+    reverse,
+    (f) => testFileSet.has(f),
+  );
 
-        // 14. Threshold check
-        if (affectedTests.length === 0) {
-          if (options.allowNoTests) {
-            // Union in alwaysRunTests: with zero BFS-affected tests, include
-            // must become exactly the alwaysRun list — never [] — when the
-            // option is configured.
-            const selected = unionAlwaysRun([], alwaysRunTests);
-            // Shadow guards the mutation site: compute the decision, never apply it.
-            if (!shadow) {
-              project.config.include = selected;
-              // Record the selected set so self-verify catches a future Vitest
-              // that runs something outside it (an empty include, or a run
-              // that ignores the alwaysRunTests union).
-              setSelectedTests(selected);
-            }
-            return {
-              action: 'selective',
-              reason: 'allow-no-tests',
-              extra: {
-                changedFiles: changed.length, deletedFiles: deleted.length,
-                ignoredFiles: ignoredCount,
-                affectedTests: 0, totalTests: testFiles.length,
-                graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-                selectedFiles: selected,
-                explain: buildExplain([], options.explain, provenance),
-              },
-            };
-          }
-          console.warn(
-            '[vitest-affected] No affected tests found — running full suite',
-          );
-          return {
-            action: 'full-suite',
-            reason: 'no-affected-tests',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              affectedTests: 0, totalTests: testFiles.length,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 14. Threshold check
+  if (affectedTests.length === 0) {
+    if (options.allowNoTests) {
+      // Union in alwaysRunTests: with zero BFS-affected tests, include
+      // must become exactly the alwaysRun list — never [] — when the
+      // option is configured.
+      const selected = unionAlwaysRun([], alwaysRunTests);
+      // Shadow guards the mutation site: compute the decision, never apply it.
+      if (!shadow) {
+        project.config.include = selected;
+        // Record the selected set so self-verify catches a future Vitest
+        // that runs something outside it (an empty include, or a run
+        // that ignores the alwaysRunTests union).
+        setSelectedTests(selected);
+      }
+      return {
+        action: 'selective',
+        reason: 'allow-no-tests',
+        extra: {
+          changedFiles: changed.length, deletedFiles: deleted.length,
+          ignoredFiles: ignoredCount,
+          affectedTests: 0, totalTests: testFiles.length,
+          graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+          selectedFiles: selected,
+          explain: buildExplain([], options.explain, provenance),
+        },
+      };
+    }
+    console.warn(
+      '[vitest-affected] No affected tests found — running full suite',
+    );
+    return {
+      action: 'full-suite',
+      reason: 'no-affected-tests',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        affectedTests: 0, totalTests: testFiles.length,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // alwaysRunTests entries are intentionally exempt from this ratio check —
-        // they are a bounded, user-declared list unioned in only after this
-        // decision, not part of the graph-driven affected count it gates.
-        const ratio = affectedTests.length / testFiles.length;
-        const threshold = options.threshold ?? 1.0;
-        if (ratio > threshold) {
-          console.warn(
-            `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
-          );
-          return {
-            action: 'full-suite',
-            reason: 'threshold-exceeded',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              affectedTests: affectedTests.length, totalTests: testFiles.length,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // alwaysRunTests entries are intentionally exempt from this ratio check —
+  // they are a bounded, user-declared list unioned in only after this
+  // decision, not part of the graph-driven affected count it gates.
+  const ratio = affectedTests.length / testFiles.length;
+  const threshold = options.threshold ?? 1.0;
+  if (ratio > threshold) {
+    console.warn(
+      `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
+    );
+    return {
+      action: 'full-suite',
+      reason: 'threshold-exceeded',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        affectedTests: affectedTests.length, totalTests: testFiles.length,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 
-        // 15. Verbose summary: count of changed files not in graph (was per-file warning)
-        if (options.verbose) {
-          const notInGraph = changed.filter((f) => !reverse.has(f)).length;
-          if (notInGraph > 0) {
-            console.warn(
-              `[vitest-affected] ${notInGraph} changed file(s) not in dependency graph (delta-parsed for new imports)`,
-            );
-          }
-        }
+  // 15. Verbose summary: count of changed files not in graph (was per-file warning)
+  if (options.verbose) {
+    const notInGraph = changed.filter((f) => !reverse.has(f)).length;
+    if (notInGraph > 0) {
+      console.warn(
+        `[vitest-affected] ${notInGraph} changed file(s) not in dependency graph (delta-parsed for new imports)`,
+      );
+    }
+  }
 
-        // 16. existsSync filter — warn on missing
-        const validTests = affectedTests.filter((f) => {
-          if (!existsSync(f)) {
-            console.warn(
-              `[vitest-affected] Affected test file not found on disk: ${safeLabel(f)}`,
-            );
-            return false;
-          }
-          return true;
-        });
+  // 16. existsSync filter — warn on missing
+  const validTests = affectedTests.filter((f) => {
+    if (!existsSync(f)) {
+      console.warn(
+        `[vitest-affected] Affected test file not found on disk: ${safeLabel(f)}`,
+      );
+      return false;
+    }
+    return true;
+  });
 
-        // 17. Apply results
-        if (validTests.length > 0) {
-          // Union in alwaysRunTests, de-duplicated against the BFS-selected set.
-          const selected = unionAlwaysRun(validTests, alwaysRunTests);
-          // Shadow guards the mutation site: compute the selection, never apply it.
-          if (!shadow) {
-            project.config.include = selected;
-            // Record the selected set for the reporter's post-run self-verify.
-            setSelectedTests(selected);
-          }
-          return {
-            action: 'selective',
-            reason: undefined,
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              affectedTests: validTests.length, totalTests: testFiles.length,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-              selectedFiles: selected,
-              explain: buildExplain(validTests, options.explain, provenance),
-            },
-          };
-        } else {
-          return {
-            action: 'full-suite',
-            reason: 'no-valid-tests-on-disk',
-            extra: {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              affectedTests: 0, totalTests: testFiles.length,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            },
-          };
-        }
+  // 17. Apply results
+  if (validTests.length > 0) {
+    // Union in alwaysRunTests, de-duplicated against the BFS-selected set.
+    const selected = unionAlwaysRun(validTests, alwaysRunTests);
+    // Shadow guards the mutation site: compute the selection, never apply it.
+    if (!shadow) {
+      project.config.include = selected;
+      // Record the selected set for the reporter's post-run self-verify.
+      setSelectedTests(selected);
+    }
+    return {
+      action: 'selective',
+      reason: undefined,
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        affectedTests: validTests.length, totalTests: testFiles.length,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+        selectedFiles: selected,
+        explain: buildExplain(validTests, options.explain, provenance),
+      },
+    };
+  } else {
+    return {
+      action: 'full-suite',
+      reason: 'no-valid-tests-on-disk',
+      extra: {
+        changedFiles: changed.length, deletedFiles: deleted.length,
+        ignoredFiles: ignoredCount,
+        affectedTests: 0, totalTests: testFiles.length,
+        graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+      },
+    };
+  }
 }
 
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
