@@ -599,15 +599,30 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
       // Ambient stats-emission context, passed to the module-level `emitStats`.
       // `rootDir` is canonicalized (the same path-identity boundary every other
-      // path in the plugin routes through) and starts at the cwd fallback so the
-      // workspace/config-shape early exits resolve relative stats paths correctly;
-      // it is reassigned to the canonical config root once resolved at step 4.
+      // path in the plugin routes through). It starts at a cwd fallback so the
+      // catch-all can always resolve a relative/default statsFile, but is then
+      // root-anchored BELOW — before ANY guard emits — whenever vitest.config.root
+      // is present. The cwd fallback is retained ONLY for the genuinely-rootless
+      // case (vitest.config.root absent): there is then no root to resolve to.
       const statsCtx: EmitStatsCtx = {
         statsFile,
         rootDir: toCanonicalPath(process.cwd()),
         verbose,
         shadow,
       };
+
+      // Root-anchor the stats path as early as possible (wlm.13). The
+      // workspace guard (step 3) and config-shape guard (step 4) both emit
+      // BEFORE rootDir is reassigned at step 4a — so with cwd != config root and
+      // a relative/default statsFile, those two decision lines would land in
+      // <cwd>/.vitest-affected/stats.jsonl while every normal line lands in
+      // <root>/..., and a harness segmenting on full-suite fallback events would
+      // silently lose exactly those two. Resolving here, guarded on truthiness,
+      // fixes the workspace guard AND any config-shape exit triggered by the
+      // other three falsy checks while root is present.
+      if (vitest.config?.root) {
+        statsCtx.rootDir = toCanonicalPath(vitest.config.root);
+      }
 
       try {
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.

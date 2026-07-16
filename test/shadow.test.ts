@@ -321,8 +321,9 @@ describe('every-exit emission contract', () => {
     const statsFile = path.join(tmpDir, 'stats.jsonl');
 
     // Make `vitest.projects` throw when read inside the try → forces the
-    // catch-all. rootDir is never resolved, so the hoisted path uses cwd;
-    // an absolute statsFile sidesteps cwd resolution.
+    // catch-all. statsCtx.rootDir is root-anchored before the try (config.root
+    // is present, wlm.13); the absolute statsFile sidesteps rootDir resolution
+    // regardless.
     const { vitest, project } = createMockContext(tmpDir);
     Object.defineProperty(vitest, 'projects', {
       get() { throw new Error('boom'); },
@@ -336,5 +337,47 @@ describe('every-exit emission contract', () => {
     const lines = readStats(statsFile);
     expect(lines).toHaveLength(1);
     expect(lines[0].reason).toBe('error');
+  });
+
+  // wlm.13: a pre-root early-exit guard with a RELATIVE statsFile must resolve
+  // it against the CONFIG ROOT, not cwd. The other every-exit tests use an
+  // ABSOLUTE statsFile (which never routes through rootDir) and so cannot
+  // reproduce this bug — this one uses a relative statsFile + process.chdir.
+  describe('cwd != config root (relative statsFile) — root-anchored resolution', () => {
+    let originalCwd: string;
+    beforeEach(() => {
+      originalCwd = process.cwd();
+    });
+    afterEach(() => {
+      // Restore cwd before cleanupTempDirs removes the dir we chdir'd into.
+      process.chdir(originalCwd);
+    });
+
+    test('workspace guard line lands under <root>, not <cwd>', async () => {
+      const { tmpDir, mainPath } = setupProject(true);
+      const subDir = path.join(tmpDir, 'sub');
+      mkdirSync(subDir, { recursive: true });
+      const relStats = 'stats.jsonl';
+
+      // Workspace guard fires (projects.length > 1); vitest.config.root defaults
+      // to tmpDir. cwd is a SUBDIRECTORY of that root.
+      const { vitest, project } = createMockContext(tmpDir, {
+        projects: [{}, {}],
+      });
+      process.chdir(subDir);
+
+      await runHook(
+        vitestAffected({ changedFiles: [mainPath], cache: true, statsFile: relStats }),
+        { vitest, project },
+      );
+
+      // The 'workspace' decision line must land under <root>/, NOT <cwd>/.
+      const rootStats = path.join(tmpDir, relStats);
+      const cwdStats = path.join(subDir, relStats);
+      const lines = readStats(rootStats);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].reason).toBe('workspace');
+      expect(existsSync(cwdStats)).toBe(false);
+    });
   });
 });
