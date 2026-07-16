@@ -37,6 +37,13 @@ jobs:
       - name: Build
         run: bash scripts/quality-gate.sh build
 
+      # CI-only harness-entry smoke (single-sourced in scripts/quality-gate.sh).
+      # Runs AFTER Build: it drives `npx tsx tools/replay/run.ts`, whose static
+      # ../../dist import chain loads at module-eval regardless of branch. Fast
+      # (<~2 min: --help + --analyze-only over a tiny fixture, no walk/installs).
+      - name: Smoke (harness CLI entry)
+        run: bash scripts/quality-gate.sh smoke
+
       - name: Type-check
         run: bash scripts/quality-gate.sh types
 

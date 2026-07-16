@@ -1,0 +1,2 @@
+{"sha":"w1","status":"ok","reason":"ok","timings":{"totalMs":1},"changedFiles":["src/a.ts"],"decision":{"action":"shadow-full-suite","selectedFiles":null,"reason":"cache-miss"}}
+{"sha":"s1","status":"ok","reason":"ok","timings":{"totalMs":1},"changedFiles":["src/a.ts"],"decision":{"action":"shadow-selective","selectedFiles":["/smoke-root/t/a.test.ts"]}}
