@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dependency pinning policy — hybrid tilde on 0.x native/parse deps** — the
+  `0.x` runtime deps that execute in consumers' processes are now tilde-pinned to
+  their patch line (`oxc-parser` `^0.128.0` → `~0.128.0`, `tinyglobby` `^0.2.16`
+  → `~0.2.16`) so a breaking upstream `0.x` minor cannot silently reach consumers
+  (published packages ship no lockfile). `oxc-resolver` stays caret (`^11.0.0`) —
+  it follows real semver. Tilde on `0.x` means we uptake upstream patch fixes by
+  cutting more frequent releases rather than floating minors. Lands with the
+  `>=0.10.0` release.
+
 - **Public entry surface shrank** — deleted five never-publicly-consumed
   re-exports from `dist/index.js`: `bfsAffectedTests`,
   `bfsAffectedTestsWithProvenance`, `SelectionTrail`, `explainSelection`,
