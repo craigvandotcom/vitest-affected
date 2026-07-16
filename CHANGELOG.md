@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`vitest-affected-explain` learns test-file globs from an explicit source** —
+  the CLI now accepts repeatable `--include <glob>` flags (and a
+  `VITEST_AFFECTED_INCLUDE` env var of comma/space-separated globs; the flag
+  wins). This lets it classify custom test layouts (`__tests__/`, `.e2e.ts`, …)
+  the way the project's real Vitest `include` does, instead of only the default
+  `/\.(test|spec)\.[cm]?[jt]sx?$/` heuristic. When no glob is supplied (or none
+  match), it falls back to that default matcher, preserving the standalone stance
+  (no Vitest boot required).
+
 ### Fixed
 
+- **Parse errors no longer discard partial imports or escalate to a full suite** —
+  `resolveFileImports` now returns `{ targets, parseFailed }`: on a mid-edit syntax
+  error it keeps the partial specifier list oxc extracted before the broken point
+  (partial ≥ nothing — discarding it would strictly under-seed) and warns once per
+  file, rather than dropping every target. The changed file itself remains an
+  unconditional BFS seed, so its cached dependents still run; a syntax error stays
+  within the changed file's blast radius instead of forcing the whole suite.
+- **Early-exit stats lines are now root-anchored** — the workspace and
+  config-shape full-suite guards emit before the plugin resolves `vitest.config.root`,
+  so with `cwd` != config root and a relative/default `statsFile` their decision
+  line previously landed under `<cwd>/.vitest-affected/` while every other line
+  landed under `<root>/`, silently losing exactly those two events from any
+  fallback-segmenting harness. The stats path is now anchored to the config root as
+  the first step inside the plugin's safety `try`, before any guard emits.
 - **Config full-suite trigger is now root-anchored** — a config basename
   (`package.json`, lockfiles, `vitest.config.*`, …) only forces a full suite
   when it sits at the repo root (or is a shared workspace config above the

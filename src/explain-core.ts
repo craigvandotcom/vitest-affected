@@ -35,17 +35,25 @@ export function explainSelection(
   testFile: string,
   seeds: string[],
   reverse: ReverseMap,
-  isTestFile: (p: string) => boolean = (p) => DEFAULT_TEST_MATCHER.test(p),
+  isTestFile?: (p: string) => boolean,
 ): ExplainResult {
-  if (!isTestFile(testFile)) {
+  // Track WHICH matcher rejected the file so the "not a test file" reason names
+  // the real one: a custom matcher (explain-cli's --include/env globs) must not
+  // be reported as the default heuristic — that misdirects exactly the
+  // custom-layout users --include exists to serve (wlm.7).
+  const usingDefaultMatcher = isTestFile === undefined;
+  const matches = isTestFile ?? ((p) => DEFAULT_TEST_MATCHER.test(p));
+  if (!matches(testFile)) {
     return {
       testFile,
       selected: false,
       seed: null,
       chain: [],
-      reason:
-        'not a test file — it does not match the default test matcher ' +
-        '/\\.(test|spec)\\.[cm]?[jt]sx?$/, so it is never a selection target',
+      reason: usingDefaultMatcher
+        ? 'not a test file — it does not match the default test matcher ' +
+          '/\\.(test|spec)\\.[cm]?[jt]sx?$/, so it is never a selection target'
+        : 'not a test file — it does not match the configured --include test ' +
+          'globs (VITEST_AFFECTED_INCLUDE / --include), so it is never a selection target',
     };
   }
   if (seeds.length === 0) {
@@ -59,7 +67,7 @@ export function explainSelection(
         'FULL suite (there is no selective subset to explain)',
     };
   }
-  const { provenance } = bfsAffectedTestsWithProvenance(seeds, reverse, isTestFile);
+  const { provenance } = bfsAffectedTestsWithProvenance(seeds, reverse, matches);
   const trail = provenance.get(testFile);
   if (trail) {
     const hops = trail.chain.length - 1;

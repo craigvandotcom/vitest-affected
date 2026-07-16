@@ -611,20 +611,22 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         shadow,
       };
 
-      // Root-anchor the stats path as early as possible (wlm.13). The
-      // workspace guard (step 3) and config-shape guard (step 4) both emit
-      // BEFORE rootDir is reassigned at step 4a — so with cwd != config root and
-      // a relative/default statsFile, those two decision lines would land in
-      // <cwd>/.vitest-affected/stats.jsonl while every normal line lands in
-      // <root>/..., and a harness segmenting on full-suite fallback events would
-      // silently lose exactly those two. Resolving here, guarded on truthiness,
-      // fixes the workspace guard AND any config-shape exit triggered by the
-      // other three falsy checks while root is present.
-      if (vitest.config?.root) {
-        statsCtx.rootDir = toCanonicalPath(vitest.config.root);
-      }
-
       try {
+        // Root-anchor the stats path as early as possible (wlm.13), but INSIDE
+        // the try so a throwing `vitest.config` getter (the exact threat model
+        // the every-exit tests exercise) falls into the catch-all full-suite
+        // fallback rather than crashing the run — the plugin's safety invariant.
+        // The disabled check below emits NOTHING and the first emitter is the
+        // workspace guard (step 3), so anchoring here still lands before ANY
+        // stats line. Without it, with cwd != config root and a relative/default
+        // statsFile, the workspace guard (step 3) and config-shape guard (step 4)
+        // would write their decision line under <cwd>/.vitest-affected/stats.jsonl
+        // while every normal line lands under <root>/..., and a harness segmenting
+        // on full-suite fallback events would silently lose exactly those two.
+        if (vitest.config?.root) {
+          statsCtx.rootDir = toCanonicalPath(vitest.config.root);
+        }
+
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
         if (disabled) {
           return;
