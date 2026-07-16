@@ -20,7 +20,7 @@
 | **Type-check**   | `tsc --noEmit`                                       |
 | **Format**       | N/A (no formatter configured)                        |
 | **Build**        | `npm run build`                                      |
-| **Quality gate** | `npm run build && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && VITEST_AFFECTED_DISABLED=1 npx vitest run`    |
+| **Quality gate** | `for s in build types test-types tests; do bash scripts/quality-gate.sh $s; done` (single-sourced 4-step gate — see `scripts/quality-gate.sh`)    |
 
 ## Architecture
 

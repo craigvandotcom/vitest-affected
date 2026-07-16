@@ -25,28 +25,23 @@ jobs:
 
       - run: npm ci
 
-      # Build FIRST: tools/replay imports from ../../dist/index.js by design
-      # (the harness measures the BUILT artifact, never src) — on a fresh
-      # checkout dist/ doesn't exist yet, so type-checking before building
-      # fails with TS2307.
+      # Each step runs ONE stage of the single-sourced gate defined in
+      # scripts/quality-gate.sh (the canonical step definitions live there, so
+      # this workflow carries no literal build/type/test commands to drift).
+      # Build MUST stay first: on a fresh checkout dist/ is absent and
+      # tools/replay imports the BUILT artifact by design, so type-checking
+      # before building fails with TS2307 (commit 155bece / 2026-07-11 —
+      # dist freshness is the gate's job). The final step disables the affected
+      # plugin internally (inside the script) so the suite always exercises
+      # every test; path canonicalization keeps the matrix green on Linux + macOS.
       - name: Build
-        run: npm run build
+        run: bash scripts/quality-gate.sh build
 
       - name: Type-check
-        run: npx tsc --noEmit
+        run: bash scripts/quality-gate.sh types
 
-      # The base tsconfig excludes test/ from the build, so the suite is never
-      # type-checked by the step above. tsconfig.test.json includes test/ + src/
-      # (noEmit) to enforce `strict` / "no any" across the tests too.
       - name: Type-check tests
-        run: npx tsc -p tsconfig.test.json --noEmit
+        run: bash scripts/quality-gate.sh test-types
 
-      # Run the plugin's OWN suite with vitest-affected DISABLED so the suite
-      # never selects a subset of itself — the gate always exercises every test.
-      # The suite spawns real nested vitest runs (replay/integration); path
-      # canonicalization (toCanonicalPath) makes it platform-neutral, so the
-      # matrix is green on both Linux and macOS.
       - name: Test (full suite, plugin disabled)
-        run: npx vitest run
-        env:
-          VITEST_AFFECTED_DISABLED: '1'
+        run: bash scripts/quality-gate.sh tests
