@@ -17,7 +17,7 @@ Stack: TypeScript, Vitest plugin API, oxc-parser, oxc-resolver, tinyglobby
 | Test (single file) | `npx vitest run test/path/to/file.test.ts` |
 | Type-check | `tsc --noEmit` |
 | Lint | `tsc --noEmit` (TypeScript strict is the linter) |
-| Quality gate | `for s in build types test-types tests; do bash scripts/quality-gate.sh $s; done` (single-sourced 4-step gate — see `scripts/quality-gate.sh`) |
+| Quality gate | `(set -e; for s in build types test-types tests; do bash scripts/quality-gate.sh $s; done)` (single-sourced 4-step gate — see `scripts/quality-gate.sh`; the subshell `set -e` short-circuits on the first failed step) |
 
 No separate eslint/prettier/biome — TypeScript strict mode is the only static analysis.
 

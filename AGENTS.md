@@ -20,7 +20,7 @@
 | **Type-check**   | `tsc --noEmit`                                       |
 | **Format**       | N/A (no formatter configured)                        |
 | **Build**        | `npm run build`                                      |
-| **Quality gate** | `for s in build types test-types tests; do bash scripts/quality-gate.sh $s; done` (single-sourced 4-step gate — see `scripts/quality-gate.sh`)    |
+| **Quality gate** | `(set -e; for s in build types test-types tests; do bash scripts/quality-gate.sh $s; done)` (single-sourced 4-step gate — see `scripts/quality-gate.sh`; the subshell `set -e` short-circuits on the first failed step)    |
 
 ## Architecture
 
