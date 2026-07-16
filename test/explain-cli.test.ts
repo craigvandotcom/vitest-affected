@@ -24,11 +24,44 @@ afterEach(() => {
 });
 
 /** Run the built bin. `reject: false` so non-zero exits are inspected, not thrown. */
-function runBin(args: string[], cwd?: string) {
+function runBin(args: string[], cwd?: string, env?: Record<string, string>) {
   return execa('node', [BIN, ...args], {
     cwd: cwd ?? projectRoot,
     reject: false,
+    ...(env ? { env } : {}),
   });
+}
+
+/**
+ * Build a CUSTOM-LAYOUT fixture: a test file under `__tests__/` with no
+ * `.test.`/`.spec.` infix (so the default matcher would misclassify it) that
+ * depends on src/main.ts, with a warm cache and main.ts modified as a BFS seed.
+ * Returns the absolute path of the custom-layout test file.
+ */
+async function setupCustomLayoutFixture(tmp: string): Promise<string> {
+  mkdirSync(path.join(tmp, 'src'), { recursive: true });
+  mkdirSync(path.join(tmp, '__tests__'), { recursive: true });
+  const mainPath = path.join(tmp, 'src', 'main.ts');
+  const testPath = path.join(tmp, '__tests__', 'foo.ts');
+  writeFileSync(mainPath, 'export const main = 1;\n');
+  writeFileSync(
+    testPath,
+    'import { main } from "../src/main";\nimport { test, expect } from "vitest";\ntest("main", () => expect(main).toBe(1));\n',
+  );
+
+  // Warm cache: main.ts → __tests__/foo.ts reverse edge.
+  const reverse = new Map<string, Set<string>>([[mainPath, new Set([testPath])]]);
+  saveCacheSync(path.join(tmp, '.vitest-affected'), reverse);
+
+  await execa('git', ['init', '-q'], { cwd: tmp });
+  await execa('git', ['config', 'user.email', 'test@test.com'], { cwd: tmp });
+  await execa('git', ['config', 'user.name', 'Test'], { cwd: tmp });
+  await execa('git', ['add', '.'], { cwd: tmp });
+  await execa('git', ['commit', '-qm', 'initial'], { cwd: tmp });
+  // Modify main.ts so it surfaces as an unstaged change (a BFS seed).
+  writeFileSync(mainPath, 'export const main = 2;\n');
+
+  return testPath;
 }
 
 beforeAll(() => {
@@ -116,5 +149,55 @@ describe('vitest-affected-explain bin — SELECTED output shape', () => {
     expect(r.stdout).toContain('chain:');
     expect(r.stdout).toContain(mainPath);
     expect(r.stdout).toContain('↳');
+  });
+});
+
+// ===========================================================================
+// (3) CUSTOM-LAYOUT TEST-FILE CLASSIFICATION — --include flag + env var.
+//     va-hygiene-...wlm.7: explain-cli learns test globs from an explicit
+//     source instead of only the default .test./.spec. heuristic.
+// ===========================================================================
+
+describe('vitest-affected-explain bin — custom-layout include globs', () => {
+  test('--include classifies a __tests__/*.ts file as a test file (SELECTED)', async () => {
+    const tmp = makeTempDir(tempDirs, 'vitest-affected-explain-inc-');
+    const testPath = await setupCustomLayoutFixture(tmp);
+
+    const r = await runBin(['--include', '__tests__/**/*.ts', '__tests__/foo.ts'], tmp);
+    expect(r.exitCode).toBe(0);
+    // With the include glob, foo.ts IS a test file — and main.ts changed and
+    // reaches it, so it is SELECTED. Crucially NOT the 'not a test file' reason.
+    expect(r.stdout).not.toContain('not a test file');
+    expect(r.stdout).toContain(`SELECTED: ${testPath}`);
+  });
+
+  test('VITEST_AFFECTED_INCLUDE env supplies the same globs (parity with the flag)', async () => {
+    const tmp = makeTempDir(tempDirs, 'vitest-affected-explain-env-');
+    const testPath = await setupCustomLayoutFixture(tmp);
+
+    const r = await runBin(['__tests__/foo.ts'], tmp, {
+      ...process.env,
+      VITEST_AFFECTED_INCLUDE: '__tests__/**/*.ts',
+    } as Record<string, string>);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).not.toContain('not a test file');
+    expect(r.stdout).toContain(`SELECTED: ${testPath}`);
+  });
+
+  test('without --include/env the custom-layout file falls back to the default matcher (NOT a test file)', async () => {
+    const tmp = makeTempDir(tempDirs, 'vitest-affected-explain-fallback-');
+    await setupCustomLayoutFixture(tmp);
+
+    const r = await runBin(['__tests__/foo.ts'], tmp);
+    expect(r.exitCode).toBe(0);
+    // Default heuristic /\.(test|spec)\./ does not match __tests__/foo.ts.
+    expect(r.stdout).toContain('not a test file');
+  });
+
+  test('--help documents the --include flag, the env var, and the heuristic fallback', async () => {
+    const r = await runBin(['--help']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('--include');
+    expect(r.stdout).toContain('VITEST_AFFECTED_INCLUDE');
   });
 });
