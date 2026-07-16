@@ -34,7 +34,7 @@
  *     all-full-suite walk is list-only degeneration in disguise.
  *
  * IMPORT NOTE (load-bearing): mergeRuntimeEdges / ReverseMap come from the
- * BUILT package root ('../../dist/index.js') via evolution.ts — the same
+ * BUILT private entry ('../../dist/internal.js') via evolution.ts — the same
  * artifact the replay harness ships against — never from src (importing src
  * would measure unbuilt code). Run `npm run build` if dist is stale/missing.
  */
@@ -42,7 +42,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { execa } from 'execa';
-import type { ReverseMap } from '../../dist/index.js';
+import type { ReverseMap } from '../../dist/internal.js';
 import type { LedgerEntry } from './types.js';
 import { trackChild } from './child-registry.js';
 import {

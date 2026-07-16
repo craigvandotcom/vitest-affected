@@ -44,13 +44,15 @@
  *    everything — live self-healing → scope 'all'.
  *
  * IMPORT NOTE (load-bearing): mergeRuntimeEdges is imported from the BUILT
- * package root ('../../dist/index.js') — the same artifact the replay harness
- * ships against — NOT from '../../src/runtime-merge.js'. Importing src would
- * measure unbuilt code and recreate logic drift; run `npm run build` if dist
- * is stale/missing. The ReverseMap type comes from the dist declarations.
+ * private entry ('../../dist/internal.js') — the same artifact the replay
+ * harness ships against — NOT from '../../src/runtime-merge.js'. Importing src
+ * would measure unbuilt code and recreate logic drift; run `npm run build` if
+ * dist is stale/missing. The ReverseMap type comes from the dist declarations.
+ * (dist/internal.js is the private replay surface; dist/index.js is the public
+ * plugin API — see va-hygiene-20260706-deferred-wlm.9.)
  */
-import { mergeRuntimeEdges } from '../../dist/index.js';
-import type { ReverseMap } from '../../dist/index.js';
+import { mergeRuntimeEdges } from '../../dist/internal.js';
+import type { ReverseMap } from '../../dist/internal.js';
 import { simulateLiveSelection, testsOf } from './detector.js';
 import type { ShadowDecision } from './types.js';
 

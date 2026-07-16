@@ -18,7 +18,7 @@
  * Reports must ALWAYS label both tiers — never a bare "miss-rate".
  */
 import path from 'node:path';
-import type { ReverseMap } from '../../dist/index.js';
+import type { ReverseMap } from '../../dist/internal.js';
 import type { LedgerEntry } from './types.js';
 
 // ---------------------------------------------------------------------------

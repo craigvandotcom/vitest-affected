@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Public entry surface shrank** — deleted five never-publicly-consumed
+  re-exports from `dist/index.js`: `bfsAffectedTests`,
+  `bfsAffectedTestsWithProvenance`, `SelectionTrail`, `explainSelection`,
+  `ExplainResult` (every in-repo/test consumer already imports these from their
+  source modules `./selector.js` / `./explain-core.js`, never from the index).
+  The public entry now exports ONLY `vitestAffected` + `VitestAffectedOptions`.
+  The replay-harness symbols `mergeRuntimeEdges` + `ReverseMap` moved to a new
+  private entry `dist/internal.js` (NOT in `package.json` exports — the exports
+  map stays `["."]`). README documented none of these symbols, so this is NOT a
+  breaking change.
+
 ### Added
 
 - **`vitest-affected-explain` learns test-file globs from an explicit source** —

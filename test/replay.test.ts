@@ -71,7 +71,7 @@ import {
 import { reconstructCacheEvolution } from '../tools/replay/evolution.js';
 import type { CommitEdgeInput } from '../tools/replay/evolution.js';
 import type { LedgerEntry } from '../tools/replay/types.js';
-import type { ReverseMap } from '../dist/index.js';
+import type { ReverseMap } from '../dist/internal.js';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const distPath = path.join(projectRoot, 'dist');

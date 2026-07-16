@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 
-import type { ReverseMap } from '../dist/index.js';
+import type { ReverseMap } from '../dist/internal.js';
 import type { LedgerEntry, ShadowDecision } from '../tools/replay/types.js';
 import {
   evolutionScope,
