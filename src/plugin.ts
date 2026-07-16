@@ -2,7 +2,7 @@
 import type { Plugin } from 'vite';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
 import type { TestModule, VitestPluginContext } from 'vitest/node';
-import { existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
+import { existsSync, statSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'tinyglobby';
 import { deltaParseNewImports } from './graph/builder.js';
@@ -169,6 +169,19 @@ const DEFAULT_STALE_CACHE_DAYS = 14;
 /** Default selective-run-count threshold for the staleness warning. */
 const DEFAULT_MAX_SELECTIVE_RUNS = 50;
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+/**
+ * Byte-size cap for stats.jsonl before rotation kicks in. `writeStatsLine`
+ * appends one line per run forever with nothing reading the file back, so a
+ * long-lived consumer repo accumulates unbounded disk without this cap. Byte
+ * size (not line count) keeps the pre-append check O(1) — a single
+ * `statSync` — where a line-count cap would require reading and counting
+ * every line on every run. Exported so tests can seed a synthetic over-cap
+ * fixture without ever writing a genuine 5 MB file. On breach, the current
+ * file is renamed to `<file>.1` (overwriting any prior `.1`) before a fresh
+ * file receives the current run's line — see `writeStatsLine`.
+ */
+export const STATS_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
  * Config file basenames that, when changed, should trigger a full test suite run.
@@ -442,6 +455,23 @@ function writeStatsLine(
       payload = { ...rest };
     }
     const line = JSON.stringify({ timestamp: new Date().toISOString(), ...payload });
+    // SIZE-CAP ROTATION, right before the append. The existsSync gate is
+    // load-bearing, not optional: statSync on a nonexistent path throws
+    // ENOENT, and since this whole function is best-effort (caught below),
+    // an unguarded statSync on the very common first-ever run — mkdirSync
+    // above creates the directory but never the file — would throw, get
+    // swallowed by the catch, and SKIP the appendFileSync entirely, silently
+    // dropping this run's line. existsSync must gate statSync so the
+    // fresh-file path never reaches that failure mode; it just appends.
+    // `>=` (not `>`) so a file sitting exactly at the cap still rotates
+    // rather than growing unbounded one line short of the threshold forever.
+    if (existsSync(filePath) && statSync(filePath).size >= STATS_FILE_MAX_BYTES) {
+      // renameSync overwrites an existing stats.jsonl.1 atomically — at most
+      // one backup generation is kept. The current run's line is appended to
+      // the (now-fresh) stats.jsonl right after, so it is never lost and the
+      // file is never truncated mid-line.
+      renameSync(filePath, filePath + '.1');
+    }
     appendFileSync(filePath, line + '\n');
   } catch (err) {
     // Best-effort — never crash on stats writing

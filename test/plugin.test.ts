@@ -1,10 +1,10 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
-import { vitestAffected } from '../src/plugin.js';
+import { vitestAffected, STATS_FILE_MAX_BYTES } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
 import {
   createMockContext,
@@ -724,5 +724,78 @@ describe('parse-error changed file → selection stays scoped (va-hygiene-...wlm
     expect(projectConfig.include).not.toEqual(originalInclude);
     expect(projectConfig.include.some((p) => p.endsWith('main.test.ts'))).toBe(true);
     expect(lastStat(statsFile).reason).not.toBe('config-change');
+  });
+});
+
+/**
+ * Minimal fixture for stats-rotation coverage: a single changed source file,
+ * no cache written — the pipeline takes the cache-miss full-suite path, which
+ * emits exactly one DECISION line. That single-emit shape is all rotation
+ * needs to observe (the rotation hook site is inside writeStatsLine, upstream
+ * of which decision fired).
+ */
+function setupRotationFixture(): { tmpDir: string; mainPath: string } {
+  const tmpDir = makeTempDir(tempDirs, 'vitest-affected-rotation-');
+  mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+  const mainPath = path.join(tmpDir, 'src', 'main.ts');
+  writeFileSync(mainPath, 'export const main = 1;\n');
+  return { tmpDir, mainPath };
+}
+
+describe('stats.jsonl rotation', () => {
+  test('over-cap seed rotates: fresh stats.jsonl holds exactly the current line, stats.jsonl.1 holds the prior content', async () => {
+    const { tmpDir, mainPath } = setupRotationFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    // Pre-seed a synthetic over-cap file — sized off the exported constant so
+    // this never depends on (or writes) a genuine 5 MB fixture on disk.
+    const priorContent = 'x'.repeat(STATS_FILE_MAX_BYTES);
+    writeFileSync(statsFile, priorContent);
+
+    const { vitest, project } = createMockContext(tmpDir);
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    expect(readFileSync(statsFile + '.1', 'utf-8')).toBe(priorContent);
+
+    const freshLines = readStats(statsFile);
+    expect(freshLines).toHaveLength(1);
+    expect(freshLines[0].action).toBeDefined();
+  });
+
+  test('fresh (nonexistent) stats.jsonl: no rotation, exactly 1 line appended — the ENOENT-trap regression guard', async () => {
+    const { tmpDir, mainPath } = setupRotationFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    // No pre-seed: this is the first-ever run for this stats path. statSync
+    // on a nonexistent file throws ENOENT; if the existsSync guard were
+    // missing, that throw would be swallowed by writeStatsLine's best-effort
+    // catch and silently skip the append below, dropping this run's line.
+
+    const { vitest, project } = createMockContext(tmpDir);
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    expect(existsSync(statsFile + '.1')).toBe(false);
+    expect(readStats(statsFile)).toHaveLength(1);
+  });
+
+  test('under-cap existing stats.jsonl: no rotation, line appended to the same file', async () => {
+    const { tmpDir, mainPath } = setupRotationFixture();
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const priorContent = '{"timestamp":"2020-01-01T00:00:00.000Z","action":"full-suite"}\n';
+    writeFileSync(statsFile, priorContent);
+
+    const { vitest, project } = createMockContext(tmpDir);
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    expect(existsSync(statsFile + '.1')).toBe(false);
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(2);
   });
 });
