@@ -298,6 +298,26 @@ describe('isRootConfigFile (root-anchored config predicate)', () => {
     expect(isRootConfigFile('README.md', SET)).toBe(false);
     expect(isRootConfigFile('src/index.ts', SET)).toBe(false);
   });
+
+  // bead va-6ln — Windows fail-safe. toRepoRelative only relativizes true POSIX
+  // absolutes; a Windows drive path (or a residual leading-'/' absolute) reaches
+  // this predicate UNCHANGED. Without the guard it splits to ['C:', ...] and
+  // returns false, dropping the full-suite safety net for a repo-ROOT config on
+  // Windows (under-selection). The guard forces a root-config classification
+  // (→ full suite) for any still-absolute relPath. No real Windows needed — we
+  // feed the drive-path string straight through the config-trigger predicate.
+  test('a still-absolute relPath (Windows drive-letter) IS treated as a root config (fail-safe)', () => {
+    // Forward-slash form — what toCanonicalPath normalizes a Windows path to.
+    expect(isRootConfigFile('C:/repo/vitest.workspace.ts', SET)).toBe(true);
+    expect(isRootConfigFile('C:/repo/package.json', SET)).toBe(true);
+    // Backslash form — defensive, in case a path bypasses separator normalization.
+    expect(isRootConfigFile('C:\\repo\\vitest.workspace.ts', SET)).toBe(true);
+    // Over-selection is deliberate: even a non-config absolute path is forced
+    // to full-suite rather than risk silently under-selecting on Windows.
+    expect(isRootConfigFile('C:/repo/src/index.ts', SET)).toBe(true);
+    // A residual POSIX-absolute (leading '/') is likewise treated as a root config.
+    expect(isRootConfigFile('/abs/repo/package.json', SET)).toBe(true);
+  });
 });
 
 describe('filterRelevantChangedFiles — nested config no longer force-preserved', () => {

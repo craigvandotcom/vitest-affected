@@ -119,6 +119,17 @@ export function toRepoRelative(filePath: string, rootDir: string): string {
 }
 
 /**
+ * True iff `p` still looks like an absolute path — a residual POSIX absolute
+ * (leading `/`) or a Windows drive-letter prefix (`C:/…` or `C:\…`). Used by
+ * `isRootConfigFile` as its non-POSIX-absolute fail-safe (bead va-6ln): such a
+ * string means `toRepoRelative` could not relativize it, so its segments cannot
+ * be trusted for root-anchoring.
+ */
+function isStillAbsolute(p: string): boolean {
+  return p.startsWith('/') || /^[A-Za-z]:[/\\]/.test(p);
+}
+
+/**
  * True iff `relPath` names a ROOT-anchored config file: its basename is in
  * `basenames` AND every path segment before the basename is exactly `..`.
  *
@@ -135,8 +146,21 @@ export function toRepoRelative(filePath: string, rootDir: string): string {
  * `toRepoRelative` produces — NOT a raw absolute path or a bare basename.
  * Shared by both force-rerun sites (plugin.ts + the relevance filter below) so
  * they can never drift.
+ *
+ * FAIL-SAFE (bead va-6ln): `toRepoRelative` only relativizes when both sides are
+ * true POSIX absolutes; a Windows drive path (`C:/repo/…`, or `C:\repo\…` if it
+ * ever bypasses toCanonicalPath's separator normalization) or a residual
+ * leading-`/` absolute is returned UNCHANGED. Split on `/`, such a path yields a
+ * non-`..` leading segment (`C:`) and would fall through to `false` — silently
+ * dropping the full-suite trigger for a genuine repo-ROOT config on Windows
+ * (under-selection, the plugin's cardinal sin). So: any relPath that is still
+ * absolute after toRepoRelative is treated as a root config → force the full
+ * suite. Safe over-selection; a pure no-op on POSIX, where toRepoRelative has
+ * already relativized every in-repo path. (Root-cause fix — making
+ * toRepoRelative itself Windows-aware — is a candidate follow-up, out of scope.)
  */
 export function isRootConfigFile(relPath: string, basenames: ReadonlySet<string>): boolean {
+  if (isStillAbsolute(relPath)) return true;
   const segments = relPath.split('/');
   const basename = segments[segments.length - 1];
   if (!basenames.has(basename)) return false;
