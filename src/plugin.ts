@@ -585,6 +585,114 @@ function buildExplain(
 }
 
 /**
+ * Create the runtime reverse-graph reporter and splice it into `vitest.reporters`.
+ * The reporter fires POST-run (after `configureVitest` returns), so it owns its
+ * own mutable `reverse`/`cacheMeta` seeded from the pipeline's loaded values and
+ * persists merged edges to disk via `saveCacheSync` — the cross-run channel is
+ * disk, not shared memory (the pipeline only reads these values synchronously,
+ * before this reporter ever fires). The `Object.defineProperty` interception is
+ * required because `configureVitest` runs BEFORE Vitest's `createReporters`
+ * overwrites the reporters array; a plain push would be lost. The two diagnostic
+ * closures emit their own POST-run heartbeat lines (shadow=false) — never the
+ * terminal decision line. Returns `setSelectedTests` so the pipeline can record
+ * the applied selection for the reporter's self-verify.
+ */
+function installRuntimeReporter(
+  vitest: VitestPluginContext['vitest'],
+  rootDir: string,
+  statsCtx: EmitStatsCtx,
+  initialReverse: ReverseMap,
+  cacheDir: string | undefined,
+  initialCacheMeta: CacheMeta,
+): { setSelectedTests: (tests: string[]) => void } {
+  let reverse = initialReverse;
+  let cacheMeta = initialCacheMeta;
+
+  const { reporter, setRootDir, setSelectedTests } = createRuntimeReporter(
+    (edges, wasFullSuiteRun) => {
+      if (!cacheDir) return;
+      try {
+        // Per-test overwrite for every test that ran this cycle: strip
+        // stale edges, merge fresh ones (so removed imports are reflected,
+        // not accumulated forever). Persistence stays here at the call-site.
+        reverse = mergeRuntimeEdges(reverse, edges, 'all');
+        // STALENESS METADATA update: a full-suite run re-observes (near)
+        // every edge → reset the baseline (now / 0). A selective run only
+        // partially refreshes → preserve lastFullRebuild, bump runCount.
+        // Reassign cacheMeta so a later watch re-run reads the fresh value.
+        cacheMeta = wasFullSuiteRun
+          ? { lastFullRebuild: Date.now(), runCount: 0 }
+          : {
+              lastFullRebuild: cacheMeta.lastFullRebuild,
+              runCount: cacheMeta.runCount + 1,
+            };
+        saveCacheSync(cacheDir, reverse, cacheMeta);
+      } catch {
+        // Best-effort: runtime edge persistence failed — cache will be stale next run
+      }
+    },
+    {
+      // ZERO-EDGE HEARTBEAT — fires post-run; statsFile/rootDir are
+      // captured into this closure because the reporter runs AFTER
+      // configureVitest returns. Emitted with shadow=false: this is a
+      // post-run diagnostic, not a selection decision, so it must NOT be
+      // remapped into the shadow-selective/shadow-full-suite namespace.
+      onZeroEdgeRun: (testModuleCount) => {
+        // Machine signal ALWAYS emitted; the loud console.warn is scoped to
+        // starvation-scale runs so a small third-party-only selective run
+        // stays quiet on the console.
+        if (testModuleCount > ZERO_EDGE_STARVATION_MODULE_THRESHOLD) {
+          console.warn(
+            '[vitest-affected] HEARTBEAT: a completed test run collected ZERO ' +
+              'dependency edges from importDurations across all modules. The reverse ' +
+              'graph cannot be built or updated, so selection will fall back to the ' +
+              'full suite indefinitely. This is the silent-starvation signal — verify ' +
+              "that Vitest's importDurations collection is enabled and its API is intact.",
+          );
+        }
+        emitStats(statsCtx, 'heartbeat', 'zero-edges', undefined, false);
+      },
+      // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
+      onSelectionMismatch: (strays) => {
+        console.warn(
+          `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).map(safeLabel).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
+        );
+        emitStats(statsCtx, 'heartbeat', 'selection-mismatch', {
+          strayCount: strays.length,
+        }, false);
+      },
+    },
+  );
+  setRootDir(rootDir);
+
+  // configureVitest fires BEFORE Vitest's createReporters assigns vitest.reporters.
+  // A direct push onto the current (empty) array is lost when createReporters
+  // overwrites it with a new array. Use a property setter to intercept that
+  // assignment and append our reporter to whatever Vitest creates.
+  const vitestAny = vitest as unknown as { reporters: Reporter[] };
+  try {
+    let _reporters = vitestAny.reporters;
+    _reporters.push(reporter);
+    Object.defineProperty(vitest, 'reporters', {
+      configurable: true,
+      enumerable: true,
+      get() { return _reporters; },
+      set(value: Reporter[]) {
+        _reporters = value;
+        if (!value.includes(reporter)) {
+          value.push(reporter);
+        }
+      },
+    });
+  } catch {
+    // Fallback: direct push (works in unit tests with plain mock objects)
+    vitestAny.reporters.push(reporter);
+  }
+
+  return { setSelectedTests };
+}
+
+/**
  * Inputs threaded into {@link runPipeline}: the two hook arguments plus the
  * env-resolved options/mode and the ambient stats context the orchestrator
  * built above its try. `statsCtx.rootDir` is mutated in place by the pipeline
@@ -792,90 +900,18 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
           }
         }
 
-        // Inject runtime reporter that merges runtime edges into cached reverse map.
-        // On selective runs only a subset of tests execute, so we merge new edges
-        // into the existing cache rather than replacing it (which would destroy
-        // graph data for tests that didn't run this time).
-        const { reporter, setRootDir, setSelectedTests } = createRuntimeReporter(
-          (edges, wasFullSuiteRun) => {
-            if (!cacheDir) return;
-            try {
-              // Per-test overwrite for every test that ran this cycle: strip
-              // stale edges, merge fresh ones (so removed imports are reflected,
-              // not accumulated forever). Persistence stays here at the call-site.
-              reverse = mergeRuntimeEdges(reverse, edges, 'all');
-              // STALENESS METADATA update: a full-suite run re-observes (near)
-              // every edge → reset the baseline (now / 0). A selective run only
-              // partially refreshes → preserve lastFullRebuild, bump runCount.
-              // Reassign cacheMeta so a later watch re-run reads the fresh value.
-              cacheMeta = wasFullSuiteRun
-                ? { lastFullRebuild: Date.now(), runCount: 0 }
-                : {
-                    lastFullRebuild: cacheMeta.lastFullRebuild,
-                    runCount: cacheMeta.runCount + 1,
-                  };
-              saveCacheSync(cacheDir, reverse, cacheMeta);
-            } catch {
-              // Best-effort: runtime edge persistence failed — cache will be stale next run
-            }
-          },
-          {
-            // ZERO-EDGE HEARTBEAT — fires post-run; statsFile/rootDir are
-            // captured into this closure because the reporter runs AFTER
-            // configureVitest returns. Emitted with shadow=false: this is a
-            // post-run diagnostic, not a selection decision, so it must NOT be
-            // remapped into the shadow-selective/shadow-full-suite namespace.
-            onZeroEdgeRun: (testModuleCount) => {
-              // Machine signal ALWAYS emitted; the loud console.warn is scoped to
-              // starvation-scale runs so a small third-party-only selective run
-              // stays quiet on the console.
-              if (testModuleCount > ZERO_EDGE_STARVATION_MODULE_THRESHOLD) {
-                console.warn(
-                  '[vitest-affected] HEARTBEAT: a completed test run collected ZERO ' +
-                    'dependency edges from importDurations across all modules. The reverse ' +
-                    'graph cannot be built or updated, so selection will fall back to the ' +
-                    'full suite indefinitely. This is the silent-starvation signal — verify ' +
-                    "that Vitest's importDurations collection is enabled and its API is intact.",
-                );
-              }
-              emitStats(statsCtx, 'heartbeat', 'zero-edges', undefined, false);
-            },
-            // SELECTION SELF-VERIFY mismatch — same post-run diagnostic contract.
-            onSelectionMismatch: (strays) => {
-              console.warn(
-                `[vitest-affected] SELF-VERIFY FAILED: ${strays.length} test(s) ran that were NOT in the selected set — the include mutation silently lost effect (Vitest ran tests we did not select). First offenders: ${strays.slice(0, 5).map(safeLabel).join(', ')}${strays.length > 5 ? ` (+${strays.length - 5} more)` : ''}`,
-              );
-              emitStats(statsCtx, 'heartbeat', 'selection-mismatch', {
-                strayCount: strays.length,
-              }, false);
-            },
-          },
+        // Inject runtime reporter that merges runtime edges into cached reverse
+        // map. On selective runs only a subset of tests execute, so it merges
+        // new edges into the existing cache rather than replacing it (which
+        // would destroy graph data for tests that didn't run this time).
+        const { setSelectedTests } = installRuntimeReporter(
+          vitest,
+          rootDir,
+          statsCtx,
+          reverse,
+          cacheDir,
+          cacheMeta,
         );
-        setRootDir(rootDir);
-
-        // configureVitest fires BEFORE Vitest's createReporters assigns vitest.reporters.
-        // A direct push onto the current (empty) array is lost when createReporters
-        // overwrites it with a new array. Use a property setter to intercept that
-        // assignment and append our reporter to whatever Vitest creates.
-        const vitestAny = vitest as unknown as { reporters: Reporter[] };
-        try {
-          let _reporters = vitestAny.reporters;
-          _reporters.push(reporter);
-          Object.defineProperty(vitest, 'reporters', {
-            configurable: true,
-            enumerable: true,
-            get() { return _reporters; },
-            set(value: Reporter[]) {
-              _reporters = value;
-              if (!value.includes(reporter)) {
-                value.push(reporter);
-              }
-            },
-          });
-        } catch {
-          // Fallback: direct push (works in unit tests with plain mock objects)
-          vitestAny.reporters.push(reporter);
-        }
 
         // Register watch-mode filter: pass-through (Vitest's own module graph handles it)
         if (vitest.config.watch) {
