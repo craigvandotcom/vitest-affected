@@ -16,8 +16,9 @@ const execFile = promisify(execFileCb);
 // finite cap instead makes overflow throw a CATCHABLE error:
 //   - committed path (no `.catch`): rejects → propagates through Promise.all →
 //     getChangedFiles throws → the plugin's catch-all falls back to the full suite;
-//   - staged/unstaged paths (per-command `.catch(() => [])`): the throw is caught
-//     locally and that source degrades to [].
+//   - staged/unstaged paths (per-command `.catch` + isBenignGitError): a maxBuffer
+//     overflow is NOT a benign shape, so it too rethrows → full-suite fallback
+//     (only an unborn-HEAD failure degrades that source to []).
 // Either way the outcome is a real error the plugin can act on — over-select via
 // full-suite fallback — rather than the whole test process dying. 256MB is far
 // above any realistic `--name-only` diff (paths only, no contents) yet still a
@@ -37,6 +38,34 @@ async function exec(cmd: string, args: string[], opts: { cwd: string }): Promise
     const stderr = err && typeof err === 'object' && 'stderr' in err ? String(err.stderr) : undefined;
     throw new Error(`${cmd} ${args.join(' ')} failed: ${stderr ?? msg}`);
   }
+}
+
+// Benign git-error shapes for the working-tree sources (staged/unstaged).
+//
+// The ONLY known-benign failure is an unborn HEAD (a repo with zero commits):
+// the two `diff-index ... HEAD` sources cannot resolve HEAD, so git 2.49 emits
+//   fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.
+// which exec() rewraps as `git diff-index ... failed: <that stderr>`. Here empty
+// genuinely means "nothing committed yet" → degrade to [] is correct.
+//
+// The `ls-files` (unstaged/untracked) source has NO currently-known benign
+// failure mode — it exits 0 on an unborn HEAD and lists untracked files. The
+// same classifier is applied uniformly to all three sources anyway (single
+// source of truth, forward-safe); in practice an `ls-files` failure is never
+// benign and always propagates.
+//
+// Everything NOT matched here (corrupt index, I/O error, unreadable `.git`,
+// maxBuffer overflow) is a GENUINE failure: rethrow so it propagates through
+// Promise.all → getChangedFiles throws → the plugin's catch-all falls back to
+// the full suite. This mirrors the committed path and the ref-verification
+// loud-failure guard — never silently skip tests.
+const BENIGN_GIT_ERROR_PATTERNS = [
+  /unknown revision or path not in the working tree/,
+  /ambiguous argument 'HEAD'/,
+];
+function isBenignGitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return BENIGN_GIT_ERROR_PATTERNS.some((re) => re.test(msg));
 }
 
 export async function getChangedFiles(
@@ -156,7 +185,7 @@ export async function getChangedFiles(
     { cwd: gitRoot }
   )
     .then(r => r.stdout.trim().split('\n').filter(Boolean))
-    .catch(() => []);
+    .catch((err: unknown) => { if (isBenignGitError(err)) return []; throw err; });
 
   // staged deletions — includes old names from renames
   const stagedDeletedPromise: Promise<string[]> = exec(
@@ -165,7 +194,7 @@ export async function getChangedFiles(
     { cwd: gitRoot }
   )
     .then(r => r.stdout.trim().split('\n').filter(Boolean))
-    .catch(() => []);
+    .catch((err: unknown) => { if (isBenignGitError(err)) return []; throw err; });
 
   // unstaged: untracked files + modified tracked files (includes unstaged deletions)
   const unstagedPromise: Promise<string[]> = exec(
@@ -174,7 +203,7 @@ export async function getChangedFiles(
     { cwd: gitRoot }
   )
     .then(r => r.stdout.trim().split('\n').filter(Boolean))
-    .catch(() => []);
+    .catch((err: unknown) => { if (isBenignGitError(err)) return []; throw err; });
 
   const [committed, stagedChanged, stagedDeleted, unstaged] = await Promise.all([
     committedPromise,

@@ -341,4 +341,42 @@ describe('getChangedFiles', () => {
       /vitest-affected: shallow clone detected/,
     );
   });
+
+  // 16. Benign zero-commit (unborn HEAD): the two staged `diff-index ... HEAD`
+  // sources cannot resolve HEAD and fail with the "ambiguous argument 'HEAD'"
+  // shape — classified BENIGN → degrade to []. Meanwhile the `ls-files` source
+  // exits 0 and lists the untracked file. Net: getChangedFiles must NOT throw,
+  // and the untracked file must surface in `changed`. Proves the benign
+  // classifier lets the working-tree sources coexist on an unborn HEAD rather
+  // than the whole call rejecting. (No existing test covers this — every other
+  // test makes >=1 commit, including test 6 "clean repo".)
+  test('unborn HEAD (zero commits) does not throw; untracked file surfaces via ls-files', async () => {
+    const dir = await makeTempRepo();
+    // NO commit — HEAD is unborn.
+    writeFileSync(path.join(dir, 'fresh.ts'), 'export const fresh = 1;\n');
+
+    const result = await getChangedFiles(dir);
+    expect(result.changed).toContain(path.join(dir, 'fresh.ts'));
+    expect(result.deleted).toHaveLength(0);
+  });
+
+  // 17. Genuine (non-benign) failure on a working-tree source → loud reject
+  // (→ plugin full-suite fallback). Corrupting `.git/index` makes the staged
+  // `diff-index` sources fail with `fatal: .git/index: index file smaller than
+  // expected`, which is NOT a benign shape, so isBenignGitError returns false
+  // and the throw propagates through Promise.all → getChangedFiles rejects.
+  // Deterministic + cross-platform (ubuntu + macos) — unlike chmod/`.git`
+  // unreadable simulations, which no-op under root in CI. Mirrors test 12's
+  // loud-failure assertion shape.
+  test('genuine failure (corrupt .git/index) on a working-tree source rejects', async () => {
+    const dir = await makeTempRepo();
+    writeFileSync(path.join(dir, 'a.ts'), 'export const a = 1;\n');
+    await git(['add', 'a.ts'], dir);
+    await git(['commit', '-m', 'initial'], dir);
+
+    // Corrupt the index — the staged diff-index sources now fail non-benignly.
+    writeFileSync(path.join(dir, '.git', 'index'), 'GARBAGE');
+
+    await expect(getChangedFiles(dir)).rejects.toThrow();
+  });
 });
