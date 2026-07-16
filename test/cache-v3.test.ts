@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, utimesSync } from 'node:fs';
 import { loadCachedReverseMap, saveCacheSync } from '../src/graph/cache.js';
 import { makeTempDir as makeTempDirTracked, cleanupTempDirs } from './_helpers.js';
 
@@ -345,5 +345,196 @@ describe('v3 verbose logging', () => {
       expect.stringContaining('v3 cache hit'),
     );
     warnSpy.mockRestore();
+  });
+});
+
+describe('mtime-guarded orphaned tmp cleanup', () => {
+  test('spares a fresh .tmp- file and reaps an aged one', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+    mkdirSync(cacheDir, { recursive: true });
+
+    const freshTmp = path.join(cacheDir, '.tmp-fresh');
+    const agedTmp = path.join(cacheDir, '.tmp-aged');
+    writeFileSync(freshTmp, 'garbage');
+    writeFileSync(agedTmp, 'garbage');
+
+    // Backdate the aged file well past the 60s mtime-guard threshold; leave
+    // the fresh file at its natural (just-written) mtime.
+    const oldTime = new Date(Date.now() - 120_000);
+    utimesSync(agedTmp, oldTime, oldTime);
+
+    loadCachedReverseMap(cacheDir, rootDir);
+
+    const entries = readdirSync(cacheDir);
+    expect(entries).toContain('.tmp-fresh');
+    expect(entries).not.toContain('.tmp-aged');
+  });
+});
+
+describe('saveCacheSync concurrency union (observedTests)', () => {
+  test('CONCURRENT-WRITER: unions in disk edges for tests this run did not observe', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const sourceX = path.join(rootDir, 'src', 'x.ts');
+    const testB = path.join(rootDir, 'test', 'b.test.ts');
+    const sourceY = path.join(rootDir, 'src', 'y.ts');
+    const testA = path.join(rootDir, 'test', 'a.test.ts');
+
+    // Simulate a concurrent writer: on-disk graph has test B importing source X.
+    saveCacheSync(cacheDir, new Map([[sourceX, new Set([testB])]]));
+
+    // This run observed only test A, recording A -> Y (source Y imported by A).
+    saveCacheSync(
+      cacheDir,
+      new Map([[sourceY, new Set([testA])]]),
+      {},
+      { observedTests: new Set([testA]) },
+    );
+
+    const { reverse } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(reverse.get(sourceX)?.has(testB)).toBe(true);
+    expect(reverse.get(sourceY)?.has(testA)).toBe(true);
+  });
+
+  test('REMOVAL-REGRESSION: does not resurrect an edge stripped from an observed test', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const sourceX = path.join(rootDir, 'src', 'x.ts');
+    const testA = path.join(rootDir, 'test', 'a.test.ts');
+
+    // On-disk: A imports X.
+    saveCacheSync(cacheDir, new Map([[sourceX, new Set([testA])]]));
+
+    // This run observed A, but A no longer imports X (the edge was already
+    // stripped upstream by mergeRuntimeEdges before saveCacheSync is called —
+    // simulated here by a map with no entry for A at all).
+    saveCacheSync(cacheDir, new Map(), {}, { observedTests: new Set([testA]) });
+
+    const { reverse } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(reverse.has(sourceX)).toBe(false);
+  });
+
+  test('observedTests absent skips the union entirely (plain overwrite)', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const sourceX = path.join(rootDir, 'src', 'x.ts');
+    const testB = path.join(rootDir, 'test', 'b.test.ts');
+
+    saveCacheSync(cacheDir, new Map([[sourceX, new Set([testB])]]));
+    // No observedTests supplied — today's behavior: a plain overwrite that
+    // does not read or union disk state at all.
+    saveCacheSync(cacheDir, new Map());
+
+    const { reverse } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(reverse.size).toBe(0);
+  });
+});
+
+describe('git identity persistence', () => {
+  test('saveCacheSync persists headSha/branch and loadCachedReverseMap surfaces them', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    saveCacheSync(cacheDir, new Map(), { headSha: 'abc123def456', branch: 'main' });
+    const { meta } = loadCachedReverseMap(cacheDir, rootDir);
+
+    expect(meta.headSha).toBe('abc123def456');
+    expect(meta.branch).toBe('main');
+  });
+
+  test('a v3 cache lacking headSha/branch read-migrates with undefined (no baseline)', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+    mkdirSync(cacheDir, { recursive: true });
+
+    writeFileSync(
+      path.join(cacheDir, 'graph.json'),
+      JSON.stringify({
+        version: 3,
+        builtAt: Date.now(),
+        lastFullRebuild: 0,
+        runCount: 0,
+        reverseMap: {},
+      }),
+    );
+
+    const { meta } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(meta.headSha).toBeUndefined();
+    expect(meta.branch).toBeUndefined();
+  });
+});
+
+describe('growth prune (full-suite saves only)', () => {
+  test('a full-suite save prunes a deleted source key and a dangling deleted-test value', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const deletedSource = path.join(rootDir, 'src', 'gone.ts');
+    const deletedTest = path.join(rootDir, 'test', 'gone.test.ts');
+    const liveSource = path.join(rootDir, 'src', 'a.ts');
+    const liveTest = path.join(rootDir, 'test', 'a.test.ts');
+
+    mkdirSync(path.dirname(liveSource), { recursive: true });
+    writeFileSync(liveSource, '');
+    mkdirSync(path.dirname(liveTest), { recursive: true });
+    writeFileSync(liveTest, '');
+
+    const reverse = new Map<string, Set<string>>([
+      [deletedSource, new Set([liveTest])],
+      [liveSource, new Set([liveTest, deletedTest])],
+    ]);
+
+    saveCacheSync(cacheDir, reverse, {}, { fullSuite: true });
+
+    const { reverse: loaded } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(loaded.has(deletedSource)).toBe(false);
+    expect(loaded.get(liveSource)?.has(deletedTest)).toBe(false);
+    expect(loaded.get(liveSource)?.has(liveTest)).toBe(true);
+  });
+
+  test('prune sweeps a dead entry re-introduced by the step-2 disk union', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const deletedSource = path.join(rootDir, 'src', 'gone.ts');
+    const liveTest = path.join(rootDir, 'test', 'a.test.ts');
+    mkdirSync(path.dirname(liveTest), { recursive: true });
+    writeFileSync(liveTest, '');
+
+    // A concurrent writer's on-disk state has a dead source key that step 2's
+    // union would otherwise carry forward untouched.
+    saveCacheSync(cacheDir, new Map([[deletedSource, new Set([liveTest])]]));
+
+    // Full-suite run observes nothing new, but the union (observedTests: {})
+    // still re-admits the disk entry — the prune step must still sweep it.
+    saveCacheSync(
+      cacheDir,
+      new Map(),
+      {},
+      { observedTests: new Set(), fullSuite: true },
+    );
+
+    const { reverse: loaded } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(loaded.has(deletedSource)).toBe(false);
+  });
+
+  test('a selective save does NOT sweep dead entries', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const deletedSource = path.join(rootDir, 'src', 'gone.ts');
+    const liveTest = path.join(rootDir, 'test', 'a.test.ts');
+    mkdirSync(path.dirname(liveTest), { recursive: true });
+    writeFileSync(liveTest, '');
+
+    const reverse = new Map<string, Set<string>>([[deletedSource, new Set([liveTest])]]);
+    saveCacheSync(cacheDir, reverse); // no fullSuite flag — no sweep
+
+    const { reverse: loaded } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(loaded.has(deletedSource)).toBe(true);
   });
 });

@@ -1,9 +1,31 @@
 /// <reference types="vitest/config" />
-import { describe, test, expect } from 'vitest';
+import { describe, test, expect, afterEach } from 'vitest';
+import path from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
-import { createRuntimeReporter } from '../src/plugin.js';
+import {
+  createRuntimeReporter,
+  installRuntimeReporter,
+  reconcileCacheStaleness,
+} from '../src/plugin.js';
 import { mergeRuntimeEdges, type ReverseMap } from '../src/runtime-merge.js';
-import { createMockTestModule } from './_helpers.js';
+import { loadCachedReverseMap } from '../src/graph/cache.js';
+import {
+  createMockTestModule,
+  makeTempDir as makeTempDirTracked,
+  cleanupTempDirs,
+  readStats,
+} from './_helpers.js';
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  cleanupTempDirs(tempDirs);
+});
+
+function makeTempDir(): string {
+  return makeTempDirTracked(tempDirs, 'vitest-affected-runtime-unit-');
+}
 
 // ---------------------------------------------------------------------------
 // createRuntimeReporter
@@ -393,5 +415,212 @@ describe('mergeRuntimeEdges', () => {
       '/p/src/shared.ts': ['/p/a.test.ts'],
       '/p/src/untouched.ts': ['/p/b.test.ts'],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// installRuntimeReporter — git identity passthrough + full-suite prune wiring
+// ---------------------------------------------------------------------------
+
+/** Minimal fake vitest.reporters splice target — installRuntimeReporter only
+ *  ever pushes onto / reads `.reporters`, so a plain array-bearing object is
+ *  sufficient (mirrors the cast pattern _helpers.ts uses for mock contexts). */
+function makeMockVitest(): { reporters: Reporter[] } {
+  return { reporters: [] };
+}
+
+describe('installRuntimeReporter — git identity passthrough', () => {
+  test('a reporter-triggered save round-trips headSha/branch on BOTH the full-suite and selective branches (catches the bare-literal drop)', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+    const statsCtx = { rootDir, verbose: false, shadow: false };
+    const mockVitest = makeMockVitest();
+
+    const { setSelectedTests } = installRuntimeReporter(
+      mockVitest as unknown as Parameters<typeof installRuntimeReporter>[0],
+      rootDir,
+      statsCtx,
+      new Map(),
+      cacheDir,
+      { lastFullRebuild: 0, runCount: 0 },
+      { headSha: 'deadbeef1234', branch: 'feature/x' },
+    );
+    const reporter = mockVitest.reporters[0];
+
+    // Cycle 1: no selective decision applied — the reporter's first completed
+    // run is classified full-suite (wasFullSuiteRun), exercising the
+    // full-suite cacheMeta literal.
+    reporter.onTestModuleEnd!(
+      createMockTestModule(path.join(rootDir, 'a.test.ts'), {
+        [path.join(rootDir, 'src', 'a.ts')]: { selfTime: 1, totalTime: 2 },
+      }),
+    );
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    let loaded = loadCachedReverseMap(cacheDir, rootDir);
+    expect(loaded.meta.headSha).toBe('deadbeef1234');
+    expect(loaded.meta.branch).toBe('feature/x');
+
+    // Cycle 2: a selective decision was applied — exercises the OTHER
+    // cacheMeta literal (the one bug risk was a headSha/branch drop
+    // affecting only one of the two branches).
+    setSelectedTests([path.join(rootDir, 'b.test.ts')]);
+    reporter.onTestModuleEnd!(
+      createMockTestModule(path.join(rootDir, 'b.test.ts'), {
+        [path.join(rootDir, 'src', 'b.ts')]: { selfTime: 1, totalTime: 2 },
+      }),
+    );
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    loaded = loadCachedReverseMap(cacheDir, rootDir);
+    expect(loaded.meta.headSha).toBe('deadbeef1234');
+    expect(loaded.meta.branch).toBe('feature/x');
+  });
+});
+
+describe('installRuntimeReporter — full-suite prune wiring', () => {
+  test('a full-suite reporter-triggered save prunes a dead source key untouched by the runtime merge', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const deletedSource = path.join(rootDir, 'src', 'gone.ts');
+    const unobservedTest = path.join(rootDir, 'test', 'c.test.ts'); // never runs this cycle
+    const liveSource = path.join(rootDir, 'src', 'a.ts');
+    const liveTest = path.join(rootDir, 'test', 'a.test.ts');
+
+    // liveSource/liveTest must exist on disk to SURVIVE the prune; deletedSource
+    // and unobservedTest are deliberately left absent.
+    mkdirSync(path.dirname(liveSource), { recursive: true });
+    mkdirSync(path.dirname(liveTest), { recursive: true });
+    writeFileSync(liveSource, '');
+    writeFileSync(liveTest, '');
+
+    // deletedSource -> {unobservedTest}: unobservedTest is NOT part of this
+    // cycle's edges, so mergeRuntimeEdges('all', ...) leaves this entry
+    // structurally untouched (scope only covers tests present in `edges`) —
+    // isolating the assertion to the PRUNE step, not the merge's own removal.
+    const initialReverse: ReverseMap = new Map([[deletedSource, new Set([unobservedTest])]]);
+
+    const statsCtx = { rootDir, verbose: false, shadow: false };
+    const mockVitest = makeMockVitest();
+    installRuntimeReporter(
+      mockVitest as unknown as Parameters<typeof installRuntimeReporter>[0],
+      rootDir,
+      statsCtx,
+      initialReverse,
+      cacheDir,
+      { lastFullRebuild: 0, runCount: 0 },
+    );
+    const reporter = mockVitest.reporters[0];
+
+    // First completed run of the process, no selective decision applied →
+    // the reporter classifies this wasFullSuiteRun=true, which must thread
+    // through installRuntimeReporter's saveCacheSync call as fullSuite: true.
+    reporter.onTestModuleEnd!(
+      createMockTestModule(liveTest, { [liveSource]: { selfTime: 1, totalTime: 2 } }),
+    );
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    const { reverse } = loadCachedReverseMap(cacheDir, rootDir);
+    expect(reverse.has(deletedSource)).toBe(false);
+    expect(reverse.get(liveSource)?.has(liveTest)).toBe(true);
+  });
+
+  test('a selective reporter-triggered save does NOT prune a dead source key', () => {
+    const rootDir = makeTempDir();
+    const cacheDir = path.join(rootDir, '.vitest-affected');
+
+    const deletedSource = path.join(rootDir, 'src', 'gone.ts');
+    const unobservedTest = path.join(rootDir, 'test', 'c.test.ts');
+    const liveSource = path.join(rootDir, 'src', 'a.ts');
+    const liveTest = path.join(rootDir, 'test', 'a.test.ts');
+    mkdirSync(path.dirname(liveSource), { recursive: true });
+    mkdirSync(path.dirname(liveTest), { recursive: true });
+    writeFileSync(liveSource, '');
+    writeFileSync(liveTest, '');
+
+    const initialReverse: ReverseMap = new Map([[deletedSource, new Set([unobservedTest])]]);
+
+    const statsCtx = { rootDir, verbose: false, shadow: false };
+    const mockVitest = makeMockVitest();
+    const { setSelectedTests } = installRuntimeReporter(
+      mockVitest as unknown as Parameters<typeof installRuntimeReporter>[0],
+      rootDir,
+      statsCtx,
+      initialReverse,
+      cacheDir,
+      { lastFullRebuild: 0, runCount: 0 },
+    );
+    const reporter = mockVitest.reporters[0];
+
+    // A selective decision was applied this cycle → wasFullSuiteRun=false.
+    setSelectedTests([liveTest]);
+    reporter.onTestModuleEnd!(
+      createMockTestModule(liveTest, { [liveSource]: { selfTime: 1, totalTime: 2 } }),
+    );
+    reporter.onTestRunEnd!([], [], 'passed' as TestRunEndReason);
+
+    const { reverse } = loadCachedReverseMap(cacheDir, rootDir);
+    // Selective save: no sweep — the dead entry survives untouched.
+    expect(reverse.has(deletedSource)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileCacheStaleness — git identity mismatch heartbeat
+// ---------------------------------------------------------------------------
+
+describe('reconcileCacheStaleness — git identity mismatch heartbeat', () => {
+  test('a branch switch (stored sha != current sha) fires exactly one cache-git-mismatch heartbeat and never forces the full suite', () => {
+    const rootDir = makeTempDir();
+    const statsFile = path.join(rootDir, 'stats.jsonl');
+    const statsCtx = { statsFile, rootDir, verbose: false, shadow: false };
+
+    const cacheMeta = { lastFullRebuild: 0, runCount: 0, headSha: 'aaaa1111', branch: 'main' };
+    reconcileCacheStaleness({}, cacheMeta, statsCtx, { headSha: 'bbbb2222', branch: 'feature' });
+
+    const lines = readStats(statsFile);
+    const mismatchLines = lines.filter((l) => l['reason'] === 'cache-git-mismatch');
+    expect(mismatchLines).toHaveLength(1);
+    expect(mismatchLines[0]?.['action']).toBe('heartbeat');
+    // Selection is otherwise unchanged: reconcileCacheStaleness never emits a
+    // decision line (selective/full-suite) — every emitted line is a heartbeat.
+    expect(lines.every((l) => l['action'] === 'heartbeat')).toBe(true);
+  });
+
+  test('a matching HEAD sha does not fire the mismatch heartbeat', () => {
+    const rootDir = makeTempDir();
+    const statsFile = path.join(rootDir, 'stats.jsonl');
+    const statsCtx = { statsFile, rootDir, verbose: false, shadow: false };
+
+    const cacheMeta = { lastFullRebuild: 0, runCount: 0, headSha: 'aaaa1111', branch: 'main' };
+    reconcileCacheStaleness({}, cacheMeta, statsCtx, { headSha: 'aaaa1111', branch: 'main' });
+
+    const lines = readStats(statsFile);
+    expect(lines.filter((l) => l['reason'] === 'cache-git-mismatch')).toHaveLength(0);
+  });
+
+  test('no stored baseline (headSha absent — a pre-this-bead cache) does not fire the mismatch heartbeat', () => {
+    const rootDir = makeTempDir();
+    const statsFile = path.join(rootDir, 'stats.jsonl');
+    const statsCtx = { statsFile, rootDir, verbose: false, shadow: false };
+
+    const cacheMeta = { lastFullRebuild: 0, runCount: 0 };
+    reconcileCacheStaleness({}, cacheMeta, statsCtx, { headSha: 'bbbb2222', branch: 'main' });
+
+    const lines = readStats(statsFile);
+    expect(lines.filter((l) => l['reason'] === 'cache-git-mismatch')).toHaveLength(0);
+  });
+
+  test('no current identity (readGitIdentity degraded to undefined) does not fire the mismatch heartbeat', () => {
+    const rootDir = makeTempDir();
+    const statsFile = path.join(rootDir, 'stats.jsonl');
+    const statsCtx = { statsFile, rootDir, verbose: false, shadow: false };
+
+    const cacheMeta = { lastFullRebuild: 0, runCount: 0, headSha: 'aaaa1111', branch: 'main' };
+    reconcileCacheStaleness({}, cacheMeta, statsCtx, {});
+
+    const lines = readStats(statsFile);
+    expect(lines.filter((l) => l['reason'] === 'cache-git-mismatch')).toHaveLength(0);
   });
 });

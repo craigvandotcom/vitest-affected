@@ -243,3 +243,44 @@ export async function getChangedFiles(
 
   return { changed, deleted };
 }
+
+/**
+ * Read the current HEAD commit SHA and branch name, for the cache's git
+ * identity metadata (persisted alongside the reverse map so a later run can
+ * detect a branch switch / rebase that silently invalidated the
+ * runtime-observed graph — see reconcileCacheStaleness in plugin.ts).
+ *
+ * Each of the two reads degrades to `undefined` INDEPENDENTLY on ANY failure
+ * (unborn HEAD, not a git repo, detached-HEAD edge cases, or any other git
+ * error) — this is a best-effort diagnostic read, not a decision input, so it
+ * must never throw and never block the pipeline. Mirrors git.ts's existing
+ * benign-failure posture (isBenignGitError / getChangedFiles's soft
+ * not-a-work-tree fallback) but is even more permissive: EVERY failure here is
+ * benign, because the only consumer (a DIAGNOSTIC heartbeat) treats an absent
+ * value as "no baseline, don't warn" rather than a decision that must fail
+ * loud. Independent try/catch per read: `--abbrev-ref HEAD` can resolve via
+ * the symbolic ref even when `rev-parse HEAD` fails on an unborn HEAD (no
+ * commit to name yet), so one succeeding while the other fails is a real,
+ * useful partial result rather than an all-or-nothing pair.
+ */
+export async function readGitIdentity(
+  rootDir: string,
+): Promise<{ headSha?: string; branch?: string }> {
+  let headSha: string | undefined;
+  try {
+    const { stdout } = await exec('git', ['rev-parse', 'HEAD'], { cwd: rootDir });
+    headSha = stdout.trim() || undefined;
+  } catch {
+    headSha = undefined;
+  }
+
+  let branch: string | undefined;
+  try {
+    const { stdout } = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: rootDir });
+    branch = stdout.trim() || undefined;
+  } catch {
+    branch = undefined;
+  }
+
+  return { headSha, branch };
+}

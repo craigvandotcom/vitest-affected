@@ -6,6 +6,7 @@ import {
   readdirSync,
   rmSync,
   existsSync,
+  statSync,
 } from 'node:fs';
 import path from 'node:path';
 import { toCanonicalPath } from './normalize.js';
@@ -29,16 +30,35 @@ function safeJsonReviver(_key: string, value: unknown): unknown {
 }
 
 /**
+ * Age threshold (ms) for `.tmp-*` reaping in {@link cleanupOrphanedTmp}. A
+ * `saveCacheSync` in another concurrently-running process writes its temp file
+ * moments before renaming it into place; without an age guard, a load that
+ * happens to run mid-write would delete that in-flight temp out from under the
+ * concurrent writer, corrupting its atomic rename (renameSync would then throw
+ * ENOENT). Only a temp file OLDER than this threshold is presumed genuinely
+ * orphaned (left behind by a process that crashed between writeFileSync and
+ * renameSync) and safe to reap. 60s comfortably exceeds any realistic
+ * writeFileSync→renameSync gap for this cache's payload size.
+ */
+const ORPHANED_TMP_MAX_AGE_MS = 60_000;
+
+/**
  * Clean up any orphaned `.tmp-*` files left by a previous interrupted write.
+ * Spares any temp file younger than {@link ORPHANED_TMP_MAX_AGE_MS} — see that
+ * constant's doc for why a fresh temp must not be reaped.
  */
 function cleanupOrphanedTmp(cacheDir: string): void {
   if (!existsSync(cacheDir)) return;
   try {
     const entries = readdirSync(cacheDir);
+    const now = Date.now();
     for (const entry of entries) {
       if (entry.startsWith('.tmp-')) {
+        const entryPath = path.join(cacheDir, entry);
         try {
-          rmSync(path.join(cacheDir, entry));
+          const { mtimeMs } = statSync(entryPath);
+          if (now - mtimeMs < ORPHANED_TMP_MAX_AGE_MS) continue; // in-flight — spare it
+          rmSync(entryPath);
         } catch {
           // best-effort
         }
@@ -170,6 +190,53 @@ function relativeMapToAbsolute(
   return absolute;
 }
 
+/**
+ * PRIVATE. Read-only raw read of the on-disk v3 reverse map, for the
+ * save-path concurrency union ONLY (item 1b of the cache-robustness spec) —
+ * NOT for `loadCachedReverseMap`, which additionally runs
+ * `cleanupOrphanedTmp` and the full v1/v2 migration pipeline: paying that cost
+ * on every SAVE (not just every load) would be wasteful, and a migration
+ * write-back has no business happening from inside a save.
+ *
+ * GUARDED to `version === 3` only: a missing/corrupt file, or any other
+ * version (v1, v2, unknown), returns an EMPTY map rather than attempting to
+ * migrate it here. That makes the union a self-healing NO-OP against a
+ * legacy on-disk format — the legacy cache still gets migrated correctly the
+ * next time `loadCachedReverseMap` runs — and, just as importantly, it
+ * prevents ever double-joining an absolute-path v1/v2 map through the
+ * relative-path v3 rejoin logic below (which would silently corrupt paths).
+ *
+ * Returns entries confined and canonicalized against `canonicalRoot`, in
+ * exactly the same absolute in-memory shape `loadCachedReverseMap` produces —
+ * callers union this directly into their own absolute-path working map.
+ */
+function readConfinedDiskMapV3(cacheDir: string, canonicalRoot: string): ReverseMap {
+  const cachePath = path.join(cacheDir, GRAPH_FILE);
+  let raw: string;
+  try {
+    raw = readFileSync(cachePath, 'utf-8');
+  } catch {
+    return new Map();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw, safeJsonReviver);
+  } catch {
+    return new Map();
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) return new Map();
+  const obj = parsed as Record<string, unknown>;
+  if (obj['version'] !== CACHE_VERSION_V3) return new Map();
+
+  const reverseMapRaw = obj['reverseMap'];
+  if (!isValidReverseMapObject(reverseMapRaw)) return new Map();
+
+  const absoluteRaw = relativeMapToAbsolute(reverseMapRaw, canonicalRoot);
+  return toConfinedReverseMap(absoluteRaw, canonicalRoot);
+}
+
 // ---------------------------------------------------------------------------
 // Disk format v3 — rootDir-relative paths (current)
 // ---------------------------------------------------------------------------
@@ -202,18 +269,37 @@ interface CacheDiskFormatV3 {
    */
   lastFullRebuild: number;
   runCount: number;
+  /**
+   * GIT IDENTITY METADATA (additive since this bead — every cache written
+   * before it, and any v1/v2 cache, simply lacks these fields; load defaults
+   * them to `undefined`, which reconcileCacheStaleness reads as "no baseline,
+   * don't warn"). Captured once per save from `readGitIdentity` (git.ts) and
+   * threaded through unchanged — cache.ts never shells out itself, staying
+   * synchronous.
+   *
+   * - `headSha` — the HEAD commit SHA at the time of this save. Compared
+   *   against the CURRENT HEAD sha on a later run to detect a branch switch
+   *   or rebase that silently invalidated the runtime-observed graph
+   *   (DIAGNOSTIC only — see reconcileCacheStaleness in plugin.ts).
+   * - `branch` — the branch name at the time of this save, carried alongside
+   *   `headSha` for the same diagnostic purpose.
+   */
+  headSha?: string;
+  branch?: string;
   reverseMap: Record<string, string[]>;  // source → test_files, rootDir-relative
 }
 
 /**
- * Staleness metadata surfaced from a cache load. Absent-in-file fields default
- * to 0 (no baseline), which the plugin's staleness check treats as "do not
- * warn" — a freshly-migrated v2/v1 cache or a pre-metadata v3 cache is not
- * flagged until its first full-suite run seeds `lastFullRebuild`.
+ * Staleness + git-identity metadata surfaced from a cache load. `headSha`/
+ * `branch` are `undefined` when the field is absent in the file (pre-this-bead
+ * v3 cache, or a migrated v1/v2 cache) — read as "no baseline, don't warn" by
+ * reconcileCacheStaleness, same posture as `lastFullRebuild`/`runCount` at 0.
  */
 export interface CacheMeta {
   lastFullRebuild: number;
   runCount: number;
+  headSha?: string;
+  branch?: string;
 }
 
 const EMPTY_META: CacheMeta = { lastFullRebuild: 0, runCount: 0 };
@@ -289,9 +375,14 @@ export function loadCachedReverseMap(
     const lastFullRebuild =
       typeof obj['lastFullRebuild'] === 'number' ? obj['lastFullRebuild'] : 0;
     const runCount = typeof obj['runCount'] === 'number' ? obj['runCount'] : 0;
+    // Additive git-identity metadata — absent in a pre-this-bead v3 cache,
+    // defaulted to undefined (no baseline, don't warn — same posture as the
+    // staleness fields above).
+    const headSha = typeof obj['headSha'] === 'string' ? obj['headSha'] : undefined;
+    const branch = typeof obj['branch'] === 'string' ? obj['branch'] : undefined;
 
     if (verbose) console.warn(`[vitest-affected] v3 cache hit — ${reverse.size} entries`);
-    return { reverse, hit: true, meta: { lastFullRebuild, runCount } };
+    return { reverse, hit: true, meta: { lastFullRebuild, runCount, headSha, branch } };
   }
 
   // --- v2 → v3 migration (v2 stored absolute paths) ---
@@ -329,42 +420,141 @@ export function loadCachedReverseMap(
 }
 
 /**
+ * Options threaded into {@link saveCacheSync} beyond the staleness/git-identity
+ * `meta`. Both are optional and default to today's behavior (no union, no
+ * sweep) — see the SAVE-PATH TRANSFORM ORDER doc on `saveCacheSync` itself for
+ * how they interact.
+ */
+export interface SaveCacheOptions {
+  /**
+   * The set of test paths THIS run actually observed (i.e. the union of every
+   * value-set in the `edges` the runtime reporter collected this cycle).
+   * Drives step 2 (the concurrency union): a disk edge is unioned in only when
+   * its TEST is absent from this set — this run is authoritative for every
+   * test it observed, disk is authoritative for everything else. `undefined`
+   * (the default — tests, one-off tools) skips the union entirely, preserving
+   * today's plain atomic-overwrite behavior.
+   */
+  observedTests?: Set<string>;
+  /**
+   * Whether this save follows a FULL-SUITE run. Gates step 3 (the growth
+   * prune): only a full-suite save re-exercises (near) every test, so only
+   * then can a missing source/test path be trusted as genuinely dead rather
+   * than merely "not part of this selective run". Default false (no sweep).
+   */
+  fullSuite?: boolean;
+}
+
+/**
  * Persist a reverse map to disk in v3 format (rootDir-relative paths).
  * Atomic write: temp file → renameSync. Always writes current-version-only —
  * there is no reason to ever write v1/v2 again, migration is a read-time-only
  * concern.
  *
- * Keys/values arrive already canonicalized absolute paths (the reporter +
- * mergeRuntimeEdges operate on canonical paths); this function relativizes
- * them against rootDir right before serialization — the one place the
- * absolute→relative boundary crosses on the way to disk.
+ * `saveCacheSync` intentionally keeps its 2-arg-compatible signature (no
+ * explicit `rootDir` parameter) for caller compatibility: every call site in
+ * this codebase constructs `cacheDir` as `path.join(rootDir,
+ * '.vitest-affected')`, so `path.dirname(cacheDir)` recovers rootDir without a
+ * signature change. Canonicalized defensively in case a caller ever passes a
+ * non-canonical cacheDir.
  *
- * `saveCacheSync` intentionally keeps its 2-arg signature (no explicit
- * `rootDir` parameter) for caller compatibility: every call site in this
- * codebase constructs `cacheDir` as `path.join(rootDir, '.vitest-affected')`,
- * so `path.dirname(cacheDir)` recovers rootDir without a signature change.
- * Canonicalized defensively in case a caller ever passes a non-canonical
- * cacheDir.
+ * `meta` carries the additive staleness + git-identity fields. It is optional
+ * and defaults to a FRESH full rebuild (`lastFullRebuild: now, runCount: 0`,
+ * `headSha`/`branch` undefined) so any caller that does not track them —
+ * tests, one-off tools — produces a non-stale, identity-less cache. The
+ * runtime reporter passes explicit meta on every save: a full-suite run
+ * resets the staleness baseline (now / 0), a selective run preserves
+ * `lastFullRebuild` and bumps `runCount`; `headSha`/`branch` are captured once
+ * (readGitIdentity, git.ts) and passed through unchanged on every save. NEVER
+ * let a selective save fall through to the fresh staleness default, or it
+ * would silently reset the baseline it is meant to age.
  *
- * `meta` carries the additive staleness fields. It is optional and defaults to
- * a FRESH full rebuild (`lastFullRebuild: now, runCount: 0`) so any caller that
- * does not track staleness — tests, one-off tools — produces a non-stale cache.
- * The runtime reporter passes explicit meta on every save: a full-suite run
- * resets it (now / 0), a selective run preserves `lastFullRebuild` and bumps
- * `runCount`. NEVER let a selective save fall through to the fresh default, or
- * it would silently reset the staleness baseline it is meant to age.
+ * SAVE-PATH TRANSFORM ORDER (binding — mis-ordering silently cancels these
+ * steps). Applied, in THIS order, immediately before serialize+rename:
+ *
+ *   1. Build this run's reverseMap — `reverse`, as passed in: already-canonical
+ *      absolute paths, exactly as before this bead.
+ *   2. CONCURRENCY UNION — only when `opts.observedTests` is supplied: re-read
+ *      the on-disk graph.json (via {@link readConfinedDiskMapV3}, NOT
+ *      `loadCachedReverseMap` — see that helper's doc) and per-KEY Set-union
+ *      its entries into the working map, but ONLY for tests the caller did
+ *      NOT observe this cycle. This lets a CONCURRENT writer's edges survive
+ *      while this process's own just-stripped removed-import edges are never
+ *      resurrected (that stripping already happened upstream, in
+ *      `mergeRuntimeEdges('all', ...)`, before `reverse` ever reaches here —
+ *      an observed test simply has no entry for a dropped edge to union back
+ *      in). Skipped entirely when `observedTests` is absent (today's plain
+ *      overwrite).
+ *   3. GROWTH PRUNE — only when `opts.fullSuite` is true, and only AFTER step
+ *      2: existsSync-sweep the UNIONED working map, dropping (i) source keys
+ *      whose file no longer exists and (ii) test-path values whose file no
+ *      longer exists (an entry emptied of every value is dropped entirely).
+ *      Running this AFTER the union — not before — is load-bearing: a
+ *      dead entry reintroduced by a concurrent writer's disk state in step 2
+ *      must still be swept by a full-suite save, which a prune-before-union
+ *      ordering would miss entirely.
+ *   4. Relativize + tmp-write + renameSync — as today.
+ *
+ * A union performed WITHOUT the observedTests guard would resurrect edges
+ * `mergeRuntimeEdges` deliberately removed upstream; pruning before the union
+ * would let step 2 re-add exactly the dead keys step 3 just swept. Either
+ * mis-ordering silently defeats the guarantee the other step exists to
+ * provide.
  */
 export function saveCacheSync(
   cacheDir: string,
   reverse: ReverseMap,
   meta: Partial<CacheMeta> = {},
+  opts: SaveCacheOptions = {},
 ): void {
   mkdirSync(cacheDir, { recursive: true });
 
   const canonicalRoot = toCanonicalPath(path.dirname(cacheDir));
 
+  // Step 1: this run's authoritative map. Cloned into a mutable working copy
+  // — `reverse` (and its Sets) may be a structurally-shared value the caller
+  // (the reporter's mergeRuntimeEdges output) still holds a reference to and
+  // reuses across saves; steps 2/3 below must never mutate the caller's Sets
+  // in place.
+  const working: ReverseMap = new Map();
+  for (const [file, tests] of reverse) working.set(file, new Set(tests));
+
+  // Step 2: CONCURRENCY UNION (skipped when observedTests is absent).
+  if (opts.observedTests) {
+    const onDisk = readConfinedDiskMapV3(cacheDir, canonicalRoot);
+    for (const [file, tests] of onDisk) {
+      for (const t of tests) {
+        // This run is authoritative for every test it observed — union in
+        // only the edges belonging to tests it did NOT observe this cycle.
+        if (opts.observedTests.has(t)) continue;
+        let target = working.get(file);
+        if (!target) {
+          target = new Set();
+          working.set(file, target);
+        }
+        target.add(t);
+      }
+    }
+  }
+
+  // Step 3: GROWTH PRUNE (full-suite saves only, AFTER the union above so a
+  // dead entry reintroduced by step 2 is still removed).
+  if (opts.fullSuite) {
+    for (const [file, tests] of working) {
+      if (!existsSync(file)) {
+        working.delete(file);
+        continue;
+      }
+      for (const t of tests) {
+        if (!existsSync(t)) tests.delete(t);
+      }
+      if (tests.size === 0) working.delete(file);
+    }
+  }
+
+  // Step 4: relativize + tmp-write + renameSync.
   const reverseMap: Record<string, string[]> = {};
-  for (const [file, tests] of reverse) {
+  for (const [file, tests] of working) {
     reverseMap[toRootRelative(file, canonicalRoot)] = [...tests].map((t) =>
       toRootRelative(t, canonicalRoot),
     );
@@ -376,6 +566,8 @@ export function saveCacheSync(
     builtAt: now,
     lastFullRebuild: meta.lastFullRebuild ?? now,
     runCount: meta.runCount ?? 0,
+    headSha: meta.headSha,
+    branch: meta.branch,
     reverseMap,
   };
 

@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, utimesSync } from 'node:fs';
 import { loadCachedReverseMap, saveCacheSync } from '../src/graph/cache.js';
 import { makeTempDir as makeTempDirTracked, cleanupTempDirs } from './_helpers.js';
 
@@ -254,14 +254,24 @@ describe('proto-pollution protection', () => {
 });
 
 describe('orphaned tmp cleanup', () => {
+  // NOTE: cleanup is now mtime-guarded (cache-robustness bead — a tmp file
+  // younger than the age threshold is presumed an in-flight concurrent write,
+  // not an orphan, and is spared). Backdate the fixture files past that
+  // threshold so this test still exercises genuine orphan reaping; the fresh-
+  // vs-aged distinction itself is covered in test/cache-v3.test.ts.
   test('cleans up .tmp- files on load', () => {
     const rootDir = makeTempDir();
     const cacheDir = path.join(rootDir, '.vitest-affected');
     mkdirSync(cacheDir, { recursive: true });
 
-    // Create orphaned tmp files
-    writeFileSync(path.join(cacheDir, '.tmp-abc123'), 'garbage');
-    writeFileSync(path.join(cacheDir, '.tmp-def456'), 'garbage');
+    // Create orphaned tmp files, backdated past the mtime-guard threshold.
+    const tmp1 = path.join(cacheDir, '.tmp-abc123');
+    const tmp2 = path.join(cacheDir, '.tmp-def456');
+    writeFileSync(tmp1, 'garbage');
+    writeFileSync(tmp2, 'garbage');
+    const oldTime = new Date(Date.now() - 120_000);
+    utimesSync(tmp1, oldTime, oldTime);
+    utimesSync(tmp2, oldTime, oldTime);
 
     loadCachedReverseMap(cacheDir, rootDir);
 

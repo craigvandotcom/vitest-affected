@@ -9,7 +9,7 @@ import { deltaParseNewImports } from './graph/builder.js';
 import { loadCachedReverseMap, saveCacheSync } from './graph/cache.js';
 import type { CacheMeta } from './graph/cache.js';
 import { normalizeModuleId, safeLabel, toCanonicalPath } from './graph/normalize.js';
-import { getChangedFiles } from './git.js';
+import { getChangedFiles, readGitIdentity } from './git.js';
 import { bfsAffectedTestsWithProvenance } from './selector.js';
 import type { SelectionTrail } from './selector.js';
 import { filterRelevantChangedFiles, isRootConfigFile, matchesAnyRule, toRepoRelative } from './changed-files.js';
@@ -28,6 +28,15 @@ interface ExperimentalImportDurations {
     thresholds?: { warn?: number; danger?: number };
   };
 }
+
+/**
+ * The HEAD sha + branch name pair `readGitIdentity` (git.ts) resolves — both
+ * fields degrade to `undefined` independently on failure (unborn HEAD, not a
+ * git repo, etc). Named locally so every consumer (reconcileCacheStaleness,
+ * installRuntimeReporter) shares one shape instead of re-declaring the
+ * inline object type.
+ */
+type GitIdentity = { headSha?: string; branch?: string };
 
 export interface VitestAffectedOptions {
   disabled?: boolean;
@@ -596,14 +605,25 @@ function buildExplain(
  * closures emit their own POST-run heartbeat lines (shadow=false) — never the
  * terminal decision line. Returns `setSelectedTests` so the pipeline can record
  * the applied selection for the reporter's self-verify.
+ *
+ * `gitIdentity` is captured ONCE (fetched early and unconditionally in
+ * `runPipeline`, before this function is even called) and threaded into BOTH
+ * `cacheMeta` literals below on every save — this is the ONLY production write
+ * path (saveCacheSync's other 0 call sites are all in tests), so a field
+ * missing from either branch here is silently dropped from every real cache
+ * on disk. Exported (over `createRuntimeReporter`, which callers already used
+ * directly) so `test/runtime-unit.test.ts` can drive the meta-passthrough and
+ * full-suite-prune wiring without a full plugin cycle — this is an additive,
+ * behavior-preserving export per the bead's testability latitude.
  */
-function installRuntimeReporter(
+export function installRuntimeReporter(
   vitest: VitestPluginContext['vitest'],
   rootDir: string,
   statsCtx: EmitStatsCtx,
   initialReverse: ReverseMap,
   cacheDir: string | undefined,
   initialCacheMeta: CacheMeta,
+  gitIdentity: GitIdentity = {},
 ): { setSelectedTests: (tests: string[]) => void } {
   let reverse = initialReverse;
   let cacheMeta = initialCacheMeta;
@@ -620,13 +640,35 @@ function installRuntimeReporter(
         // every edge → reset the baseline (now / 0). A selective run only
         // partially refreshes → preserve lastFullRebuild, bump runCount.
         // Reassign cacheMeta so a later watch re-run reads the fresh value.
+        // headSha/branch are threaded through UNCHANGED in both branches —
+        // this run's git identity was already captured once, early, in
+        // runPipeline; it is never re-derived per save.
         cacheMeta = wasFullSuiteRun
-          ? { lastFullRebuild: Date.now(), runCount: 0 }
+          ? {
+              lastFullRebuild: Date.now(),
+              runCount: 0,
+              headSha: gitIdentity.headSha,
+              branch: gitIdentity.branch,
+            }
           : {
               lastFullRebuild: cacheMeta.lastFullRebuild,
               runCount: cacheMeta.runCount + 1,
+              headSha: gitIdentity.headSha,
+              branch: gitIdentity.branch,
             };
-        saveCacheSync(cacheDir, reverse, cacheMeta);
+        // observedTests = every test path this cycle's edges touched — the
+        // concurrency-union scope (saveCacheSync step 2): this run is
+        // authoritative for these tests, disk is authoritative for the rest.
+        // fullSuite gates the growth-prune sweep (step 3) to full-suite saves
+        // only, mirroring the staleness-reset condition above.
+        const observedTests = new Set<string>();
+        for (const tests of edges.values()) {
+          for (const t of tests) observedTests.add(t);
+        }
+        saveCacheSync(cacheDir, reverse, cacheMeta, {
+          observedTests,
+          fullSuite: wasFullSuiteRun,
+        });
       } catch {
         // Best-effort: runtime edge persistence failed — cache will be stale next run
       }
@@ -766,11 +808,27 @@ function enforceImportDurationsShape(
  * exists (lastFullRebuild > 0) and the graph has aged out or exceeded the
  * selective-run budget. A recommendation only — never forces the full suite
  * (that would surprise a user mid-flow); the normal decision line still follows.
+ *
+ * Also reconciles GIT IDENTITY: when the cache's stored `headSha` (persisted
+ * at the last save) is present and differs from the CURRENT HEAD sha
+ * (`currentGitIdentity`, fetched fresh this run), the graph was recorded on a
+ * different commit — a branch switch or rebase that could have silently
+ * invalidated runtime-observed edges. Same DIAGNOSTIC posture as the
+ * staleness check above: emits a `cache-git-mismatch` heartbeat and nothing
+ * more — it does NOT force the full suite. Skipped when either side is
+ * absent (no stored baseline yet, or the current read degraded to
+ * `undefined`) — an absent value means "nothing to compare", not a mismatch.
+ *
+ * Exported (per the bead's testability latitude) so `test/runtime-unit.test.ts`
+ * can drive it directly with a fake `statsCtx` rather than a full plugin
+ * cycle — a pure function over its inputs, easy to pin without broader
+ * surface.
  */
-function reconcileCacheStaleness(
+export function reconcileCacheStaleness(
   options: VitestAffectedOptions,
   cacheMeta: CacheMeta,
   statsCtx: EmitStatsCtx,
+  currentGitIdentity: GitIdentity = {},
 ): void {
   const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
   const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
@@ -790,6 +848,18 @@ function reconcileCacheStaleness(
         selectiveRunCount: cacheMeta.runCount,
       }, false);
     }
+  }
+
+  if (
+    cacheMeta.headSha &&
+    currentGitIdentity.headSha &&
+    cacheMeta.headSha !== currentGitIdentity.headSha
+  ) {
+    console.warn(
+      `[vitest-affected] CACHE GIT MISMATCH: the dependency graph was last recorded at commit ${cacheMeta.headSha.slice(0, 12)}, but HEAD is now ${currentGitIdentity.headSha.slice(0, 12)}. ` +
+        'A branch switch or rebase may have changed files the cache never observed. Continuing with selective selection for now.',
+    );
+    emitStats(statsCtx, 'heartbeat', 'cache-git-mismatch', undefined, false);
   }
 }
 
@@ -907,6 +977,16 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
   );
   if (importDurationsDecision) return importDurationsDecision;
 
+  // GIT IDENTITY — fetched ONCE, EARLY, and UNCONDITIONALLY: independent of
+  // change-source (covers both the getChangedFiles path below and the
+  // options.changedFiles injection path, which bypasses getChangedFiles
+  // entirely), and ahead of reconcileCacheStaleness so its mismatch check
+  // always has the current commit to compare against. readGitIdentity never
+  // throws — both fields degrade to `undefined` independently on any
+  // failure (not a git repo, unborn HEAD, etc), so this can never itself
+  // trigger the full-suite fallback.
+  const gitIdentity = await readGitIdentity(rootDir);
+
   // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
   cacheDir = path.join(rootDir, '.vitest-affected');
 
@@ -921,9 +1001,9 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
     cacheHit = false;
   }
 
-  // STALENESS RECONCILIATION — a pre-run diagnostic (never forces the full
-  // suite); see reconcileCacheStaleness.
-  reconcileCacheStaleness(options, cacheMeta, statsCtx);
+  // STALENESS + GIT IDENTITY RECONCILIATION — a pre-run diagnostic (never
+  // forces the full suite); see reconcileCacheStaleness.
+  reconcileCacheStaleness(options, cacheMeta, statsCtx, gitIdentity);
 
   // Inject runtime reporter that merges runtime edges into cached reverse
   // map. On selective runs only a subset of tests execute, so it merges
@@ -936,6 +1016,7 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
     reverse,
     cacheDir,
     cacheMeta,
+    gitIdentity,
   );
 
   // Register watch-mode filter: pass-through (Vitest's own module graph handles it)
