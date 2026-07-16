@@ -1,7 +1,7 @@
 /// <reference types="vitest/config" />
 import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
 import {
@@ -337,6 +337,215 @@ describe('every-exit emission contract', () => {
     const lines = readStats(statsFile);
     expect(lines).toHaveLength(1);
     expect(lines[0].reason).toBe('error');
+  });
+
+  // -------------------------------------------------------------------------
+  // wlm.1 parity matrix: the 6 guards above (workspace, config-shape,
+  // no-include-patterns, no-test-files, always-run-config-error, error) plus
+  // the 10 below = ALL 16 full-suite `reason` strings emitStats() emits (the
+  // corrected matrix in bead wlm.1's comment). Each pins exactly ONE terminal
+  // decision line with its reason — the behavior-preservation contract the
+  // configureVitest staged-pipeline refactor must hold identical.
+  // -------------------------------------------------------------------------
+
+  test('import-durations-shape guard emits one line', async () => {
+    const { tmpDir, mainPath } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    // A non-plain-object importDurations trips the structural shape-check.
+    const { vitest, project } = createMockContext(tmpDir, {
+      experimental: { importDurations: [] },
+    });
+
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('import-durations-shape');
+  });
+
+  test('setup-file-change guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const setupPath = path.join(tmpDir, 'tests', 'setup.ts');
+    writeFileSync(setupPath, 'export default () => {};\n');
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    projectConfig.setupFiles = [setupPath];
+
+    await runHook(
+      vitestAffected({ changedFiles: [setupPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('setup-file-change');
+  });
+
+  test('global-setup-change guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const gsPath = path.join(tmpDir, 'global-setup.ts');
+    writeFileSync(gsPath, 'export function setup() {}\n');
+    const { vitest, project } = createMockContext(tmpDir, { globalSetup: gsPath });
+
+    await runHook(
+      vitestAffected({ changedFiles: [gsPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('global-setup-change');
+  });
+
+  test('full-suite-trigger guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const mdPath = path.join(tmpDir, 'docs.md');
+    writeFileSync(mdPath, '# docs\n');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({
+        changedFiles: [mdPath],
+        fullSuiteTriggers: [/\.md$/],
+        cache: true,
+        statsFile,
+      }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('full-suite-trigger');
+  });
+
+  test('no-changes guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('no-changes');
+  });
+
+  test('config-change guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const cfgPath = path.join(tmpDir, 'vitest.config.ts');
+    writeFileSync(cfgPath, 'export default {};\n');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      // respectProvidedChangedFiles keeps the config file past the relevance
+      // filter, so the root-config force-rerun fires rather than no-changes.
+      vitestAffected({
+        changedFiles: [cfgPath],
+        respectProvidedChangedFiles: true,
+        cache: true,
+        statsFile,
+      }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('config-change');
+  });
+
+  test('cache-miss guard emits one line', async () => {
+    const { tmpDir, mainPath } = setupProject(false); // no cache on disk
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('cache-miss');
+  });
+
+  test('no-affected-tests guard emits one line', async () => {
+    const { tmpDir } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    // An orphan source: on disk + relevant, but reaches no test in the graph.
+    const orphanPath = path.join(tmpDir, 'src', 'orphan.ts');
+    writeFileSync(orphanPath, 'export const orphan = 1;\n');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [orphanPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('no-affected-tests');
+  });
+
+  test('threshold-exceeded guard emits one line', async () => {
+    const { tmpDir, mainPath } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      // 1 affected / 1 total = 100% > 50% threshold → full suite.
+      vitestAffected({
+        changedFiles: [mainPath],
+        threshold: 0.5,
+        cache: true,
+        statsFile,
+      }),
+      { vitest, project },
+    );
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('threshold-exceeded');
+  });
+
+  test('no-valid-tests-on-disk guard emits one line (TOCTOU: globbed test vanishes before the on-disk filter)', async () => {
+    const { tmpDir, mainPath, testPath } = setupProject(true);
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+    const { vitest, project } = createMockContext(tmpDir);
+
+    // no-valid-tests-on-disk is a TOCTOU race-guard: a test globbed (present at
+    // glob time) but gone by the post-BFS existsSync filter — affected tests are
+    // otherwise always a subset of on-disk globbed files. Reproduce it
+    // deterministically WITHOUT a new harness by deleting the selected test the
+    // instant the plugin reads options.threshold, which it reads exactly once,
+    // AFTER BFS and BEFORE the existsSync filter.
+    let deleted = false;
+    const options = {
+      changedFiles: [mainPath],
+      cache: true as const,
+      statsFile,
+      get threshold(): number {
+        if (!deleted) {
+          rmSync(testPath);
+          deleted = true;
+        }
+        return 1.0; // default: never trips threshold-exceeded (ratio 1.0 !> 1.0)
+      },
+    };
+
+    await runHook(vitestAffected(options), { vitest, project });
+
+    const lines = readStats(statsFile);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].reason).toBe('no-valid-tests-on-disk');
   });
 
   // wlm.13: a pre-root early-exit guard with a RELATIVE statsFile must resolve
