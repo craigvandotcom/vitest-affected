@@ -1,7 +1,7 @@
 /// <reference types="vitest/config" />
 import type { Plugin } from 'vite';
 import type { Reporter, TestRunEndReason } from 'vitest/reporters';
-import type { TestModule } from 'vitest/node';
+import type { TestModule, VitestPluginContext } from 'vitest/node';
 import { existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'tinyglobby';
@@ -508,10 +508,22 @@ function isExistingFile(p: string): boolean {
 }
 
 /**
+ * A terminal pipeline decision: the single `(action, reason, extra)` tuple that
+ * becomes the one DECISION line the orchestrator emits at its tail. Every
+ * early-exit inside {@link runPipeline} returns one of these (or `null` for the
+ * disabled rollback switch, which emits nothing).
+ */
+interface Decision {
+  action: string;
+  reason?: string;
+  extra?: Record<string, unknown>;
+}
+
+/**
  * Twin-block helper: resolve a `string | string[]` config field
  * (setupFiles/globalSetup) into a canonicalized Set, check it against the RAW
- * changed+deleted set, and on a hit warn + emit the full-suite stats line.
- * Returns true so the caller can early-return.
+ * changed+deleted set, and on a hit warn + return the full-suite Decision.
+ * Returns `null` when there is no hit so the caller can fall through.
  */
 function checkFullSuiteConfigField(
   rawField: string | string[] | undefined,
@@ -523,8 +535,7 @@ function checkFullSuiteConfigField(
   deletedCount: number,
   graphSize: number,
   startMs: number,
-  statsCtx: EmitStatsCtx,
-): boolean {
+): Decision | null {
   const fieldRaw = rawField ?? [];
   const fieldSet = new Set(
     (Array.isArray(fieldRaw) ? fieldRaw : [fieldRaw]).map((f) =>
@@ -533,13 +544,16 @@ function checkFullSuiteConfigField(
   );
   if (rawChanged.some((f) => fieldSet.has(f))) {
     console.warn(warnMessage);
-    emitStats(statsCtx, 'full-suite', reason, {
-      changedFiles: changedCount, deletedFiles: deletedCount,
-      graphSize, durationMs: Date.now() - startMs,
-    });
-    return true;
+    return {
+      action: 'full-suite',
+      reason,
+      extra: {
+        changedFiles: changedCount, deletedFiles: deletedCount,
+        graphSize, durationMs: Date.now() - startMs,
+      },
+    };
   }
-  return false;
+  return null;
 }
 
 /**
@@ -570,48 +584,40 @@ function buildExplain(
   return out;
 }
 
-export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
-  // Hoisted state — shared between config() and configureVitest()
+/**
+ * Inputs threaded into {@link runPipeline}: the two hook arguments plus the
+ * env-resolved options/mode and the ambient stats context the orchestrator
+ * built above its try. `statsCtx.rootDir` is mutated in place by the pipeline
+ * (root-anchored once `vitest.config.root` resolves) so the orchestrator's tail
+ * emission and its catch-all both observe the anchored path.
+ */
+interface PipelineCtx {
+  vitest: VitestPluginContext['vitest'];
+  project: VitestPluginContext['project'];
+  options: VitestAffectedOptions;
+  statsCtx: EmitStatsCtx;
+  startMs: number;
+  verbose: boolean;
+  shadow: boolean;
+  disabled: boolean;
+}
+
+/**
+ * The staged selection pipeline. Runs the full decision sequence and RETURNS a
+ * single terminal {@link Decision} (or `null` when disabled → emit nothing)
+ * instead of emitting inline; the orchestrator writes exactly one DECISION line
+ * at its tail from the returned value. Non-terminal emits stay inline (the
+ * cache-stale heartbeat) or in the runtime reporter's post-run closures
+ * (zero-edges / selection-mismatch) — those are never the terminal decision
+ * line. `reverse`/`cacheDir`/`cacheMeta` are pipeline locals: the runtime
+ * reporter closure reassigns them across watch re-runs and persists via
+ * saveCacheSync (the cross-run channel is disk, not this call's scope).
+ */
+async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
+  const { vitest, project, options, statsCtx, startMs, verbose, shadow, disabled } =
+    ctx;
   let reverse: ReverseMap = new Map();
   let cacheDir: string | undefined;
-
-  return {
-    name: 'vitest-affected',
-
-    async configureVitest({ vitest, project }) {
-      // 1. Env overrides + mode resolution — hoisted ABOVE the try so the
-      // catch-all and every early return can emit a stats line.
-      let { disabled = false } = options;
-      if (process.env.VITEST_AFFECTED_DISABLED === '1') {
-        disabled = true;
-      }
-      let { shadow = false } = options;
-      if (process.env.VITEST_AFFECTED_SHADOW === '1') {
-        shadow = true;
-      }
-      const verbose = options.verbose ?? false;
-      const startMs = Date.now();
-
-      // Stats path: the env override wins over config so historical consumer
-      // configs cannot starve emission. Resolved here (before rootDir is known)
-      // so the catch-all can still emit; rootDir starts at cwd and is refined
-      // once vitest.config.root resolves.
-      const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
-      // Ambient stats-emission context, passed to the module-level `emitStats`.
-      // `rootDir` is canonicalized (the same path-identity boundary every other
-      // path in the plugin routes through). It starts at a cwd fallback so the
-      // catch-all can always resolve a relative/default statsFile, but is then
-      // root-anchored BELOW — before ANY guard emits — whenever vitest.config.root
-      // is present. The cwd fallback is retained ONLY for the genuinely-rootless
-      // case (vitest.config.root absent): there is then no root to resolve to.
-      const statsCtx: EmitStatsCtx = {
-        statsFile,
-        rootDir: toCanonicalPath(process.cwd()),
-        verbose,
-        shadow,
-      };
-
-      try {
         // Root-anchor the stats path as early as possible (wlm.13), but INSIDE
         // the try so a throwing `vitest.config` getter (the exact threat model
         // the every-exit tests exercise) falls into the catch-all full-suite
@@ -629,7 +635,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 2. Disabled check — rollback switch is fully inert: emits NOTHING.
         if (disabled) {
-          return;
+          return null;
         }
 
         // 3. Workspace guard
@@ -637,10 +643,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Workspace with multiple projects detected — skipping test selection, running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'workspace', {
-            durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'workspace',
+            extra: { durationMs: Date.now() - startMs },
+          };
         }
 
         // 4. Config shape validation
@@ -653,10 +660,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Unexpected config shape — running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'config-shape', {
-            durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'config-shape',
+            extra: { durationMs: Date.now() - startMs },
+          };
         }
 
         // Canonicalize once at the source: every downstream graph key (cache
@@ -690,10 +698,11 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               `[vitest-affected] alwaysRunTests path(s) not found or not a file: ${missing.slice(0, 5).map(safeLabel).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5} more)` : ''} — running full suite`,
             );
-            emitStats(statsCtx, 'full-suite', 'always-run-config-error', {
-              durationMs: Date.now() - startMs,
-            });
-            return;
+            return {
+              action: 'full-suite',
+              reason: 'always-run-config-error',
+              extra: { durationMs: Date.now() - startMs },
+            };
           }
           alwaysRunTests = resolvedAlwaysRun;
         }
@@ -726,10 +735,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
             );
-            emitStats(statsCtx, 'full-suite', 'import-durations-shape', {
-              graphSize: reverse.size, durationMs: Date.now() - startMs,
-            });
-            return;
+            return {
+              action: 'full-suite',
+              reason: 'import-durations-shape',
+              extra: {
+                graphSize: reverse.size, durationMs: Date.now() - startMs,
+              },
+            };
           }
         }
         if (exp) {
@@ -900,11 +912,14 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               `[vitest-affected] Full-suite trigger matched (${safeLabel(toRepoRelative(triggerHit, rootDir))}) — running full suite`,
             );
-            emitStats(statsCtx, 'full-suite', 'full-suite-trigger', {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              graphSize: reverse.size, durationMs: Date.now() - startMs,
-            });
-            return;
+            return {
+              action: 'full-suite',
+              reason: 'full-suite-trigger',
+              extra: {
+                changedFiles: changed.length, deletedFiles: deleted.length,
+                graphSize: reverse.size, durationMs: Date.now() - startMs,
+              },
+            };
           }
         }
 
@@ -917,32 +932,26 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         // matching 6a's behavior.
         const rawChangedForSetup = [...changed, ...deleted];
 
-        if (
-          checkFullSuiteConfigField(
-            project.config.setupFiles,
-            '[vitest-affected] Setup file change detected — running full suite',
-            'setup-file-change',
-            rootDir, rawChangedForSetup, changed.length, deleted.length,
-            reverse.size, startMs, statsCtx,
-          )
-        ) {
-          return;
-        }
+        const setupDecision = checkFullSuiteConfigField(
+          project.config.setupFiles,
+          '[vitest-affected] Setup file change detected — running full suite',
+          'setup-file-change',
+          rootDir, rawChangedForSetup, changed.length, deleted.length,
+          reverse.size, startMs,
+        );
+        if (setupDecision) return setupDecision;
 
         // globalSetup is a sibling of setupFiles on the resolved config — same
         // string | string[] shape, same relative-path-resolution requirement,
         // same "invisible to the import graph" reasoning. Mirrored exactly.
-        if (
-          checkFullSuiteConfigField(
-            project.config.globalSetup,
-            '[vitest-affected] Global setup file change detected — running full suite',
-            'global-setup-change',
-            rootDir, rawChangedForSetup, changed.length, deleted.length,
-            reverse.size, startMs, statsCtx,
-          )
-        ) {
-          return;
-        }
+        const globalSetupDecision = checkFullSuiteConfigField(
+          project.config.globalSetup,
+          '[vitest-affected] Global setup file change detected — running full suite',
+          'global-setup-change',
+          rootDir, rawChangedForSetup, changed.length, deleted.length,
+          reverse.size, startMs,
+        );
+        if (globalSetupDecision) return globalSetupDecision;
 
         // 6b. Filter irrelevant changed/deleted files before any graph analysis.
         // Caller-provided changedFiles still get filtered unless explicitly opted out.
@@ -975,12 +984,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 7. No changes check — run full suite
         if (changed.length === 0 && deleted.length === 0) {
-          emitStats(statsCtx, 'full-suite', 'no-changes', {
-            changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
-            graphSize: reverse.size,
-            durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'no-changes',
+            extra: {
+              changedFiles: 0, deletedFiles: 0, ignoredFiles: ignoredCount,
+              graphSize: reverse.size,
+              durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // 8. Deleted file handling — treat as BFS seeds
@@ -1004,12 +1016,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] Config file change detected — running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'config-change', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: reverse.size, durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'config-change',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              graphSize: reverse.size, durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // 10. Cache miss → full suite (first run collects runtime data)
@@ -1019,13 +1034,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               '[vitest-affected] No cached runtime graph — running full suite (will populate cache after run)',
             );
           }
-          emitStats(statsCtx, 'full-suite', 'cache-miss', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: 0, cacheHit: false,
-            durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'cache-miss',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              graphSize: 0, cacheHit: false,
+              durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // 11. Delta parse: find new imports in changed files not yet in cache.
@@ -1048,12 +1066,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No include patterns configured — running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'no-include-patterns', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'no-include-patterns',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // Canonicalize glob results so they converge with graph keys built off
@@ -1084,12 +1105,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             console.warn(
               `[vitest-affected] alwaysRunTests path(s) not matched by this project's include/exclude patterns: ${outsidePatterns.slice(0, 5).map(safeLabel).join(', ')}${outsidePatterns.length > 5 ? ` (+${outsidePatterns.length - 5} more)` : ''} — running full suite`,
             );
-            emitStats(statsCtx, 'full-suite', 'always-run-config-error', {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            });
-            return;
+            return {
+              action: 'full-suite',
+              reason: 'always-run-config-error',
+              extra: {
+                changedFiles: changed.length, deletedFiles: deleted.length,
+                ignoredFiles: ignoredCount,
+                graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+              },
+            };
           }
         }
 
@@ -1097,12 +1121,15 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             '[vitest-affected] No test files matched include patterns — running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'no-test-files', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'no-test-files',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // 13. BFS: find affected tests (with provenance — the explain trail).
@@ -1129,26 +1156,32 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
               // that ignores the alwaysRunTests union).
               setSelectedTests(selected);
             }
-            emitStats(statsCtx, 'selective', 'allow-no-tests', {
-              changedFiles: changed.length, deletedFiles: deleted.length,
-              ignoredFiles: ignoredCount,
-              affectedTests: 0, totalTests: testFiles.length,
-              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-              selectedFiles: selected,
-              explain: buildExplain([], options.explain, provenance),
-            });
-            return;
+            return {
+              action: 'selective',
+              reason: 'allow-no-tests',
+              extra: {
+                changedFiles: changed.length, deletedFiles: deleted.length,
+                ignoredFiles: ignoredCount,
+                affectedTests: 0, totalTests: testFiles.length,
+                graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+                selectedFiles: selected,
+                explain: buildExplain([], options.explain, provenance),
+              },
+            };
           }
           console.warn(
             '[vitest-affected] No affected tests found — running full suite',
           );
-          emitStats(statsCtx, 'full-suite', 'no-affected-tests', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            affectedTests: 0, totalTests: testFiles.length,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'no-affected-tests',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              affectedTests: 0, totalTests: testFiles.length,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // alwaysRunTests entries are intentionally exempt from this ratio check —
@@ -1160,13 +1193,16 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
           console.warn(
             `[vitest-affected] Threshold exceeded (${affectedTests.length}/${testFiles.length} = ${(ratio * 100).toFixed(1)}%) — running full suite`,
           );
-          emitStats(statsCtx, 'full-suite', 'threshold-exceeded', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            affectedTests: affectedTests.length, totalTests: testFiles.length,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
-          return;
+          return {
+            action: 'full-suite',
+            reason: 'threshold-exceeded',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              affectedTests: affectedTests.length, totalTests: testFiles.length,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            },
+          };
         }
 
         // 15. Verbose summary: count of changed files not in graph (was per-file warning)
@@ -1200,25 +1236,79 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
             // Record the selected set for the reporter's post-run self-verify.
             setSelectedTests(selected);
           }
-          emitStats(statsCtx, 'selective', undefined, {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            affectedTests: validTests.length, totalTests: testFiles.length,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-            selectedFiles: selected,
-            explain: buildExplain(validTests, options.explain, provenance),
-          });
+          return {
+            action: 'selective',
+            reason: undefined,
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              affectedTests: validTests.length, totalTests: testFiles.length,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+              selectedFiles: selected,
+              explain: buildExplain(validTests, options.explain, provenance),
+            },
+          };
         } else {
-          emitStats(statsCtx, 'full-suite', 'no-valid-tests-on-disk', {
-            changedFiles: changed.length, deletedFiles: deleted.length,
-            ignoredFiles: ignoredCount,
-            affectedTests: 0, totalTests: testFiles.length,
-            graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
-          });
+          return {
+            action: 'full-suite',
+            reason: 'no-valid-tests-on-disk',
+            extra: {
+              changedFiles: changed.length, deletedFiles: deleted.length,
+              ignoredFiles: ignoredCount,
+              affectedTests: 0, totalTests: testFiles.length,
+              graphSize: reverse.size, cacheHit, durationMs: Date.now() - startMs,
+            },
+          };
+        }
+}
+
+export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
+  return {
+    name: 'vitest-affected',
+
+    async configureVitest({ vitest, project }) {
+      // Env overrides + mode resolution, resolved ABOVE the try so the tail
+      // emission and the catch-all both see them. statsCtx.rootDir starts at a
+      // cwd fallback (so a relative/default statsFile always resolves) and is
+      // root-anchored inside runPipeline before any guard emits.
+      let { disabled = false } = options;
+      if (process.env.VITEST_AFFECTED_DISABLED === '1') {
+        disabled = true;
+      }
+      let { shadow = false } = options;
+      if (process.env.VITEST_AFFECTED_SHADOW === '1') {
+        shadow = true;
+      }
+      const verbose = options.verbose ?? false;
+      const startMs = Date.now();
+      const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
+      const statsCtx: EmitStatsCtx = {
+        statsFile,
+        rootDir: toCanonicalPath(process.cwd()),
+        verbose,
+        shadow,
+      };
+
+      try {
+        // The pipeline returns exactly one terminal decision (or null when
+        // disabled → emit nothing); the single DECISION line is written here at
+        // the orchestrator tail. The catch-all preserves the safety invariant:
+        // any throw → full-suite fallback, never a silent skip. statsCtx was
+        // built above the try so this exit still emits.
+        const decision = await runPipeline({
+          vitest,
+          project,
+          options,
+          statsCtx,
+          startMs,
+          verbose,
+          shadow,
+          disabled,
+        });
+        if (decision) {
+          emitStats(statsCtx, decision.action, decision.reason, decision.extra);
         }
       } catch (err) {
-        // 18. Catch-all: safety invariant — never crash, never skip silently.
-        // Stats path was resolved above the try so this exit still emits.
         console.warn(
           `[vitest-affected] Unexpected error — running full suite: ${err instanceof Error ? err.message : String(err)}`,
         );
