@@ -224,9 +224,22 @@ export interface VitestAffectedOptions {
   threshold?: number;      // Run full suite if affected ratio > threshold (0-1, default 1.0 = disabled)
   allowNoTests?: boolean;  // If true, allow selecting 0 tests (default: false — runs full suite instead)
   cache?: boolean;         // (Phase 2) Persist graph to disk (default: true)
-  extraDependencies?: Record<string, string[]>;  // (Phase 3) Non-import deps: source globs → test globs
+  extraDependencies?: Record<string, string[]>;  // (Phase 3) SUPERSEDED — see note below
 }
 ```
+
+> **`extraDependencies` sketch superseded by the shipped mechanism (`?raw` + `alwaysRunTests`) — va-pw0.11, 2026-07-16.** The
+> `Record<source-glob, test-globs[]>` design above (map a source glob → the test
+> globs that depend on it — an *inverted* direction relative to the real reverse
+> graph) was never shipped. Non-import ("blind-channel") dependencies are instead
+> covered by two mechanisms that already landed: (1) `?raw` imports, which make an
+> otherwise fs-read file a real, graph-visible edge; and (2) the `alwaysRunTests`
+> option, for irreducible whole-tree scanners (`readdirSync` / tree-wide `execSync`
+> git-grep) that no finite dependency set can model. The banked design and the
+> rationale for dropping `extraDependencies` live in
+> `_plans/_done/2026-07-10-1240-vitest-affected-next-level-upgrade.md` Decision Log #11.
+> BCA's consumption (the reference application of both mechanisms) is wired in its
+> `vitest.config.mts` (`fullSuiteTriggers` + `alwaysRunTests`).
 
 ---
 
