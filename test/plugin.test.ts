@@ -676,4 +676,28 @@ describe('lockfile change → full suite (regression pin)', () => {
     expect(projectConfig.include).toEqual(originalInclude);
     expect(lastStat(statsFile).reason).toBe('config-change');
   });
+
+  test('a nested packages/*/package-lock.json does NOT trigger config-change (root-anchored)', async () => {
+    // Regression pin for va-hygiene-...wlm.3: a config basename nested under a
+    // package dir is NOT a repo-root config, so it must not short-circuit to a
+    // full suite. In a monorepo every packages/*/package-lock.json edit would
+    // otherwise negate selection.
+    const { tmpDir } = setupOrphanFixture();
+    const nestedDir = path.join(tmpDir, 'packages', 'foo');
+    mkdirSync(nestedDir, { recursive: true });
+    const nestedLock = path.join(nestedDir, 'package-lock.json');
+    writeFileSync(nestedLock, '{"name":"foo","lockfileVersion":3}\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const { vitest, project } = createMockContext(tmpDir);
+
+    await runHook(
+      vitestAffected({ changedFiles: [nestedLock], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    // The decision line is anything BUT config-change (the nested lockfile
+    // seeds BFS with no dependents rather than forcing the full suite).
+    expect(lastStat(statsFile).reason).not.toBe('config-change');
+  });
 });

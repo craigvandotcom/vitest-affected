@@ -45,6 +45,6 @@
     <text x="404" y="86" font-size="15" fill="#17c817" font-weight="700" text-anchor="middle">PASS</text>
 
     <text x="58" y="116" font-size="15" fill="#c3c2b7">0 misses · 12 verified selections</text>
-    <text x="58" y="142" font-size="12.5" fill="#78776f">replay-measured + live CI checkpoints · 2026-07-11</text>
+    <text x="58" y="142" font-size="12.5" fill="#78776f">replay-measured + live CI checkpoints · 2026-07-16</text>
   </g>
 </svg>

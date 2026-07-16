@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import {
   filterRelevantChangedFiles,
+  isRootConfigFile,
   matchesAnyRule,
   toRepoRelative,
 } from '../src/changed-files.js';
@@ -69,10 +70,14 @@ describe('filterRelevantChangedFiles', () => {
     expect(r.changed).toEqual([abs('package.json'), abs('vitest.config.ts')]);
   });
 
-  test('preserves config-basename files inside default-ignored prefixes is not relevant — defaults are absolute prefixes', () => {
-    // Sanity: a tsconfig.json inside .next/ is still recognized as config-basename
+  test('a config-basename NESTED under an ignored prefix is no longer force-preserved (root-anchored)', () => {
+    // A tsconfig.json inside .next/ is NOT a repo-root config, so root-anchoring
+    // (va-hygiene-...wlm.3) no longer force-preserves it — the .next/ ignore
+    // prefix now correctly wins. Previously the config-basename branch fired
+    // before the ignore check and wrongly retained every nested config basename.
     const r = call({ changed: [abs('.next/tsconfig.json')] });
-    expect(r.changed).toEqual([abs('.next/tsconfig.json')]);
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([abs('.next/tsconfig.json')]);
   });
 
   test('does not delta-parse ignored files (verified via filtered output)', () => {
@@ -259,6 +264,64 @@ describe('toRepoRelative', () => {
 
   test('non-POSIX-absolute inputs above root are returned unchanged', () => {
     expect(toRepoRelative('C:/other/a.ts', 'C:/proj')).toBe('C:/other/a.ts');
+  });
+});
+
+describe('isRootConfigFile (root-anchored config predicate)', () => {
+  const SET = new Set(['package.json', 'vitest.workspace.ts']);
+
+  test('a repo-root config is a root config', () => {
+    expect(isRootConfigFile('package.json', SET)).toBe(true);
+    expect(isRootConfigFile('vitest.workspace.ts', SET)).toBe(true);
+  });
+
+  test('a nested config is NOT a root config (selection preserved)', () => {
+    expect(isRootConfigFile('packages/foo/package.json', SET)).toBe(false);
+    expect(isRootConfigFile('a/b/c/package.json', SET)).toBe(false);
+  });
+
+  test('a shared config ABOVE rootDir (all-`..` prefix) IS a root config', () => {
+    // gitRoot !== rootDir: a Vitest project rooted at packages/foo with the
+    // workspace config at the monorepo root above it — must still full-suite.
+    expect(isRootConfigFile('../vitest.workspace.ts', SET)).toBe(true);
+    expect(isRootConfigFile('../../vitest.workspace.ts', SET)).toBe(true);
+  });
+
+  test('a SIBLING package config above rootDir is NOT a root config', () => {
+    // ../bar/package.json contains a non-`..` segment — the negative case a
+    // naive startsWith('..') shortcut would wrongly anchor.
+    expect(isRootConfigFile('../bar/package.json', SET)).toBe(false);
+    expect(isRootConfigFile('../../other/package.json', SET)).toBe(false);
+  });
+
+  test('a basename not in the set is never a root config', () => {
+    expect(isRootConfigFile('README.md', SET)).toBe(false);
+    expect(isRootConfigFile('src/index.ts', SET)).toBe(false);
+  });
+});
+
+describe('filterRelevantChangedFiles — nested config no longer force-preserved', () => {
+  // Use a config basename whose extension is NOT in the allowlist so the ONLY
+  // thing that could retain it is the configBasenames branch — isolating the
+  // root-anchoring behavior. yarn.lock (.lock) qualifies.
+  const LOCK_ONLY = { configBasenames: new Set(['yarn.lock']) };
+
+  test('a ROOT yarn.lock is retained (full-suite trigger preserved)', () => {
+    const r = call({ changed: [abs('yarn.lock')] }, LOCK_ONLY);
+    expect(r.changed).toEqual([abs('yarn.lock')]);
+    expect(r.ignored).toEqual([]);
+  });
+
+  test('a nested packages/*/yarn.lock is NOT retained (edit)', () => {
+    const r = call({ changed: [abs('packages/foo/yarn.lock')] }, LOCK_ONLY);
+    expect(r.changed).toEqual([]);
+    expect(r.ignored).toEqual([abs('packages/foo/yarn.lock')]);
+  });
+
+  test('a nested packages/*/yarn.lock is NOT retained (delete)', () => {
+    const r = call({ changed: [], deleted: [abs('packages/foo/yarn.lock')] }, LOCK_ONLY);
+    expect(r.deleted).toEqual([]);
+    expect(r.ignored).toEqual([abs('packages/foo/yarn.lock')]);
   });
 });
 

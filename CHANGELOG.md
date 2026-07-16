@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Config full-suite trigger is now root-anchored** — a config basename
+  (`package.json`, lockfiles, `vitest.config.*`, …) only forces a full suite
+  when it sits at the repo root (or is a shared workspace config above the
+  Vitest project root). Previously the basename matched _anywhere_, so in a
+  monorepo every `packages/foo/package.json` edit (or deletion) negated test
+  selection and forced the whole suite. Both decision sites — the plugin's
+  force-rerun check and the relevance filter — now share one exported
+  `isRootConfigFile` predicate so they cannot drift.
 - **Committed renames now seed a deletion** — git change detection runs with
   `--no-renames`, so a committed rename surfaces the old path as a deletion
   (which seeds BFS from the dependents of the vanished file) instead of being

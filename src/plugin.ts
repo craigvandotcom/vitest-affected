@@ -12,7 +12,7 @@ import { normalizeModuleId, safeLabel, toCanonicalPath } from './graph/normalize
 import { getChangedFiles } from './git.js';
 import { bfsAffectedTestsWithProvenance } from './selector.js';
 import type { SelectionTrail } from './selector.js';
-import { filterRelevantChangedFiles, matchesAnyRule, toRepoRelative } from './changed-files.js';
+import { filterRelevantChangedFiles, isRootConfigFile, matchesAnyRule, toRepoRelative } from './changed-files.js';
 import { mergeRuntimeEdges } from './runtime-merge.js';
 import type { ReverseMap } from './graph/types.js';
 
@@ -975,8 +975,13 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
 
         // 9. Force-rerun check: config file or setupFiles changes → full suite
         const allChangedFiles = [...changed, ...deleted];
+        // Root-anchored: only a config at the repo root (or a shared workspace
+        // config above rootDir) forces a full suite. A nested
+        // packages/foo/package.json must NOT negate selection — route the
+        // absolute path through toRepoRelative and share the predicate with the
+        // relevance filter (changed-files.ts) so the two sites never drift.
         const hasConfigChange = allChangedFiles.some((f) =>
-          CONFIG_BASENAMES.has(path.basename(f)),
+          isRootConfigFile(toRepoRelative(f, rootDir), CONFIG_BASENAMES),
         );
         if (hasConfigChange) {
           console.warn(

@@ -118,6 +118,35 @@ export function toRepoRelative(filePath: string, rootDir: string): string {
   return normalized;
 }
 
+/**
+ * True iff `relPath` names a ROOT-anchored config file: its basename is in
+ * `basenames` AND every path segment before the basename is exactly `..`.
+ *
+ * This distinguishes a repo-root config (a full-suite trigger) from a nested
+ * one (`packages/foo/package.json` — selection must be preserved, not negated).
+ * The `..`-only rule keeps the `gitRoot !== rootDir` topology working: a shared
+ * workspace config located ABOVE rootDir arrives here as `../vitest.workspace.ts`
+ * (an all-`..` prefix → still root ✓, must full-suite), while a SIBLING package's
+ * config arrives as `../bar/package.json` (contains a non-`..` segment → NOT
+ * root ✗, must NOT full-suite). A naive `relPath === basename` OR
+ * `startsWith('..')` check is wrong on exactly those two `..` cases.
+ *
+ * INVARIANT: `relPath` must be repo-relative, forward-slash — the form
+ * `toRepoRelative` produces — NOT a raw absolute path or a bare basename.
+ * Shared by both force-rerun sites (plugin.ts + the relevance filter below) so
+ * they can never drift.
+ */
+export function isRootConfigFile(relPath: string, basenames: ReadonlySet<string>): boolean {
+  const segments = relPath.split('/');
+  const basename = segments[segments.length - 1];
+  if (!basenames.has(basename)) return false;
+  // Every segment before the basename must be exactly '..'.
+  for (let i = 0; i < segments.length - 1; i++) {
+    if (segments[i] !== '..') return false;
+  }
+  return true;
+}
+
 function isRelevant(
   filePath: string,
   rootDir: string,
@@ -126,8 +155,10 @@ function isRelevant(
   const rel = toRepoRelative(filePath, rootDir);
   const basename = path.basename(rel);
 
-  // Config files are always relevant — they trigger full-suite runs downstream.
-  if (options.configBasenames?.has(basename)) return true;
+  // Root-anchored config files are always relevant — they trigger full-suite
+  // runs downstream. Nested configs (packages/foo/package.json) do NOT get
+  // force-preserved here; they follow the normal extension/ignore rules below.
+  if (options.configBasenames && isRootConfigFile(rel, options.configBasenames)) return true;
 
   // Caller-provided ignore patterns
   if (options.ignoreChangedFiles && matchesAnyRule(rel, options.ignoreChangedFiles)) {
