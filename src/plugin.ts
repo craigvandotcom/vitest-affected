@@ -711,6 +711,89 @@ interface PipelineCtx {
 }
 
 /**
+ * Force-enable Vitest 4's `experimental.importDurations` (its `limit` defaults
+ * to 0 → empty result → the reverse-graph reporter never populates → silent
+ * full-suite fallback forever) and guard against structural shape drift.
+ * importDurations is experimental upstream and was recently expanded
+ * (print/failOnDanger/thresholds), so ADDITIVE drift is tolerated but STRUCTURAL
+ * drift is not: returns a full-suite Decision when the block is present yet not a
+ * plain object (or its `limit` is a non-number) — the runtime import data cannot
+ * be trusted. Otherwise force-enables `limit` (spread to avoid mutating the
+ * workspace-shared default object) and returns null. Harmless on Vitest 3.2.x:
+ * getImportDurations() ignores the field.
+ */
+function enforceImportDurationsShape(
+  project: VitestPluginContext['project'],
+  reverse: ReverseMap,
+  startMs: number,
+): Decision | null {
+  const exp = (project.config as { experimental?: ExperimentalImportDurations })
+    .experimental;
+  if (exp && exp.importDurations !== undefined) {
+    const id: unknown = exp.importDurations;
+    const isPlainObject =
+      typeof id === 'object' && id !== null && !Array.isArray(id);
+    const limitOk =
+      isPlainObject &&
+      (!('limit' in (id as object)) ||
+        typeof (id as { limit?: unknown }).limit === 'number');
+    if (!isPlainObject || !limitOk) {
+      console.warn(
+        '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
+      );
+      return {
+        action: 'full-suite',
+        reason: 'import-durations-shape',
+        extra: {
+          graphSize: reverse.size, durationMs: Date.now() - startMs,
+        },
+      };
+    }
+  }
+  if (exp) {
+    exp.importDurations = {
+      ...exp.importDurations,
+      limit: Number.MAX_SAFE_INTEGER,
+    };
+  }
+  return null;
+}
+
+/**
+ * STALENESS RECONCILIATION — a PRE-run diagnostic (the trigger, cache metadata,
+ * is known now, not post-run). Warns + emits a non-terminal `cache-stale`
+ * heartbeat (shadow=false — never the terminal decision line) when a baseline
+ * exists (lastFullRebuild > 0) and the graph has aged out or exceeded the
+ * selective-run budget. A recommendation only — never forces the full suite
+ * (that would surprise a user mid-flow); the normal decision line still follows.
+ */
+function reconcileCacheStaleness(
+  options: VitestAffectedOptions,
+  cacheMeta: CacheMeta,
+  statsCtx: EmitStatsCtx,
+): void {
+  const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
+  const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
+  if (cacheMeta.lastFullRebuild > 0) {
+    const cacheAgeDays = (Date.now() - cacheMeta.lastFullRebuild) / MS_PER_DAY;
+    const agedOut = cacheAgeDays > staleCacheDays;
+    const runOut = cacheMeta.runCount > maxSelectiveRuns;
+    if (agedOut || runOut) {
+      console.warn(
+        `[vitest-affected] CACHE STALE: the dependency graph was last fully rebuilt ${cacheAgeDays.toFixed(1)} day(s) ago across ${cacheMeta.runCount} selective run(s) ` +
+          `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
+          'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
+      );
+      emitStats(statsCtx, 'heartbeat', 'cache-stale', {
+        staleCacheDays,
+        cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
+        selectiveRunCount: cacheMeta.runCount,
+      }, false);
+    }
+  }
+}
+
+/**
  * The staged selection pipeline. Runs the full decision sequence and RETURNS a
  * single terminal {@link Decision} (or `null` when disabled → emit nothing)
  * instead of emitting inline; the orchestrator writes exactly one DECISION line
@@ -815,49 +898,14 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
     alwaysRunTests = resolvedAlwaysRun;
   }
 
-  // Vitest 4 gates getImportDurations() on experimental.importDurations.limit
-  // (defaults to 0 → empty result → reverse-graph reporter sees nothing →
-  // cache never populates → silent full-suite fallback forever). Force-enable
-  // here. Spread to avoid mutating the default object reference, which is
-  // shared across workspace projects in v4 (cli-api: line ~10293).
-  // On Vitest 3.2.x this field is harmless: getImportDurations() ignores it.
-  const exp = (project.config as { experimental?: ExperimentalImportDurations })
-    .experimental;
-  if (exp && exp.importDurations !== undefined) {
-    // IMPORTDURATIONS SHAPE-CHECK. importDurations is explicitly
-    // experimental upstream and was recently expanded (print/failOnDanger/
-    // thresholds) — shape drift is expected, not hypothetical. We tolerate
-    // ADDITIVE drift (unknown/new fields) but bail loudly on STRUCTURAL
-    // drift that would break the force-enable write below: importDurations
-    // must be a plain object, and if `limit` is present it must be a
-    // number (we overwrite it). Anything else means we cannot trust the
-    // runtime import data → full-suite fallback, never a silent no-op.
-    const id: unknown = exp.importDurations;
-    const isPlainObject =
-      typeof id === 'object' && id !== null && !Array.isArray(id);
-    const limitOk =
-      isPlainObject &&
-      (!('limit' in (id as object)) ||
-        typeof (id as { limit?: unknown }).limit === 'number');
-    if (!isPlainObject || !limitOk) {
-      console.warn(
-        '[vitest-affected] experimental.importDurations has an unexpected shape — cannot trust runtime import data, running full suite',
-      );
-      return {
-        action: 'full-suite',
-        reason: 'import-durations-shape',
-        extra: {
-          graphSize: reverse.size, durationMs: Date.now() - startMs,
-        },
-      };
-    }
-  }
-  if (exp) {
-    exp.importDurations = {
-      ...exp.importDurations,
-      limit: Number.MAX_SAFE_INTEGER,
-    };
-  }
+  // Force-enable Vitest 4's experimental.importDurations and bail on structural
+  // shape drift before it can silently starve the reverse graph.
+  const importDurationsDecision = enforceImportDurationsShape(
+    project,
+    reverse,
+    startMs,
+  );
+  if (importDurationsDecision) return importDurationsDecision;
 
   // 5. Load cached reverse map (runtime-first: JSON read, no parsing)
   cacheDir = path.join(rootDir, '.vitest-affected');
@@ -873,32 +921,9 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
     cacheHit = false;
   }
 
-  // STALENESS RECONCILIATION — emitted PRE-run because the trigger (cache
-  // metadata) is known now, not after the run. Only fires when a baseline
-  // exists (lastFullRebuild > 0): a freshly-migrated v2/v1 cache or a
-  // pre-metadata v3 cache has none, so it is not flagged until its first
-  // full-suite run seeds the timestamp. A WARNING only — never a forced
-  // full suite (that would surprise a user mid-flow); the normal decision
-  // line still follows.
-  const staleCacheDays = options.staleCacheDays ?? DEFAULT_STALE_CACHE_DAYS;
-  const maxSelectiveRuns = options.maxSelectiveRuns ?? DEFAULT_MAX_SELECTIVE_RUNS;
-  if (cacheMeta.lastFullRebuild > 0) {
-    const cacheAgeDays = (Date.now() - cacheMeta.lastFullRebuild) / MS_PER_DAY;
-    const agedOut = cacheAgeDays > staleCacheDays;
-    const runOut = cacheMeta.runCount > maxSelectiveRuns;
-    if (agedOut || runOut) {
-      console.warn(
-        `[vitest-affected] CACHE STALE: the dependency graph was last fully rebuilt ${cacheAgeDays.toFixed(1)} day(s) ago across ${cacheMeta.runCount} selective run(s) ` +
-          `(thresholds: ${staleCacheDays}d / ${maxSelectiveRuns} runs). Selective runs only refresh edges for the tests that ran, so the graph can drift. ` +
-          'Run the FULL suite once (e.g. clear .vitest-affected or run without changes) to re-observe every edge and reset the baseline. Continuing with selective selection for now.',
-      );
-      emitStats(statsCtx, 'heartbeat', 'cache-stale', {
-        staleCacheDays,
-        cacheAgeDays: Number(cacheAgeDays.toFixed(2)),
-        selectiveRunCount: cacheMeta.runCount,
-      }, false);
-    }
-  }
+  // STALENESS RECONCILIATION — a pre-run diagnostic (never forces the full
+  // suite); see reconcileCacheStaleness.
+  reconcileCacheStaleness(options, cacheMeta, statsCtx);
 
   // Inject runtime reporter that merges runtime edges into cached reverse
   // map. On selective runs only a subset of tests execute, so it merges
