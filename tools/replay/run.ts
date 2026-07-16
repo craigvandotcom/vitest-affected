@@ -342,6 +342,16 @@ export async function main(argv: string[]): Promise<string> {
               `${flake.confirmed.length} confirmed, ${flake.flaky.length} flaky\n`,
           );
         }
+        // EMPTY-OUTCOME BASELINE (intentional skip — mirrors analysis.ts:~510).
+        // prevOutcomes is the flake-guard re-run's C-1 baseline; it must carry
+        // the last-KNOWN per-test outcome. An empty curOutcomes map (broken/
+        // errored commit with no per-test outcomes, or a legitimate zero-test
+        // commit) is the ABSENCE of an observation, not an observation that all
+        // tests lost their outcome — advancing to it would erase flip detection
+        // against the last real observation and misclassify persistent failures
+        // as new. Carry the last non-empty baseline across empty commits. (Not
+        // independently unit-testable here — main() clones real repos — so this
+        // shares the documented semantics + the analyzeRun unit test.)
         if (curOutcomes.size > 0) prevOutcomes = curOutcomes;
       }
     }

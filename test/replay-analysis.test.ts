@@ -844,6 +844,82 @@ describe('analysis: analyzeRun over a synthetic run dir', () => {
     ).toHaveLength(0);
   });
 
+  test('empty-outcome commit does NOT reset the flip baseline — the next commit compares against the last KNOWN outcome', async () => {
+    const abs = (p: string): string => `/repo/${p}`;
+    // Persistent structural miss on style.test.ts: the warm-up seeds the cache
+    // with ONLY a.ts→a.test.ts, then every selective commit changes [a.ts,
+    // style.css] and selects a.test.ts — style.test.ts is required (fresh map)
+    // but never selected, so it is missed and never learned by the drifted
+    // cache. That gives us a stable miss across three commits whose ONLY
+    // difference is the outcome ledger, isolating the baseline-advance rule.
+    const map = {
+      [abs('src/a.ts')]: [abs('t/a.test.ts')],
+      [abs('src/style.css')]: [abs('t/style.test.ts')],
+    };
+    const { runDir } = buildRunDir([
+      // Warm-up full-suite: seeds the cache WITHOUT the style.css edge.
+      {
+        sha: 'w1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { [abs('src/a.ts')]: [abs('t/a.test.ts')] },
+        outcomes: { [abs('t/a.test.ts')]: 'passed' },
+      },
+      // c1: style.test.ts missed, fails → confirmed as a NEW failure.
+      {
+        sha: 'c1',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: map,
+        outcomes: {
+          [abs('t/a.test.ts')]: 'passed',
+          [abs('t/style.test.ts')]: 'failed',
+        },
+      },
+      // c2: SAME miss, but EMPTY outcomes (no outcomes file) — cannot confirm,
+      // and MUST NOT reset the baseline to empty.
+      {
+        sha: 'c2',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: map,
+        // no `outcomes` → empty outcome map for this commit
+      },
+      // c3: SAME miss, now PASSES. Against the pre-empty baseline (failed at c1)
+      // this is a failed→passed FLIP → confirmed. If the empty c2 had reset the
+      // baseline to empty, c3 would see prev===undefined → "new passing test" →
+      // NOT confirmed. Asserting c3 confirms proves the skip carries the
+      // last-known baseline across the empty commit.
+      {
+        sha: 'c3',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: map,
+        outcomes: {
+          [abs('t/a.test.ts')]: 'passed',
+          [abs('t/style.test.ts')]: 'passed',
+        },
+      },
+    ]);
+    const analysis = await analyzeRun({ runDir, rootDir: '/repo' });
+    const byId = new Map(analysis.commits.map((c) => [c.sha, c]));
+    // Structural miss present at all three selective commits (drift is stable).
+    expect(byId.get('c1')?.structuralMisses).toHaveLength(1);
+    expect(byId.get('c2')?.structuralMisses).toHaveLength(1);
+    expect(byId.get('c3')?.structuralMisses).toHaveLength(1);
+    // c1: new failure confirmed.
+    expect(byId.get('c1')?.outcomeConfirmed).toEqual([abs('t/style.test.ts')]);
+    // c2: empty outcomes → cannot confirm.
+    expect(byId.get('c2')?.outcomeConfirmed).toEqual([]);
+    // c3: THE ASSERTION — failed→passed flip confirmed against c1's baseline,
+    // carried across the empty c2 (skip semantics). Empty c2 did NOT reset it.
+    expect(byId.get('c3')?.outcomeConfirmed).toEqual([abs('t/style.test.ts')]);
+  });
+
   test('all-full-suite walk fails loudly (degeneration guard)', async () => {
     const { runDir } = buildRunDir([
       {

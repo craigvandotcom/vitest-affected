@@ -525,6 +525,20 @@ export async function analyzeRun(
     // Thread the evolved cache into the next commit (see evolution.ts for the
     // live-persistence scope rules).
     if (step !== null) cache = step.cacheAfter;
+    // EMPTY-OUTCOME BASELINE (intentional skip — do NOT advance on empty):
+    // prevOutcomes is the C-1 flip baseline fed to detectOutcomeConfirmed, and
+    // it must hold the last-KNOWN per-test outcome, not merely the previous
+    // commit's. An empty outcome map — whether a broken/errored commit that
+    // produced no per-test outcomes OR a legitimate zero-test commit — is the
+    // ABSENCE of an observation, not an observation that every test now lacks
+    // an outcome. Overwriting the baseline with it would (a) erase flip
+    // detection against the last real observation (every subsequent miss would
+    // see prev===undefined → treated as "new") and (b) misclassify a
+    // persistent failure as a brand-new failure. So carry the last non-empty
+    // baseline across empty commits. detectOutcomeConfirmed already fail-safes
+    // the OTHER direction: an empty CURRENT map yields cur===undefined and the
+    // commit confirms nothing. Same rule mirrored at run.ts:~345 (live
+    // flake-guard re-run baseline); pinned by the analyzeRun unit test.
     if (outcomes.size > 0) prevOutcomes = outcomes;
   }
 
