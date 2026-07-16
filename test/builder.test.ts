@@ -46,7 +46,7 @@ describe('resolveFileImports', () => {
     const resolver = createResolver(simpleDir);
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     const source = `import { b } from './b';\nexport const a = b + 1;\n`;
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('b.ts')).toBe(true);
   });
@@ -61,7 +61,7 @@ describe('resolveFileImports', () => {
 
     // Use a resolver that can handle this temp dir
     const tmpResolver = createResolver(tmpDir);
-    const results = resolveFileImports(barFile, "import type { Foo } from './foo';\nexport const bar = 1;\n", tmpDir, tmpResolver);
+    const { targets: results } = resolveFileImports(barFile, "import type { Foo } from './foo';\nexport const bar = 1;\n", tmpDir, tmpResolver);
     expect(results).toHaveLength(0);
   });
 
@@ -70,7 +70,7 @@ describe('resolveFileImports', () => {
     const resolver = createResolver(simpleDir);
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     const source = `import logo from './logo.svg';\nimport img from './photo.png';\nexport const a = 1;\n`;
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(0);
   });
 
@@ -83,7 +83,7 @@ describe('resolveFileImports', () => {
     writeFileSync(path.join(tmpDir, 'x.css'), 'body { color: red; }\n');
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(entryFile, source, tmpDir, resolver);
     expect(results).toHaveLength(0);
   });
 
@@ -99,7 +99,7 @@ describe('resolveFileImports', () => {
     writeFileSync(tsFile, 'export const y = 1;\n');
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(entryFile, source, tmpDir, resolver);
     // '.css?raw' must resolve to the real x.css file — binary exclusion is
     // bypassed because the query suffix marks it as a genuine Vite module
     // import, and the query is stripped before resolution so oxc-resolver
@@ -117,7 +117,7 @@ describe('resolveFileImports', () => {
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     // ESM TypeScript convention: import with .js extension, resolver maps to .ts
     const source = `import { b } from './b.js';\nexport const a = b + 1;\n`;
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('b.ts')).toBe(true);
   });
@@ -128,7 +128,7 @@ describe('resolveFileImports', () => {
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     // Backtick with no template expressions - should be treated as static string
     const source = 'const mod = import(`./b`);\nexport const a = 1;\n';
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('b.ts')).toBe(true);
   });
@@ -153,7 +153,7 @@ describe('builder.ts bug fixes', () => {
     // resolveFileImports should NOT include sibling dir file when rootDir is projectDir
     const resolver = createResolver(projectDir);
     const source = `import { b } from '${path.join(siblingDir, 'src', 'b')}';\n`;
-    const results = resolveFileImports(
+    const { targets: results } = resolveFileImports(
       path.join(projectDir, 'src', 'a.ts'),
       source,
       projectDir,
@@ -183,6 +183,64 @@ describe('builder.ts bug fixes', () => {
     warnSpy.mockRestore();
   });
 
+});
+
+describe('parse-error handling (va-hygiene-...wlm.5)', () => {
+  test('a parse error signals parseFailed AND keeps the partial targets before the break', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    // A resolvable import of ./b sits BEFORE a mid-edit syntax error.
+    const malformed = `import { b } from './b';\nconst broken = {\n`;
+    const result = resolveFileImports(aFile, malformed, simpleDir, resolver);
+    expect(result.parseFailed).toBe(true);
+    // Partial extraction still captured the import before the broken point.
+    expect(result.targets.some((t) => t.endsWith('b.ts'))).toBe(true);
+  });
+
+  test('clean source reports parseFailed=false', () => {
+    const simpleDir = fixtureDir('simple');
+    const resolver = createResolver(simpleDir);
+    const aFile = path.join(simpleDir, 'src', 'a.ts');
+    const result = resolveFileImports(aFile, `import { b } from './b';\n`, simpleDir, resolver);
+    expect(result.parseFailed).toBe(false);
+    expect(result.targets.some((t) => t.endsWith('b.ts'))).toBe(true);
+  });
+
+  test('COLD-MISS: a parse-failed changed file with no prior cache entry is still seeded, no crash', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-parse-err-'));
+    tempDirs.push(tmpDir);
+    mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    writeFileSync(path.join(tmpDir, 'src', 'dep.ts'), 'export const dep = 1;\n');
+    const aFile = path.join(tmpDir, 'src', 'a.ts');
+    // A brand-new import of ./dep BEFORE a syntax error; ./dep is NOT in the
+    // (empty/cold) cache — must still be seeded despite the parse failure.
+    writeFileSync(aFile, `import { dep } from './dep';\nconst broken = {\n`);
+
+    const coldCache = new Map<string, Set<string>>();
+    let newTargets: string[] = [];
+    expect(() => {
+      newTargets = deltaParseNewImports([aFile], coldCache, tmpDir);
+    }).not.toThrow();
+    expect(newTargets.some((t) => t.endsWith('dep.ts'))).toBe(true);
+  });
+
+  test('the parse-failure warning is emitted at most once per file per run', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'vitest-affected-parse-warn-'));
+    tempDirs.push(tmpDir);
+    mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    const aFile = path.join(tmpDir, 'src', 'a.ts');
+    writeFileSync(aFile, `const broken = {\n`);
+
+    deltaParseNewImports([aFile], new Map<string, Set<string>>(), tmpDir);
+
+    const parseWarnings = warnSpy.mock.calls.filter(
+      (c) => typeof c[0] === 'string' && c[0].includes('Parse errors in'),
+    );
+    expect(parseWarnings).toHaveLength(1);
+    warnSpy.mockRestore();
+  });
 });
 
 describe('deltaParseNewImports', () => {
@@ -420,7 +478,7 @@ describe('barrel / re-export seed edges', () => {
     writeFileSync(namedTargetFile, 'export const thing = 1;\n');
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(barrelFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(barrelFile, source, tmpDir, resolver);
 
     expect(results.some(r => r.endsWith('star-target.ts'))).toBe(true);
     expect(results.some(r => r.endsWith('named-target.ts'))).toBe(true);
@@ -449,7 +507,7 @@ describe('tsconfig paths/baseUrl resolution', () => {
     writeFileSync(entryFile, source);
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(entryFile, source, tmpDir, resolver);
 
     expect(results).toHaveLength(1);
     expect(results[0].endsWith(path.join('lib', 'util.ts'))).toBe(true);
@@ -467,7 +525,7 @@ describe('.json import seed edge', () => {
     writeFileSync(dataFile, '{"a":1}\n');
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(entryFile, source, tmpDir, resolver);
 
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('data.json')).toBe(true);
@@ -488,7 +546,7 @@ describe('.json import seed edge', () => {
     writeFileSync(dataFile, '{"a":1}\n');
 
     const resolver = createResolver(tmpDir);
-    const results = resolveFileImports(entryFile, source, tmpDir, resolver);
+    const { targets: results } = resolveFileImports(entryFile, source, tmpDir, resolver);
 
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('data.json')).toBe(true);
@@ -501,7 +559,7 @@ describe('dynamic import literal forms', () => {
     const resolver = createResolver(simpleDir);
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     const source = "const mod = import('./b');\nexport const a = 1;\n";
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('b.ts')).toBe(true);
   });
@@ -511,7 +569,7 @@ describe('dynamic import literal forms', () => {
     const resolver = createResolver(simpleDir);
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     const source = 'const mod = import("./b");\nexport const a = 1;\n';
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(1);
     expect(results[0].endsWith('b.ts')).toBe(true);
   });
@@ -521,7 +579,7 @@ describe('dynamic import literal forms', () => {
     const resolver = createResolver(simpleDir);
     const aFile = path.join(simpleDir, 'src', 'a.ts');
     const source = 'const name = "b";\nconst mod = import(`./${name}`);\nexport const a = 1;\n';
-    const results = resolveFileImports(aFile, source, simpleDir, resolver);
+    const { targets: results } = resolveFileImports(aFile, source, simpleDir, resolver);
     expect(results).toHaveLength(0);
   });
 });

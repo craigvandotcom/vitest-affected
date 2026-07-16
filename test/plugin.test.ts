@@ -701,3 +701,28 @@ describe('lockfile change → full suite (regression pin)', () => {
     expect(lastStat(statsFile).reason).not.toBe('config-change');
   });
 });
+
+describe('parse-error changed file → selection stays scoped (va-hygiene-...wlm.5)', () => {
+  test('a mid-edit syntax error does NOT trigger a full suite; cached dependents still selected', async () => {
+    const { tmpDir } = setupOrphanFixture();
+    const mainPath = path.join(tmpDir, 'src', 'main.ts');
+    // Simulate a mid-edit save: main.ts now has a syntax error. The warm cache
+    // (setupOrphanFixture) maps main.ts -> main.test.ts.
+    writeFileSync(mainPath, 'export const main = 1;\nconst broken = {\n');
+    const statsFile = path.join(tmpDir, 'stats.jsonl');
+
+    const { vitest, project, projectConfig } = createMockContext(tmpDir);
+    const originalInclude = [...projectConfig.include];
+
+    await runHook(
+      vitestAffected({ changedFiles: [mainPath], cache: true, statsFile }),
+      { vitest, project },
+    );
+
+    // A parse error must NOT escalate to the whole suite (originalInclude); the
+    // changed file remains a BFS seed so its cached dependent test is selected.
+    expect(projectConfig.include).not.toEqual(originalInclude);
+    expect(projectConfig.include.some((p) => p.endsWith('main.test.ts'))).toBe(true);
+    expect(lastStat(statsFile).reason).not.toBe('config-change');
+  });
+});

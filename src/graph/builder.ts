@@ -152,14 +152,42 @@ export function createResolver(rootDir: string, aliasEntries?: AliasEntry[]): Re
   });
 }
 
+/**
+ * Result of statically extracting a changed file's import targets.
+ *
+ * `parseFailed` makes an oxc parse error OBSERVABLE to callers instead of being
+ * swallowed: on a parse error we still return the PARTIAL `targets` extracted
+ * before the broken point (partial ≥ nothing — discarding it would strictly
+ * under-seed), but the flag lets a caller know the target list may be
+ * incomplete.
+ */
+export interface FileImportsResult {
+  /** Import targets resolved from the file (partial if `parseFailed`). */
+  targets: string[];
+  /** True if oxc reported parse errors — `targets` may be incomplete. */
+  parseFailed: boolean;
+}
+
 export function resolveFileImports(
   file: string,
   source: string,
   rootDir: string,
   resolver: ResolverFactory,
-): string[] {
+): FileImportsResult {
   const { module: mod, errors } = parseSync(file, source);
-  if (errors.length > 0) {
+  // ACCEPTED RESIDUAL (self-healing): on a parse error we proceed with the
+  // PARTIAL specifier list oxc extracted before the broken point — partial ≥
+  // nothing, since discarding it would strictly under-seed. A brand-new import
+  // appearing AFTER a mid-edit syntax error can be missed until the file parses
+  // clean and re-runs; the miss is warned here and resolves on the next clean
+  // save. We deliberately do NOT full-suite-escalate a syntax error — it must
+  // stay within the changed file's blast radius, and the changed file is itself
+  // always an unconditional BFS seed (src/plugin.ts) so its runtime-known
+  // dependents still run. Fully closing the residual (never-under-select) needs
+  // a persisted per-file last-known-good forward-target fallback — deferred to
+  // va-hygiene-20260706-deferred-wlm.4 (cache v4 disk-format field).
+  const parseFailed = errors.length > 0;
+  if (parseFailed) {
     console.warn(`[vitest-affected] Parse errors in ${safeLabel(file)} — imports may be incomplete`);
   }
   const specifiers: string[] = [];
@@ -237,7 +265,7 @@ export function resolveFileImports(
     resolved.push(resolvedPath);
   }
 
-  return resolved;
+  return { targets: resolved, parseFailed };
 }
 
 /**
@@ -264,8 +292,14 @@ export function deltaParseNewImports(
     } catch {
       continue;
     }
-    const imports = resolveFileImports(file, source, rootDir, resolver);
-    for (const imp of imports) {
+    // Consume the parse-failure-signalling shape; keep the PARTIAL targets on a
+    // parse error (see resolveFileImports's accepted-residual note). `parseFailed`
+    // is surfaced via that function's once-per-file warning — deltaParseNewImports
+    // deliberately keeps its own string[] return so the plugin's BFS seed
+    // assembly (src/plugin.ts) is untouched (that seam belongs to
+    // va-hygiene-20260706-deferred-wlm.1).
+    const { targets } = resolveFileImports(file, source, rootDir, resolver);
+    for (const imp of targets) {
       if (!cachedReverse.has(imp)) {
         newTargets.push(imp);
         if (verbose) {
