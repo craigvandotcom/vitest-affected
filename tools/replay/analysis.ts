@@ -357,6 +357,15 @@ export async function analyzeRun(
   // commit's outcome map. Structural misses with ZERO joins across the whole
   // walk means the outcome-confirmed tier is likely path-broken, not clean.
   let outcomeJoinMatches = 0;
+  // Structural-join guard: how many changed files (in the graph's path space)
+  // were FOUND as keys of the fresh ground-truth map — i.e. actually joined the
+  // structural tier (computeRequiredTests does freshMap.get(file)). If NO
+  // selective commit's changed files ever join, yet some selective commit HAD
+  // changed files, the changed-file→graph path space is desynced and an empty
+  // structural miss-set is vacuous, not clean. A DIFFERENT join than
+  // outcomeJoinMatches (which counts missed tests present in the outcome map).
+  let structuralJoinMatches = 0;
+  let sawSelectiveChanges = false;
 
   // The simulated live selective cache, threaded commit → commit.
   let cache: ReverseMap = new Map();
@@ -453,6 +462,15 @@ export async function analyzeRun(
         });
       } else {
         segment = 'selective';
+        // Structural-join bookkeeping: a changed file that IS a key of the
+        // fresh map actually joined the structural tier. Count this join (and
+        // whether this selective commit had any changed files at all) for the
+        // structural-join guard below — deliberately NOT keyed on misses>0,
+        // which a broken join would make circular.
+        if (changedAbs.length > 0) sawSelectiveChanges = true;
+        for (const f of changedAbs) {
+          if (freshMap.has(f)) structuralJoinMatches++;
+        }
         // Simulated LIVE selection from the evolved (drifted) cache — the
         // recorded shadow selection was computed against a fully-fresh cache
         // (the harness full-runs every commit) and would erase the drift.
@@ -520,6 +538,24 @@ export async function analyzeRun(
       'outcome tier may be broken — the C-1→C outcome path-join produced no ' +
         'matches across ALL commits despite structural misses; treat the ' +
         'outcome-confirmed miss-rate as unknown, not zero',
+    );
+  }
+
+  // STRUCTURAL-JOIN GUARD: some selective commit had changed files, yet NOT a
+  // single changed file joined the fresh ground-truth map as a key across the
+  // WHOLE walk — the changed-file→graph path space is desynced (repo-relative
+  // vs absolute, or a foreign root). computeRequiredTests then silently returns
+  // empty for every commit, structuralMisses is empty, and the structural
+  // miss-rate reads a vacuous 0. This is the STRUCTURAL sibling of the outcome
+  // guard above, but its trigger is intentionally ASYMMETRIC: the outcome guard
+  // keys on "misses > 0 && zero outcome joins", which is impossible here (a
+  // broken structural join yields zero misses, making a misses-based trigger
+  // circular). Key on sawSelectiveChanges instead.
+  if (sawSelectiveChanges && structuralJoinMatches === 0) {
+    warnings.push(
+      'structural tier may be broken — the changed-file→graph path-join ' +
+        'produced no matches across ALL selective commits; treat the ' +
+        'structural miss-rate as unknown, not zero',
     );
   }
 

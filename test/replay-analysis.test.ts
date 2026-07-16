@@ -768,6 +768,82 @@ describe('analysis: analyzeRun over a synthetic run dir', () => {
     expect(renderReport(analysis)).toMatch(/outcome tier may be broken/);
   });
 
+  test('LOUD GUARD: structural changed-file→graph join produces zero matches warns instead of a vacuous 0', async () => {
+    const abs = (p: string): string => `/repo/${p}`;
+    // A selective commit that DID have changed files, but the fresh map's keys
+    // live under a FOREIGN root — so path.resolve(rootDir, changedFile) never
+    // equals a freshMap key. computeRequiredTests joins nothing, structural
+    // misses are empty, and the structural miss-rate would read a vacuous 0.
+    const { runDir } = buildRunDir([
+      {
+        sha: 'w1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { '/otherroot/src/a.ts': ['/otherroot/t/a.test.ts'] },
+        outcomes: { [abs('t/a.test.ts')]: 'passed' },
+      },
+      {
+        sha: 's1',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        // Keys under a different root — desynced from path.resolve('/repo', f).
+        reverseMap: {
+          '/otherroot/src/a.ts': ['/otherroot/t/a.test.ts'],
+          '/otherroot/src/style.css': ['/otherroot/t/style.test.ts'],
+        },
+        outcomes: { [abs('t/a.test.ts')]: 'passed' },
+      },
+    ]);
+    const analysis = await analyzeRun({ runDir, rootDir: '/repo' });
+    // Broken join → no structural misses detected at all.
+    expect(analysis.totalStructuralMisses).toBe(0);
+    // …but the 0 is UNKNOWN, not clean → a LOUD structural warning.
+    const structuralWarnings = analysis.warnings.filter((w) =>
+      /structural tier may be broken/.test(w),
+    );
+    expect(structuralWarnings).toHaveLength(1);
+    // The warning is rendered into the report.
+    expect(renderReport(analysis)).toMatch(/structural tier may be broken/);
+  });
+
+  test('aligned changed-file→graph join with a real structural miss does NOT fire the structural guard', async () => {
+    const abs = (p: string): string => `/repo/${p}`;
+    const { runDir } = buildRunDir([
+      {
+        sha: 'w1',
+        status: 'ok',
+        changedFiles: ['src/a.ts'],
+        decision: fullSuite('cache-miss'),
+        reverseMap: { [abs('src/a.ts')]: [abs('t/a.test.ts')] },
+        outcomes: { [abs('t/a.test.ts')]: 'passed' },
+      },
+      // Real structural miss: style.css joins the map (a KEY) but the selection
+      // omitted its test — a genuine miss, not a broken join.
+      {
+        sha: 's1',
+        status: 'ok',
+        changedFiles: ['src/a.ts', 'src/style.css'],
+        decision: selective([abs('t/a.test.ts')]),
+        reverseMap: {
+          [abs('src/a.ts')]: [abs('t/a.test.ts')],
+          [abs('src/style.css')]: [abs('t/style.test.ts')],
+        },
+        outcomes: {
+          [abs('t/a.test.ts')]: 'passed',
+          [abs('t/style.test.ts')]: 'failed',
+        },
+      },
+    ]);
+    const analysis = await analyzeRun({ runDir, rootDir: '/repo' });
+    expect(analysis.totalStructuralMisses).toBe(1);
+    // Changed files DID join (structuralJoinMatches > 0) → no structural guard.
+    expect(
+      analysis.warnings.filter((w) => /structural tier may be broken/.test(w)),
+    ).toHaveLength(0);
+  });
+
   test('all-full-suite walk fails loudly (degeneration guard)', async () => {
     const { runDir } = buildRunDir([
       {
