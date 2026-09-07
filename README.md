@@ -152,13 +152,31 @@ vitestAffected({
 
 ### Environment variables
 
-Three env vars override config without editing it — useful in CI:
+Four env vars override config without editing it — useful in CI:
 
 | Variable | Effect |
 |----------|--------|
 | `VITEST_AFFECTED_DISABLED=1` | Fully inert — no selection, no shadow, no stats line. The rollback kill switch; wins over everything. |
 | `VITEST_AFFECTED_SHADOW=1` | Force shadow mode (run everything, log the would-be selection). `DISABLED` still wins. |
 | `VITEST_AFFECTED_STATS_FILE=<path>` | Force stats output to `<path>`, overriding the config `statsFile` — so a CI step can point stats at a run-scoped file. |
+| `VITEST_AFFECTED_SEEDS=<files>` | Override the git-diff seed set with an explicit comma/space-separated file list, so selection runs as if only those files had changed. Wins over both the git diff and the config `changedFiles`; `DISABLED` still wins. |
+
+#### Parallel agents on one checkout
+
+If you're running AI coding agents — or multiple agents in parallel — each one needs to
+verify its changes with tests. On a shared checkout the git diff is tree-wide: agent A's
+run would select tests for B's and C's uncommitted edits too, and fail on their
+half-finished code. Give each agent its own seed set instead:
+
+```sh
+VITEST_AFFECTED_SEEDS="src/foo.ts src/bar.test-helpers.ts" npx vitest run
+```
+
+The plugin seeds its reverse-graph BFS from exactly those files — keeping the transitive
+dependencies the runtime `importDurations` map catches, which a plain `vitest related`
+(static import graph) misses — and leaves every other agent's changes out of the
+decision. Deleted files work too: a seed path that no longer exists is treated as a
+deletion, same as the git-diff path.
 
 ### Default ignored paths
 

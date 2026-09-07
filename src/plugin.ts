@@ -1434,6 +1434,21 @@ async function runPipeline(ctx: PipelineCtx): Promise<Decision | null> {
   }
 }
 
+/**
+ * Split a comma/space-separated VITEST_AFFECTED_SEEDS env value into seed
+ * paths — deliberately the same parse shape as VITEST_AFFECTED_INCLUDE
+ * (explain-cli.ts parseEnvIncludes) so both env overrides read alike, while
+ * remaining semantically distinct: INCLUDE names test-file globs (which files
+ * count as tests), SEEDS names the changed files that seed selection.
+ */
+function parseEnvSeeds(env: string | undefined): string[] {
+  if (!env) return [];
+  return env
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
   return {
     name: 'vitest-affected',
@@ -1451,6 +1466,19 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
       if (process.env.VITEST_AFFECTED_SHADOW === '1') {
         shadow = true;
       }
+      // VITEST_AFFECTED_SEEDS — worker-scoped seed override (ac-j4w5). N agents
+      // sharing ONE checkout cannot seed selection from `git diff`: the diff is
+      // tree-wide, so agent A's run selects tests for B's and C's uncommitted
+      // edits and fails on their half-finished code. When set, this list
+      // REPLACES the git diff as the BFS seed set by flowing through the
+      // existing `changedFiles` channel (resolve + missing-becomes-deleted),
+      // so every downstream leg — relevance filter, full-suite triggers,
+      // config-change detection, delta parse, BFS, threshold, shadow, stats —
+      // is unchanged. Wins over both the git diff and an explicit
+      // `changedFiles` option; VITEST_AFFECTED_DISABLED still wins over it.
+      const envSeeds = parseEnvSeeds(process.env.VITEST_AFFECTED_SEEDS);
+      const effectiveOptions: VitestAffectedOptions =
+        envSeeds.length > 0 ? { ...options, changedFiles: envSeeds } : options;
       const verbose = options.verbose ?? false;
       const startMs = Date.now();
       const statsFile = process.env.VITEST_AFFECTED_STATS_FILE ?? options.statsFile;
@@ -1470,7 +1498,7 @@ export function vitestAffected(options: VitestAffectedOptions = {}): Plugin {
         const decision = await runPipeline({
           vitest,
           project,
-          options,
+          options: effectiveOptions,
           statsCtx,
           startMs,
           verbose,
