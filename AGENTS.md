@@ -57,6 +57,14 @@ vitest-affected/
 
 **Safety invariant:** Never silently skip tests. Any failure → fallback to full suite with warning.
 
+## Key Technical Decisions
+
+- **oxc-parser** for import extraction (static + dynamic + re-exports), not esbuild/swc
+- **oxc-resolver** for specifier → absolute path resolution with tsconfig support
+- **ESM-only** output (`format: ['esm']` in tsup) — Vitest users are ESM-native
+- **`configureVitest` hook** receives `{ vitest, project }` where `project.config.include` is mutated
+- **peerDep `vitest >=3.2.0`** (configureVitest hook + importDurations require 3.2+)
+
 ## Available Skills
 
 | Skill | Type | Trigger |
@@ -76,3 +84,11 @@ Flywheel commands are in `.claude/commands/`.
 - Test fixtures in `test/fixtures/` must have known dependency structures and `"type": "module"` in package.json.
 - ESM-only output — no CJS build. Package exports only has `"import"` entry.
 - Follow existing patterns in neighboring files before introducing new conventions.
+
+## Evidence badge
+
+`_evidence/hero.svg` is the README's live miss-record hero card (embedded via
+raw.githubusercontent, regenerated with current numbers).
+Refresh it via `node scripts/update-evidence-badge.mjs` — reads the sibling
+body-compass-app evidence log; no-ops when the sibling is absent. Wired as a
+pre-commit hook: one-time `git config core.hooksPath .githooks` per clone.
