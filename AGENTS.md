@@ -1,5 +1,7 @@
 # AGENTS.md — Subagent Context
 
+Agent Mail project key: `vitest-affected`
+
 ## Project Overview
 
 | Field       | Value                                                                 |
