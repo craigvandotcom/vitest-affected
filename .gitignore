@@ -21,3 +21,4 @@ coverage/
 .factory/
 .codex/
 _scratch/
+.compounds/
