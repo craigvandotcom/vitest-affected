@@ -8,22 +8,29 @@ on:
 
 jobs:
   quality-gate:
-    name: quality-gate (${{ matrix.os }})
+    name: quality-gate (${{ matrix.os }}, Vitest ${{ matrix.vitest }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        vitest: [3.2.4, 4.1.7, 5.0.5]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.23.4
           cache: npm
 
+      - name: Install npm
+        run: npm install --global npm@12.2.1
+
       - run: npm ci
+
+      - name: Install matrix Vitest
+        run: npm install --no-save --package-lock=false vitest@${{ matrix.vitest }}
 
       # Each step runs ONE stage of the single-sourced gate defined in
       # scripts/quality-gate.sh (the canonical step definitions live there, so

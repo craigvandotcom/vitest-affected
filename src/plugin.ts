@@ -1,7 +1,6 @@
 /// <reference types="vitest/config" />
 import type { Plugin } from 'vite';
-import type { Reporter, TestRunEndReason } from 'vitest/reporters';
-import type { TestModule, VitestPluginContext } from 'vitest/node';
+import type { Reporter, TestModule, TestRunEndReason, VitestPluginContext } from 'vitest/node';
 import { existsSync, statSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'tinyglobby';

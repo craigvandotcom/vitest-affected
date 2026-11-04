@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execa } from 'execa';
-import type { Reporter, TestRunEndReason } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/node';
 import { createRuntimeReporter, vitestAffected } from '../src/plugin.js';
 import { saveCacheSync, loadCachedReverseMap } from '../src/graph/cache.js';
 import * as cacheModule from '../src/graph/cache.js';
@@ -104,6 +104,8 @@ const records = [];
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
+    // The raw diagnostic fixture bypasses the plugin's collection setup.
+    experimental: { importDurations: { limit: Number.MAX_SAFE_INTEGER } },
     reporters: [
       'default',
       {

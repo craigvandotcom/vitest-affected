@@ -43,7 +43,7 @@ export function parseGraphReverseMap(content: string, rootDir?: string): Reverse
 }
 
 /**
- * Parse a captured vitest `--reporter=json` stdout into test-file → status
+ * Parse a captured Vitest JSON report into test-file → status
  * ('passed' / 'failed' / ...). Empty map when the run crashed pre-JSON.
  */
 export function parseOutcomes(content: string): Map<string, string> {

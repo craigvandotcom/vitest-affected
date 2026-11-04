@@ -87,15 +87,17 @@ async function gitInit(cwd: string): Promise<void> {
 /**
  * Run vitest with JSON reporter in the given directory.
  * Returns the parsed JSON report.
- * Vitest's --reporter=json writes JSON to stdout.
+ * Use an explicit report file across Vitest versions.
  */
 async function runVitest(
   cwd: string,
   env: Record<string, string> = {},
 ): Promise<VitestJsonReport> {
+  const reportPath = path.join(cwd, '.vitest-affected', 'test-results.json');
+  rmSync(reportPath, { force: true });
   const result = await execa(
     'npx',
-    ['vitest', 'run', '--reporter=json'],
+    ['vitest', 'run', '--reporter=json', '--outputFile', reportPath],
     {
       cwd,
       env: { ...process.env, ...env },
@@ -103,21 +105,13 @@ async function runVitest(
     },
   );
 
-  // Vitest JSON reporter writes to stdout
-  let report: VitestJsonReport;
   try {
-    report = JSON.parse(result.stdout);
+    return JSON.parse(readFileSync(reportPath, 'utf-8')) as VitestJsonReport;
   } catch {
-    // Fallback: maybe JSON is in stderr
-    try {
-      report = JSON.parse(result.stderr);
-    } catch {
-      throw new Error(
-        `Failed to parse Vitest JSON output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}\nexitCode: ${result.exitCode}`,
-      );
-    }
+    throw new Error(
+      `Failed to read Vitest JSON report.\nstdout: ${result.stdout}\nstderr: ${result.stderr}\nexitCode: ${result.exitCode}`,
+    );
   }
-  return report;
 }
 
 beforeAll(() => {
@@ -133,35 +127,17 @@ beforeAll(() => {
 });
 
 describe('integration: plugin orchestration', () => {
-  /**
-   * Test 1: First run (no cache) → full suite, populates cache.
-   * Second run → selective (uses cached runtime graph).
-   *
-   * With the runtime-first architecture, the first run always runs full suite
-   * because there's no cached reverse map. The runtime reporter populates the
-   * cache. The second run then uses the cache for selective execution.
-   */
   test(
-    'first run populates cache, second run selects tests',
+    'first run populates cache, second run selects only affected tests',
     async () => {
-      const tmp = setupFixture('simple');
+      const tmp = setupFixture('diamond');
       await gitInit(tmp);
-
-      // Modify src/c.ts (leaf in simple fixture) — unstaged change
-      writeFileSync(
-        path.join(tmp, 'src', 'c.ts'),
-        'export const c = 42;\n',
-      );
-
       const pluginEnv = { VITEST_AFFECTED_DISABLED: '0' };
 
-      // First run: no cache → full suite → runtime reporter writes v2 cache
       const report1 = await runVitest(tmp, pluginEnv);
-      const testFiles1 = report1.testResults.map((r) => r.name);
-      // Full suite: all tests run (simple fixture has 1 test)
-      expect(testFiles1.some((f) => f.includes('a.test.ts'))).toBe(true);
+      expect(report1.success).toBe(true);
+      expect(report1.testResults).toHaveLength(2);
 
-      // Verify cache file was created with v2 format
       const cacheFile = path.join(tmp, '.vitest-affected', 'graph.json');
       expect(existsSync(cacheFile)).toBe(true);
       const cache = JSON.parse(readFileSync(cacheFile, 'utf-8')) as {
@@ -169,11 +145,12 @@ describe('integration: plugin orchestration', () => {
       };
       expect(cache.version).toBe(3);
 
-      // Second run: cache hit → selective execution
+      // Only a.test.ts imports d.ts; a full-suite fallback would also run b.test.ts.
+      writeFileSync(path.join(tmp, 'src', 'd.ts'), 'export const d = 42;\n');
       const report2 = await runVitest(tmp, pluginEnv);
-      const testFiles2 = report2.testResults.map((r) => r.name);
-      expect(testFiles2.some((f) => f.includes('a.test.ts'))).toBe(true);
-      expect(testFiles2).toHaveLength(1);
+      expect(report2.success).toBe(true);
+      expect(report2.testResults).toHaveLength(1);
+      expect(path.basename(report2.testResults[0].name)).toBe('a.test.ts');
     },
     30_000,
   );

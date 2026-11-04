@@ -335,8 +335,8 @@ Each clean full run is one more data point; a sustained zero-divergence streak i
 
 ## Requirements
 
-- **Vitest** >= 3.2.0, < 5.0.0 (Vitest 5 not yet validated — tracked for 1.1)
-- **Node.js** >= 18
+- **Vitest** >= 3.2.0, < 6.0.0
+- **Node.js** >= 18, using a version supported by your selected Vitest major
 - A **git** repository
 
 ## Limitations

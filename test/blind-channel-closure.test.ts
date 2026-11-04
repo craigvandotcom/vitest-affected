@@ -32,6 +32,7 @@ import {
   cpSync,
   symlinkSync,
   writeFileSync,
+  readFileSync,
   rmSync,
   realpathSync,
   existsSync,
@@ -39,7 +40,7 @@ import {
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { execa } from 'execa';
-import type { Reporter, TestRunEndReason } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/node';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
 import {
@@ -135,22 +136,20 @@ async function runVitest(
   cwd: string,
   env: Record<string, string> = {},
 ): Promise<VitestJsonReport> {
-  const result = await execa('npx', ['vitest', 'run', '--reporter=json'], {
+  const reportPath = path.join(cwd, '.vitest-affected', 'test-results.json');
+  rmSync(reportPath, { force: true });
+  const result = await execa('npx', ['vitest', 'run', '--reporter=json', '--outputFile', reportPath], {
     cwd,
     env: { ...process.env, ...env },
     reject: false,
   });
 
   try {
-    return JSON.parse(result.stdout) as VitestJsonReport;
+    return JSON.parse(readFileSync(reportPath, 'utf-8')) as VitestJsonReport;
   } catch {
-    try {
-      return JSON.parse(result.stderr) as VitestJsonReport;
-    } catch {
-      throw new Error(
-        `Failed to parse Vitest JSON output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}\nexitCode: ${result.exitCode}`,
-      );
-    }
+    throw new Error(
+      `Failed to read Vitest JSON report.\nstdout: ${result.stdout}\nstderr: ${result.stderr}\nexitCode: ${result.exitCode}`,
+    );
   }
 }
 

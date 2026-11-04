@@ -47,7 +47,7 @@ vitest-affected/
 │   └── *.test.ts         # Unit + integration tests
 ├── _backlog/             # Master plan: intelligent-test-selection.md
 ├── .beads/               # beads_rust task management database
-├── package.json          # ESM-only, peerDep vitest >=3.2.0 <5.0.0
+├── package.json          # ESM-only, peerDep vitest >=3.2.0 <6.0.0
 ├── tsconfig.json         # Strict, ES2022, bundler resolution
 ├── tsup.config.ts        # Build: ESM-only, dts, clean
 └── vitest.config.ts      # Test config: include test/**/*.test.ts, exclude test/fixtures/**

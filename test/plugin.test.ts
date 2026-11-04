@@ -3,7 +3,7 @@ import { describe, test, expect, afterEach, beforeEach } from 'vitest';
 import path from 'node:path';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import type { Reporter, TestRunEndReason } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/node';
 import { vitestAffected, STATS_FILE_MAX_BYTES } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
 import {

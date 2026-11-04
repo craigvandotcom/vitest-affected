@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Vitest 5 support** — reporter types now use the `vitest/node` entry shared
+  by Vitest 3, 4, and 5. The peer range and CI matrix cover all three majors,
+  including a two-test runtime-graph selection regression. Replay and test
+  harnesses use explicit JSON report files across all three versions.
+
 - **`vitest-affected-explain` learns test-file globs from an explicit source** —
   the CLI now accepts repeatable `--include <glob>` flags (and a
   `VITEST_AFFECTED_INCLUDE` env var of comma/space-separated globs; the flag

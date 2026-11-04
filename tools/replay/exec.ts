@@ -17,7 +17,7 @@
  * plugin's every-exit-emission contract). A missing line marks the commit
  * BROKEN — it is NEVER counted clean.
  */
-import { readFile, writeFile, copyFile, mkdir } from 'node:fs/promises';
+import { readFile, copyFile, mkdir, rm, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { execa } from 'execa';
@@ -132,7 +132,7 @@ export interface RunCommitResult {
  * Replay a single commit end-to-end:
  *  1. ref control (detach C, main -> C^)
  *  2. run `vitest run --reporter=json`, full suite, shadow on, per-commit stats
- *  3. capture ground-truth outcomes JSON
+ *  3. capture ground-truth outcomes JSON in an explicit report file
  *  4. read the shadow decision from the stats file (fail-closed guard)
  *  5. copy the post-run graph.json (fresh runtime edge map at C)
  *
@@ -168,9 +168,11 @@ export async function runCommit(
   }
 
   await mkdir(statsDir, { recursive: true });
+  await mkdir(outcomesDir, { recursive: true });
+  // A missing report must never reuse outcomes from an earlier attempt.
+  await rm(outcomesPath, { force: true });
   const env = buildRunEnv(baseEnv, statsPath);
 
-  let stdout: string;
   try {
     // trackChild registers the subprocess so the top-level signal handler
     // (run.ts) can terminate it before deleting the clone / exiting, instead of
@@ -180,17 +182,14 @@ export async function runCommit(
     const result = await trackChild(
       execa(
         'npx',
-        ['vitest', 'run', '--reporter=json'],
+        ['vitest', 'run', '--reporter=json', '--outputFile', path.resolve(outcomesPath)],
         // extendEnv:false — the child gets EXACTLY buildRunEnv's env, never an
         // extension of the parent process.env (which would re-introduce the CI /
         // GITHUB_ACTIONS / VITEST_AFFECTED_DISABLED keys buildRunEnv deletes; see
         // its doc comment). `env` is a full copy of the base env, so PATH etc. are
         // carried through.
         //
-        // maxBuffer STDOUT_MAX_BUFFER (256MB): a big suite's --reporter=json can
-        // exceed execa's 100MB default; on overflow execa truncates stdout, which
-        // parses to an EMPTY outcome map — corrupt ground truth, no error. The
-        // finite 256MB cap raises the ceiling while still bounding memory.
+        // Bound console capture as well as the explicit JSON report below.
         //
         // timeout VITEST_RUN_TIMEOUT_MS (30 min): a wedged suite must not stall
         // the walk. reject:false means a timeout does NOT throw — it resolves with
@@ -208,9 +207,8 @@ export async function runCommit(
       ),
     );
     // reject:false surfaces failures on the result, not as a throw. A timed-out
-    // (or maxBuffer-terminated) run has partial/truncated stdout that would parse
-    // to an empty/garbage outcome map, so classify it BROKEN explicitly rather
-    // than letting the corrupt capture flow into analysis. A normal non-zero exit
+    // (or maxBuffer-terminated) run may not have a complete report, so classify
+    // it BROKEN before the capture reaches analysis. A normal non-zero exit
     // (FAILING tests) is NOT a timeout/overflow — it stays a capturable outcome.
     if (result.timedOut) {
       return broken(`vitest run timed out after ${VITEST_RUN_TIMEOUT_MS}ms`);
@@ -220,15 +218,14 @@ export async function runCommit(
         `vitest --reporter=json output exceeded ${STDOUT_MAX_BUFFER} bytes (truncated)`,
       );
     }
-    stdout = result.stdout;
+    if ((await stat(outcomesPath)).size > STDOUT_MAX_BUFFER) {
+      return broken(`vitest JSON report exceeded ${STDOUT_MAX_BUFFER} bytes`);
+    }
   } catch (err) {
     return broken(`vitest invocation failed: ${errText(err)}`);
   }
 
-  // (a) Ground-truth outcomes JSON — persist even if unparseable for triage.
-  await writeFile(outcomesPath, stdout, 'utf-8');
-
-  // (b) Shadow decision — the fail-closed guard.
+  // Shadow decision — the fail-closed guard.
   let decision: ShadowDecision | null = null;
   if (existsSync(statsPath)) {
     const statsContent = await readFile(statsPath, 'utf-8');
@@ -238,7 +235,7 @@ export async function runCommit(
     return broken('no shadow stats line emitted (fail-closed)');
   }
 
-  // (c) Post-run graph.json — the complete fresh runtime edge map at C.
+  // Post-run graph.json — the complete fresh runtime edge map at C.
   const graphSrc = path.join(cloneDir, '.vitest-affected', 'graph.json');
   let capturedGraph: string | undefined;
   if (existsSync(graphSrc)) {

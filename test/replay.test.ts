@@ -62,6 +62,7 @@ import {
   classifyCommit,
 } from '../tools/replay/walker.js';
 import { runCommit } from '../tools/replay/exec.js';
+import { spawnDisabledRerun } from '../tools/replay/flake.js';
 import {
   analyzeRun,
   analyzeAndReport,
@@ -399,6 +400,9 @@ describe('replay: planted-miss silver bullet (real walk + drifted cache)', () =>
       expect(analysis.outcomeConfirmedMissRate).toBe(1);
       expect(analysis.totalOutcomeConfirmedMisses).toBe(1);
       expect(analysis.warnings).toEqual([]);
+
+      const rerun = await spawnDisabledRerun(cloneDir, cleanBaseEnv());
+      expect([...rerun].some(([file, status]) => file.endsWith('mod.test.ts') && status === 'failed')).toBe(true);
     },
     WALK_TIMEOUT,
   );

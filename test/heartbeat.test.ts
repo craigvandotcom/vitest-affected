@@ -2,7 +2,7 @@
 import { describe, test, expect, afterEach, beforeEach, vi } from 'vitest';
 import path from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import type { Reporter, TestRunEndReason } from 'vitest/reporters';
+import type { Reporter, TestRunEndReason } from 'vitest/node';
 import { vitestAffected } from '../src/plugin.js';
 import { saveCacheSync } from '../src/graph/cache.js';
 import {

@@ -14,15 +14,9 @@
  */
 
 /**
- * Large finite stdout cap (256MB) for any spawn whose output we must capture
- * whole: git range output AND the vitest `--reporter=json` streams. execa's
- * default maxBuffer is 100MB (`1000 * 1000 * 100`, see
- * node_modules/execa/lib/arguments/specific.js) — a big consumer suite's JSON
- * report can exceed that, and on overflow execa terminates the child and
- * truncates stdout, so `parseOutcomes` yields an empty map and the analysis runs
- * on corrupt ground truth SILENTLY. 256MB is far above any realistic output here
- * while staying finite (an overflow still terminates rather than growing
- * unbounded). Was previously duplicated as GIT_STDOUT_MAX_BUFFER in git-cmd.ts.
+ * Large finite capture cap (256MB) for git/console output and JSON reports.
+ * Execa terminates overflowing console captures; report readers check file size
+ * before consuming outcomes so a large report cannot bypass the same bound.
  */
 export const STDOUT_MAX_BUFFER = 256 * 1024 * 1024;
 

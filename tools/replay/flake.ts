@@ -2,7 +2,8 @@
  * Flake guard — distinguishes a real regression from a flaky test by
  * re-running plugin-disabled once when new failures appear.
  */
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { execa } from 'execa';
@@ -101,31 +102,32 @@ export async function spawnDisabledRerun(
   delete env.VITEST_AFFECTED_SHADOW;
   delete env.VITEST_AFFECTED_STATS_FILE;
   env.VITEST_AFFECTED_DISABLED = '1';
-  // trackChild registers this re-run with the signal handler (run.ts) so Ctrl-C
-  // terminates it before clone teardown. maxBuffer/timeout/forceKillAfterDelay
-  // mirror runCommit's vitest spawn (see exec.ts / limits.ts): a huge JSON
-  // capture must not truncate to an empty outcome map, and a wedged re-run must
-  // not stall the walk. On timeout/overflow (reject:false → no throw) stdout is
-  // partial and parseOutcomes yields an empty map; flakeCheckCommit then treats
-  // every new failure as CONFIRMED (fail-closed — never laundered into 'flaky'
-  // without positive re-run evidence), which is the safe direction here.
-  const result = await trackChild(
-    execa('npx', ['vitest', 'run', '--reporter=json'], {
-      cwd: cloneDir,
-      env,
-      reject: false,
-      // Same trap as runCommit (see exec.ts): execa's default extendEnv re-merges
-      // the parent process.env, re-introducing the CI / GITHUB_ACTIONS keys
-      // deleted above — an inherited CI=1 would enable retry masking in exactly
-      // the re-run whose job is to confirm a failure. The env above is a full
-      // copy of the base env, so PATH etc. carry through.
-      extendEnv: false,
-      maxBuffer: STDOUT_MAX_BUFFER,
-      timeout: VITEST_RUN_TIMEOUT_MS,
-      forceKillAfterDelay: CHILD_FORCE_KILL_MS,
-    }),
-  );
-  return parseOutcomes(result.stdout);
+  // A unique report cannot reuse stale outcomes and works with Vitest 3–5.
+  const reportDir = await mkdtemp(path.join(tmpdir(), 'vitest-affected-rerun-'));
+  const reportPath = path.join(reportDir, 'outcomes.json');
+  try {
+    const result = await trackChild(
+      execa('npx', ['vitest', 'run', '--reporter=json', '--outputFile', reportPath], {
+        cwd: cloneDir,
+        env,
+        reject: false,
+        extendEnv: false,
+        maxBuffer: STDOUT_MAX_BUFFER,
+        timeout: VITEST_RUN_TIMEOUT_MS,
+        forceKillAfterDelay: CHILD_FORCE_KILL_MS,
+      }),
+    );
+    // Missing, partial, or oversized evidence cannot classify a failure as flaky.
+    if (result.timedOut || result.isMaxBuffer) return new Map<string, string>();
+    try {
+      if ((await stat(reportPath)).size > STDOUT_MAX_BUFFER) return new Map<string, string>();
+      return parseOutcomes(await readFile(reportPath, 'utf-8'));
+    } catch {
+      return new Map<string, string>();
+    }
+  } finally {
+    await rm(reportDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** One flake-log.jsonl line, written by run.ts whenever a re-run happened. */
